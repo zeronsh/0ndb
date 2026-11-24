@@ -14,6 +14,11 @@ WARM_POLL_MS :: 10
 Warm_Job :: struct {
 	vfs:     prim.Vfs,
 	paths:   [dynamic]string,
+	vouched: map[string]Index_Entry,
+	trust_mtime: i64,
+	trust_exec:  bool,
+	symlinks:    bool,
+	large_limit: i64,
 	next:    int,
 	left:    int,
 	workers: [dynamic]^thread.Thread,
@@ -34,21 +39,22 @@ warm_park :: proc(m: ^Mount) -> bool {
 	if m.reg == nil || m.reg.loop == nil || m.vfs.procs != prim.os_vfs().procs {
 		return false
 	}
-	paths := make([dynamic]string, m.allocator)
-	warm_paths(m, &paths)
-	if len(paths) < WARM_MIN {
-		for p in paths {
-			delete(p, m.allocator)
-		}
-		delete(paths)
+	job := new(Warm_Job, m.allocator)
+	job.vfs = m.vfs
+	job.paths = make([dynamic]string, m.allocator)
+	job.vouched = make(map[string]Index_Entry, m.allocator)
+	warm_paths(m, job)
+	if len(job.paths) < WARM_MIN {
+		warm_drop(m, job)
 		return false
 	}
-	warm_start(m, paths)
+	warm_start(m, job)
 	return true
 }
 
 @(private)
-warm_paths :: proc(m: ^Mount, out: ^[dynamic]string) {
+warm_paths :: proc(m: ^Mount, job: ^Warm_Job) {
+	out := &job.paths
 	if !m.imported && m.has_git {
 		warm_loose_objects(m, out)
 		return
@@ -62,27 +68,33 @@ warm_paths :: proc(m: ^Mount, out: ^[dynamic]string) {
 		append(out, p)
 	}
 	if m.has_git && m.imported && git_index_stamp(m.vfs, m.git) != m.stamp {
-		warm_index_changed(m, out)
+		warm_index_changed(m, job)
 	}
 }
 
 @(private)
-warm_index_changed :: proc(m: ^Mount, out: ^[dynamic]string) {
+warm_index_changed :: proc(m: ^Mount, job: ^Warm_Job) {
+	out := &job.paths
+	trust := false
+	if m.opts.index_trust && m.git_refs && m.db != nil {
+		head, herr := git_head(m.vfs, m.git, context.temp_allocator)
+		trust = herr == .None && !git_head_equal(head, m.head)
+	}
 	r: Index_Reader
 	if index_open(&r, m.vfs, m.git.dir, m.git_format, context.temp_allocator) != .None {
 		return
 	}
 	defer index_close(&r)
-	seen := make(map[string]bool, context.temp_allocator)
+	seen := make(map[string]string, context.temp_allocator)
 	for p in out {
-		seen[p] = true
+		seen[p] = p
 	}
 	base := m.git.common if len(m.git.common) > 0 else m.git.dir
 	objects, _ := path_join(base, "objects", context.temp_allocator)
 	for {
 		e, ok, err := index_next(&r)
 		if err != .None || !ok {
-			return
+			break
 		}
 		if e.stage != 0 || e.mode & 0o170000 != 0o100000 {
 			continue
@@ -93,9 +105,15 @@ warm_index_changed :: proc(m: ^Mount, out: ^[dynamic]string) {
 		}
 		abuf: prim.Path_Buf
 		abs := abs_path(m, e.path, abuf[:])
-		if !seen[abs] {
-			p, _ := clone_string(abs, m.allocator)
+		p, listed := seen[abs]
+		if !listed {
+			p, _ = clone_string(abs, m.allocator)
 			append(out, p)
+		}
+		if trust {
+			v := e
+			v.path = ""
+			job.vouched[p] = v
 		}
 		hb: [odb.MAX_HEX]u8
 		hex := odb.oid_to_string(e.oid, m.git_format, &hb)
@@ -103,6 +121,10 @@ warm_index_changed :: proc(m: ^Mount, out: ^[dynamic]string) {
 		lp, _ := path_join(fan, hex[2:], m.allocator)
 		append(out, lp)
 	}
+	job.trust_mtime = index_file_mtime_ns(&r)
+	job.trust_exec = mount_trust_exec(m)
+	job.symlinks = mount_symlinks(m)
+	job.large_limit = m.opts.large_limit
 }
 
 @(private)
@@ -133,12 +155,9 @@ warm_loose_objects :: proc(m: ^Mount, out: ^[dynamic]string) {
 }
 
 @(private)
-warm_start :: proc(m: ^Mount, paths: [dynamic]string) {
-	job := new(Warm_Job, m.allocator)
-	job.vfs = m.vfs
-	job.paths = paths
+warm_start :: proc(m: ^Mount, job: ^Warm_Job) {
 	job.workers = make([dynamic]^thread.Thread, m.allocator)
-	n := min(max(m.opts.threads, 1), max(os.get_processor_core_count(), 1), len(paths))
+	n := min(max(m.opts.threads, 1), max(os.get_processor_core_count(), 1), len(job.paths))
 	sync.atomic_store(&job.left, n)
 	m.warm = job
 	for _ in 0 ..< n {
@@ -158,6 +177,12 @@ warm_worker :: proc(job: ^Warm_Job) {
 		i := sync.atomic_add(&job.next, 1)
 		if i >= len(job.paths) {
 			break
+		}
+		if e, has := &job.vouched[job.paths[i]]; has {
+			st, serr := prim.lstat(job.vfs, job.paths[i])
+			if serr == .None && disk_kind(st.kind) == .File && st.size <= job.large_limit && index_clean(e, disk_stat(st), .File, job.trust_mtime, job.trust_exec, job.symlinks) {
+				continue
+			}
 		}
 		fd, err := prim.open_file(job.vfs, job.paths[i], {})
 		if err == .None {
@@ -204,10 +229,16 @@ warm_free :: proc(m: ^Mount) {
 		thread.destroy(w)
 	}
 	delete(job.workers)
+	warm_drop(m, job)
+	m.warm = nil
+}
+
+@(private)
+warm_drop :: proc(m: ^Mount, job: ^Warm_Job) {
+	delete(job.vouched)
 	for p in job.paths {
 		delete(p, m.allocator)
 	}
 	delete(job.paths)
 	free(job, m.allocator)
-	m.warm = nil
 }
