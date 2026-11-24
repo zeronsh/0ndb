@@ -10,7 +10,7 @@
 | `tree` | An agent's `tree.write`, and a person's disk edit in the mount, each until the tree subscription event (and until the follow-up `tree.list`). |
 | `buffer` | A `buffer.edit` keystroke on one connection until a second `buffer.open` subscriber sees it. |
 | `mount` | `tree.create` plus `mount.add` of a 3000-file git repo, until the first `tree.list`. Also later directory lists. |
-| `switch` | A branch switch until its files are materialized. This is a stub for now. |
+| `switch` | Two branches of a native conversation, each whose turn writes `branch.txt` through a local fake provider. Then `switch` to the other sibling until it answers, checking each time that the disk holds that branch's bytes (`FLOWS_SWITCH_FILES`, 200). |
 
 Build, then run (each daemon runs under `ulimit -v 4000000`):
 

@@ -561,8 +561,107 @@ def f_mount_open():
         dm.stop()
 
 
+class FakeWriter(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):
+        pass
+
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers.get("content-length", "0"))) or b"{}")
+        msgs = body.get("messages", [])
+        last = msgs[-1] if msgs else {}
+        content = last.get("content")
+        answered = isinstance(content, list) and any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content)
+        prompt = ""
+        for m in msgs:
+            if m.get("role") == "user":
+                c = m.get("content")
+                if isinstance(c, str):
+                    prompt = c
+                elif isinstance(c, list):
+                    texts = [b.get("text", "") for b in c if isinstance(b, dict) and b.get("type") == "text"]
+                    if texts:
+                        prompt = texts[-1]
+        self.send_response(200)
+        self.send_header("content-type", "text/event-stream")
+        self.send_header("connection", "close")
+        self.end_headers()
+
+        def ev(name, obj):
+            self.wfile.write(("event: %s\ndata: %s\n\n" % (name, json.dumps(obj))).encode())
+            self.wfile.flush()
+
+        ev("message_start", {"type": "message_start", "message": {"id": "msg_w", "type": "message", "role": "assistant", "model": "claude-opus-5-5", "content": [], "stop_reason": None, "usage": {"input_tokens": 1, "output_tokens": 1}}})
+        if answered:
+            ev("content_block_start", {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}})
+            ev("content_block_delta", {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "written"}})
+            ev("content_block_stop", {"type": "content_block_stop", "index": 0})
+            ev("message_delta", {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 1}})
+        else:
+            args = json.dumps({"path": "branch.txt", "content": "branch %s\n" % prompt})
+            ev("content_block_start", {"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "id": "toolu_w%d" % len(msgs), "name": "write_file", "input": {}}})
+            ev("content_block_delta", {"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": args}})
+            ev("content_block_stop", {"type": "content_block_stop", "index": 0})
+            ev("message_delta", {"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 1}})
+        ev("message_stop", {"type": "message_stop"})
+
+
 def f_branch_switch():
-    return dict(flow="branch switch → files materialized", runs=0, notes="stub until 8770a918's PR 1 lands")
+    d = flow_dir("branch_switch")
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), FakeWriter)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    dm = Daemon(d, {"ANTHROPIC_BASE_URL": "http://127.0.0.1:%d" % srv.server_address[1], "ANTHROPIC_API_KEY": "x"})
+    files = os.environ.get("FLOWS_SWITCH_FILES", "200")
+    try:
+        root = os.path.join(d, "work")
+        make_repo(root, int(files), random.Random(9))
+        obj = dm.cli("new", "flows-branches", "--provider", "native", "--model", "claude-opus-5-5")["object"]
+        c = dm.client()
+        tree = mount_tree(dm, c, root)
+        c.call("mount", object=obj, name="work", tree=tree.split("/")[1], path="work")
+        target = os.path.join(root, "branch.txt")
+
+        def disk():
+            return open(target).read() if os.path.exists(target) else None
+
+        def turn(text, **extra):
+            c.call("send", object=obj, text=text, **extra)
+            end = now() + 60
+            while now() < end:
+                if disk() == "branch %s\n" % text and c.call("convo.status", object=obj).get("status") == "idle":
+                    return
+                time.sleep(0.05)
+            raise RuntimeError("turn %s: branch.txt is %r after 60 s" % (text, disk()))
+
+        turn("A")
+        head = c.call("convo.status", object=obj)["head"]
+        w = c.call("convo.window", object=obj, anchor=head, before=10)
+        first = [m["id"] for m in w["messages"] if m.get("role") == "user"][0]
+        turn("B", root=True)
+        sib = c.call("convo.siblings", object=obj, msg=first)
+        rids = [x if isinstance(x, str) else x.get("id") or x.get("msg") or x.get("rid") for x in (sib.get("siblings") or sib.get("messages") or [])]
+        if len(rids) < 2:
+            raise RuntimeError("expected two sibling branches, got %s" % json.dumps(sib)[:300])
+        lat, wrong, seen = [], 0, set()
+        want = {rids[0]: "branch A\n", rids[1]: "branch B\n"}
+        cur = rids[1]
+        for i in range(RUNS):
+            nxt = rids[0] if cur == rids[1] else rids[1]
+            t0 = now()
+            c.call("switch", object=obj, sibling=nxt, timeout_ms=120000)
+            lat.append(now() - t0)
+            got = disk()
+            seen.add(got)
+            if got != want[nxt]:
+                wrong += 1
+            cur = nxt
+        c.close()
+        notes = "bytes on disk at return %s; %d of %d switches did not match their branch" % (sorted(map(repr, seen)), wrong, len(lat))
+        return row("branch switch → files materialized (%s-file repo)" % files, lat, True, notes)
+    finally:
+        dm.stop()
+        srv.shutdown()
 
 
 FLOWS = dict(send=f_send_first_token, cli=f_cli_first_token, window=f_convo_window, tree=f_tree_events, buffer=f_buffer_keystroke, mount=f_mount_open, switch=f_branch_switch)
