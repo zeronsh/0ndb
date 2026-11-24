@@ -1,5 +1,7 @@
 package engine
 
+import "core:fmt"
+
 import "base:runtime"
 import "core:mem/virtual"
 import "core:sync"
@@ -967,6 +969,7 @@ _on_settle :: proc(l: ^prim.Loop, data: rawptr) {
 	}
 
 	e.settling = true
+	fmt.eprintf("DBGT %p settle t=%d lru=%d\n", e, prim.loop_now_ns(e.loop)/1_000_000, len(e.lru))
 	_redact_settle(e)
 	_mounts_settle(e)
 	_full_settle(e)

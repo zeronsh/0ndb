@@ -1,5 +1,7 @@
 package engine
 
+import "core:fmt"
+
 import "../convo"
 import "../fs"
 import "../journal"
@@ -133,7 +135,7 @@ _object_changed :: proc(e: ^Engine, space: prim.Id, id: prim.Id, kind: Change_Ki
 }
 
 @(private)
-_handle_get :: proc(e: ^Engine, o: Object, kind: Kind) -> (h: ^Handle, err: Error) {
+_handle_get :: proc(e: ^Engine, o: Object, kind: Kind, loc := #caller_location) -> (h: ^Handle, err: Error) {
 	if x, ok := e.handles[o.id]; ok {
 		if x.kind != kind || x.sp.id != o.space {
 			return nil, .Invalid
@@ -173,6 +175,7 @@ _handle_get :: proc(e: ^Engine, o: Object, kind: Kind) -> (h: ^Handle, err: Erro
 		h.view_init = true
 	}
 	e.handles[o.id] = h
+	if kind == .Text { fmt.eprintf("DBGT %p open %s settling=%v in_tick=%v timer=%v t=%d %s\n", e, prim.id_hex(o.id), e.settling, e.in_tick, e.settle_timer != 0, prim.loop_now_ns(e.loop)/1_000_000, loc.procedure) }
 	append(&e.lru, h)
 	e.stats.opened += 1
 	if e.settle_timer == 0 && !e.in_tick && !e.settling {
@@ -739,6 +742,7 @@ _handles_commit :: proc(e: ^Engine) {
 
 @(private)
 _handle_close :: proc(e: ^Engine, h: ^Handle) -> Error {
+	if h.kind == .Text { fmt.eprintf("DBGT %p close %s mark=%d dur=%d t=%d\n", e, prim.id_hex(h.id), h.hist != nil ? i64(fs.history_durable_mark(h.hist)) : -1, h.hist != nil ? i64(h.hist.durable) : -1, prim.loop_now_ns(e.loop)/1_000_000) }
 	if h.hist != nil && !e.closing && fs.history_durable_mark(h.hist) > h.hist.durable {
 		return .Busy
 	}
