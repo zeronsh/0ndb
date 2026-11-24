@@ -697,6 +697,12 @@ cmd_blame :: proc(a: ^Args) -> int {
 			}
 			if sh > i64(lo) || (sh == sl && sl == i64(lo)) {
 				who := actor_name(names, jstr(spans[j], "actor"))
+				switch jstr(spans[j], "owner") {
+				case "agent":
+					who = fmt.tprintf("agent %s", short(jstr(spans[j], "conversation")))
+				case "unresolved":
+					who = "unresolved"
+				}
 				if jbool(spans[j], "redacted") {
 					who = "redacted"
 				}
