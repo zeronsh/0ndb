@@ -429,7 +429,15 @@ _moves_settle_step :: proc(e: ^Engine) {
 		if .Data not_in c.kinds {
 			continue
 		}
-		if h, ok := e.handles[id]; ok && h.kind == .Conversation {
+		kind: Kind
+		if h, ok := e.handles[id]; ok {
+			kind = h.kind
+		} else if rec, found, rerr := _rec_get(e, id); rerr == .None && found && rec.space == c.space {
+			kind = rec.kind
+		} else {
+			continue
+		}
+		if kind == .Conversation {
 			append(&list, Object{c.space, id})
 		}
 	}
