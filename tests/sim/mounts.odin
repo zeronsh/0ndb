@@ -1134,7 +1134,7 @@ check_synced_disk :: proc(w: ^World, n: ^Node) {
 		return
 	}
 	for &sm in n.mounts {
-		if sm.m == nil || sm.m.passes == sm.checked || fs.mount_pass_parked(sm.m) {
+		if sm.m == nil || sm.m.passes == sm.checked {
 			continue
 		}
 		sm.checked = sm.m.passes
