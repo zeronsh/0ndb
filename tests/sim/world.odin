@@ -101,6 +101,7 @@ Node :: struct {
 	identity:    osync.Identity,
 	caps:        [8]eng.Cap_Credentials,
 	restart_pending: bool,
+	cut_writes:  [dynamic]Cut_Write,
 	probed:      bool,
 	sent:        map[string]i64,
 	boot:        u64,
@@ -508,6 +509,8 @@ world_destroy :: proc(w: ^World) {
 			agent_pending_free(w, pa)
 		}
 		delete(n.agent_pending)
+		cut_writes_drop(n)
+		delete(n.cut_writes)
 		delete(n.name, w.allocator)
 		free(n, w.allocator)
 	}
