@@ -742,9 +742,16 @@ equal in both directions.
   observations arriving together share one fdatasync run off the loop
   through the registry's `Sync_Exec`, and `observe.route_held` records every
   content-changing path of an observed write and runs the write's `Release`
-  (exactly once) only after; a supervisor that can hold a write (the Linux
-  seccomp supervisor, which parks the notification) sets the `Release` and
-  keeps the write blocked until it runs. A runtime tool-call pin records its path the same
+  (exactly once) only after; a supervisor that holds a write sets the
+  `Release` and keeps the write blocked until it runs. The Linux seccomp
+  supervisor parks only writes under a write gate; any other write it lets
+  go before it queues the event, so the watcher can report the whole write
+  first. It stamps each event just before letting the write go, and the
+  observation claims a pending change first seen at or after that stamp (or
+  an unreported file whose mtime is within a timestamp tick of it); a path
+  whose last watched event is a close is not left open to the scope, so a
+  later save is the person's. Until such a write's record is synced, a power
+  loss credits it to the device. A runtime tool-call pin records its path the same
   way but cannot hold the provider's write. A provider can write before the
   runtime has interpreted the tool_use line that names the file, so the
   watcher's change arrives first; it is still the tool's. Each unscoped dirty

@@ -37,6 +37,8 @@ Write :: struct {
 	window:  bool,
 	git:     bool,
 	release: Release,
+	stamped: bool,
+	age:     i64,
 }
 
 Release :: struct {
@@ -261,9 +263,9 @@ route :: proc(r: ^Router, w: ^Write, scope: ^fs.Scope) {
 			return
 		}
 	}
-	_route_path(r, w.path, w.exact, scope)
+	_route_path(r, w, w.path, scope)
 	if w.op == .Rename || w.op == .Exchange {
-		_route_path(r, w.from, w.exact, scope)
+		_route_path(r, w, w.from, scope)
 	}
 }
 
@@ -292,9 +294,9 @@ route_held :: proc(r: ^Router, w: ^Write, scope: ^fs.Scope) {
 	}
 	h^ = {left = 1, release = w.release, allocator = r.allocator}
 	w.release = {}
-	_held_path(r, h, w.path, scope)
+	_held_path(r, h, w, w.path, scope)
 	if w.op == .Rename || w.op == .Exchange {
-		_held_path(r, h, w.from, scope)
+		_held_path(r, h, w, w.from, scope)
 	}
 	route(r, w, scope)
 	_held_done(h, .None)
@@ -310,13 +312,13 @@ _held_op :: proc "contextless" (op: Op) -> bool {
 }
 
 @(private)
-_held_path :: proc(r: ^Router, h: ^Held, path: string, scope: ^fs.Scope) {
+_held_path :: proc(r: ^Router, h: ^Held, w: ^Write, path: string, scope: ^fs.Scope) {
 	m, rel, ok := router_locate(r, path)
 	if !ok || m != scope.mount || len(rel) == 0 || fs.path_internal(rel) {
 		return
 	}
 	h.left += 1
-	fs.mount_observe_begin(m, rel, scope, _held_done, h)
+	fs.mount_observe_begin(m, rel, scope, _held_done, h, fs.mount_since(m, w.age) if w.stamped else {})
 }
 
 @(private)
@@ -334,18 +336,22 @@ _held_done :: proc(ctx: rawptr, err: fs.Error) {
 }
 
 @(private)
-_route_path :: proc(r: ^Router, path: string, exact: bool, scope: ^fs.Scope) {
+_route_path :: proc(r: ^Router, w: ^Write, path: string, scope: ^fs.Scope) {
 	m, rel, ok := router_locate(r, path)
 	if !ok {
 		return
 	}
 	if len(rel) == 0 {
-		if !exact {
+		if !w.exact {
 			fs.mount_mark_rescan(m)
 		}
 		return
 	}
 	if fs.path_internal(rel) {
+		return
+	}
+	if w.stamped && scope != nil && m == scope.mount && _held_op(w.op) {
+		fs.mount_mark_written(m, rel, scope)
 		return
 	}
 	fs.mount_mark_observed(m, rel, scope)
