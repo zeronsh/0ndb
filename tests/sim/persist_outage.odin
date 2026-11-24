@@ -9,7 +9,7 @@ EV_PERSIST_OUTAGE_END: Ev_Kind
 
 @(init)
 _persist_outage_init :: proc "contextless" () {
-	register_op(14, "persist_outage", proc(w: ^World) -> int {return 1 if w.cfg.persist_fault else 0}, op_persist_outage)
+	register_op(14, "persist_outage", proc(w: ^World) -> int {return 1 if w.cfg.persist_fault && env_u64("SIM_PERSIST_OUTAGE", 0) != 0 else 0}, op_persist_outage)
 	EV_PERSIST_OUTAGE_END = register_event(_persist_outage_end)
 	register_final_check(12, check_applied_cursors)
 	register_final_check(13, check_actor_owners)
