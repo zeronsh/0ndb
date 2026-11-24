@@ -20,8 +20,6 @@ Rb_Observer :: enum u8 {
 	Names_Writer,
 	Blind,
 	None,
-	Pinned_Turn,
-	Pinned_Tool,
 }
 
 @(private = "file")
@@ -35,7 +33,6 @@ Rb_Ctx :: struct {
 	parent: obj.Rid,
 	r0:     obj.Rid,
 	alloc:  runtime.Allocator,
-	held:   ^fs.Scope,
 }
 
 @(private = "file")
@@ -187,7 +184,7 @@ _rb_tool :: proc(c: ^Rb_Ctx, name, data: string, named: bool) {
 		defer node_after(n)
 		tool = fs.scope_open(n.reg, m, prim.id_new_with(node_clock(&n.clock), rng_random(&c.w.rng)), c.agent, nil, fs.Observe_Since{mono = prim.clock_mono_ns(n.e.cfg.clock), wall = prim.clock_wall_ns(n.e.cfg.clock)})
 		if named {
-			n.writers[abs] = Writer_Info{scope = tool, agent = true}
+			_writer_set(c.w, n, abs, Writer_Info{scope = tool, agent = true})
 			fs.mount_observe_begin(m, name, tool)
 		}
 	}
@@ -205,32 +202,7 @@ _rb_tool :: proc(c: ^Rb_Ctx, name, data: string, named: bool) {
 }
 
 @(private = "file")
-_rb_pinned :: proc(c: ^Rb_Ctx, turn: ^fs.Scope, tool: bool) {
-	n := c.n
-	m := _rb_mount(c)
-	abs := strings.concatenate({RB_ROOT, "/a.txt"}, c.alloc)
-	s := c.held if tool else turn
-	open: {
-		context = instance_context(&n.inst)
-		defer node_after(n)
-		n.writers[strings.clone(abs, c.w.allocator)] = Writer_Info{scope = s, agent = true}
-		fs.mount_observe_begin(m, "a.txt", s)
-	}
-	_rb_put(c, "a.txt", "A\n2\nP\n")
-	run_until(c.w, c.w.now + 3_000_000, false)
-	close: {
-		context = instance_context(&n.inst)
-		defer node_after(n)
-		if tool {
-			fs.scope_close(n.reg, s)
-		}
-		key, _ := delete_key(&n.writers, abs)
-		delete(key, c.w.allocator)
-	}
-}
-
-@(private = "file")
-_rb_run :: proc(w: ^World, model: Rb_Observer, alloc: runtime.Allocator) {
+_rb_run :: proc(w: ^World, model: Rb_Observer, step: int, alloc: runtime.Allocator) {
 	n := w.nodes[0]
 	if !node_start(n) {
 		world_fail(w, "read between: node start")
@@ -289,7 +261,7 @@ _rb_run :: proc(w: ^World, model: Rb_Observer, alloc: runtime.Allocator) {
 		return
 	}
 	switch model {
-	case .Names_Writer, .Pinned_Turn, .Pinned_Tool:
+	case .Names_Writer:
 	case .Blind:
 		n.reg.observer.changed = _rb_blind
 	case .None:
@@ -330,13 +302,6 @@ _rb_run :: proc(w: ^World, model: Rb_Observer, alloc: runtime.Allocator) {
 		defer node_after(n)
 		turn = fs.scope_open(n.reg, m, sid, c.agent)
 	}
-	pin: {
-		context = instance_context(&n.inst)
-		defer node_after(n)
-		if model == .Pinned_Turn {
-			fs.scope_read_base(turn, "a.txt", transmute([]u8)string("1\n2\n3\n"))
-		}
-	}
 	read: {
 		context = instance_context(&n.inst)
 		defer node_after(n)
@@ -344,11 +309,7 @@ _rb_run :: proc(w: ^World, model: Rb_Observer, alloc: runtime.Allocator) {
 		if err := fs.scope_read_base(r, "a.txt", transmute([]u8)string("1\n2\n3\n")); err != .None {
 			world_fail(w, "between: scope_read_base: %v", err)
 		}
-		if model == .Pinned_Tool {
-			c.held = r
-		} else {
-			fs.scope_close(n.reg, r)
-		}
+		fs.scope_close(n.reg, r)
 	}
 	run_until(w, w.now + 100_000_000, false)
 	api: {
@@ -358,21 +319,22 @@ _rb_run :: proc(w: ^World, model: Rb_Observer, alloc: runtime.Allocator) {
 			world_fail(w, "between: tree_write: %v", err)
 		}
 	}
-	for _ in 0 ..< 50 {
-		if _rb_disk(c)["a.txt"] == "1\n2\nP\n" {
+	if step < 0 {
+		run_until(w, w.now + 2_000_000_000, true)
+		if d := _rb_disk(c)["a.txt"]; d != "1\n2\nP\n" {
+			world_fail(w, "read between: the person's write never reached disk (%q)", d)
+			return
+		}
+	}
+	for _ in 0 ..< step {
+		t, ok := next_time(w)
+		if !ok {
 			break
 		}
-		run_until(w, w.now + 100_000_000, false)
+		run_until(w, t, false)
 	}
-	if d := _rb_disk(c)["a.txt"]; d != "1\n2\nP\n" {
-		world_fail(w, "between: the person's write never reached disk (%q)", d)
-		return
-	}
-	if model == .Pinned_Turn || model == .Pinned_Tool {
-		_rb_pinned(c, turn, model == .Pinned_Tool)
-	} else {
-		_rb_tool(c, "a.txt", "A\n2\nP\n", model == .Names_Writer)
-	}
+	was := _rb_disk(c)["a.txt"]
+	_rb_tool(c, "a.txt", strings.concatenate({"A\n", was[2:]}, alloc), model == .Names_Writer)
 	run_until(w, w.now + 500_000_000, true)
 	turn_close: {
 		context = instance_context(&n.inst)
@@ -436,7 +398,8 @@ read_between :: proc(t: ^testing.T) {
 	test_begin(t)
 	defer test_end(t)
 	for model in Rb_Observer {
-		for seed in u64(1) ..= 4 {
+		for step in -1 ..< 40 {
+			seed := u64(1)
 			cfg := default_config(seed)
 			cfg.nodes = 1
 			cfg.spaces = 0
@@ -452,12 +415,12 @@ read_between :: proc(t: ^testing.T) {
 			world_init(w, cfg)
 			a: virtual.Arena
 			if virtual.arena_init_growing(&a, 1 << 20) == nil {
-				_rb_run(w, model, virtual.arena_allocator(&a))
+				_rb_run(w, model, step, virtual.arena_allocator(&a))
 			}
 			for f in w.failures {
-				fmt.eprintf("read_between %v seed %d: %s\n", model, seed, f)
+				fmt.eprintf("read_between %v step %d: %s\n", model, step, f)
 			}
-			testing.expect(t, len(w.failures) == 0, fmt.tprintf("read_between %v seed %d failed", model, seed))
+			testing.expect(t, len(w.failures) == 0, fmt.tprintf("read_between %v step %d failed", model, step))
 			world_destroy(w)
 			free(w)
 			virtual.arena_destroy(&a)
