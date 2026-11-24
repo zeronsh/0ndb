@@ -77,8 +77,8 @@ warm_index_changed :: proc(m: ^Mount, job: ^Warm_Job) {
 	out := &job.paths
 	trust := false
 	if m.opts.index_trust && m.git_refs && m.db != nil {
-		head, herr := git_head(m.vfs, m.git, context.temp_allocator)
-		trust = herr == .None && !git_head_equal(head, m.head)
+		head, hok := git_head(m.vfs, m.git, context.temp_allocator)
+		trust = hok && !git_head_equal(head, m.head)
 	}
 	r: Index_Reader
 	if index_open(&r, m.vfs, m.git.dir, m.git_format, context.temp_allocator) != .None {
