@@ -1010,6 +1010,9 @@ op_inode :: proc(h: ^History, id: crdt.Op_Id) -> fstree.Inode_Id {
 	if id == {} {
 		return fstree.ROOT
 	}
+	when ODIN_TEST {
+		assert(h.awake, "an op id is mapped to an inode on a sleeping history")
+	}
 	return fstree.Inode_Id{crdt.graph_intern(&h.g, id.actor), id.seq}
 }
 

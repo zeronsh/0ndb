@@ -1711,6 +1711,11 @@ mat_snapshot_dirty :: proc(m: ^Mount, items: []Mat_Item, target: Version) -> (he
 	if len(snapped) == 0 {
 		return {}, false, .None
 	}
+	vids := make([dynamic]fstree.Op_Id, context.temp_allocator)
+	for p in parents {
+		append(&vids, op_inode(h, p))
+	}
+	reloading := false
 	if b.n > 0 {
 		history_register_actor(h, actor, pseudo) or_return
 		ch, has, cerr := builder_commit_at(m, &b, parents[:])
@@ -1721,19 +1726,12 @@ mat_snapshot_dirty :: proc(m: ^Mount, items: []Mat_Item, target: Version) -> (he
 			return {}, false, .None
 		}
 		head = ch
+		reloading = cerr == .Reloading
 	} else {
 		if len(parents) == 0 {
 			return {}, false, .None
 		}
 		head = parents[len(parents) - 1]
-	}
-	vids := make([dynamic]fstree.Op_Id, context.temp_allocator)
-	if b.n == 0 {
-		for p in parents {
-			append(&vids, op_inode(h, p))
-		}
-	} else {
-		append(&vids, op_inode(h, head))
 	}
 	ver := shadow_version_add(&m.shadow, vids[:]) or_return
 	for i, k in snapped {
@@ -1743,5 +1741,5 @@ mat_snapshot_dirty :: proc(m: ^Mount, items: []Mat_Item, target: Version) -> (he
 		e.oid = oids[k]
 		shadow_put(&m.shadow, items[i].path, e) or_return
 	}
-	return head, true, .None
+	return head, true, .Reloading if reloading else .None
 }
