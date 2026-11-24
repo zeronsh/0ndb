@@ -10,7 +10,7 @@ import "../../src/prim"
 
 MERGE_ROOT :: "/work/merge-n0"
 
-based_merge_run :: proc(seed: u64, crash_at: u64, sync_fail: bool) -> (failures: [dynamic]string, crashed: bool) {
+based_merge_run :: proc(seed: u64, crash_at: u64, sync_fail: bool) -> (failures: [dynamic]string, crashed: bool, acked: int) {
 	failures = make([dynamic]string)
 	cfg := default_config(seed)
 	cfg.nodes = 1
@@ -25,7 +25,7 @@ based_merge_run :: proc(seed: u64, crash_at: u64, sync_fail: bool) -> (failures:
 	cfg.verbose = env_u64("SIM_VERBOSE", 0) != 0
 	w := new(World)
 	world_init(w, cfg)
-	crashed = _merge_crash(w, crash_at, sync_fail)
+	crashed, acked = _merge_crash(w, crash_at, sync_fail)
 	for f in w.failures {
 		append(&failures, fmt.aprintf("%s", f))
 	}
@@ -56,7 +56,7 @@ _merge_write :: proc(vfs: prim.Vfs, path: string, data: string) -> prim.Error {
 }
 
 @(private = "file")
-_merge_crash :: proc(w: ^World, crash_at: u64, sync_fail: bool) -> (crashed: bool) {
+_merge_crash :: proc(w: ^World, crash_at: u64, sync_fail: bool) -> (crashed: bool, acked: int) {
 	n := w.nodes[0]
 	if !node_start(n) {
 		world_fail(w, "merge: node start")
@@ -102,6 +102,8 @@ _merge_crash :: proc(w: ^World, crash_at: u64, sync_fail: bool) -> (crashed: boo
 	tool := "tool line\n"
 	agent := prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng))
 	crashes := w.stats.crashes
+	typed_op, tool_op: ^M_Op
+	wrote := false
 	pin: {
 		context = instance_context(&n.inst)
 		sm := _merge_mount(n)
@@ -120,6 +122,8 @@ _merge_crash :: proc(w: ^World, crash_at: u64, sync_fail: bool) -> (crashed: boo
 			world_fail(w, "merge: tree_write: %v", terr)
 			return
 		}
+		typed_op = new_op(m, .Tree_Write, n, oi)
+		op_done(typed_op, eng.pending_seq(&n.e), .None)
 		fs.mount_observe_begin(sm.m, "a.txt", scope)
 		_writer_set(w, n, MERGE_ROOT + "/a.txt", Writer_Info{scope = scope, agent = true})
 		n.disk.crash_at = n.disk.stats.ops + crash_at
@@ -129,8 +133,13 @@ _merge_crash :: proc(w: ^World, crash_at: u64, sync_fail: bool) -> (crashed: boo
 		if _merge_write(vfs, MERGE_ROOT + "/a.txt", strings.concatenate({base, tool}, context.temp_allocator)) != .None || n.disk.dead {
 			break pin
 		}
-		fs.scope_close(n.reg, scope)
+		wrote = true
+		serr := fs.scope_close(n.reg, scope)
 		_forget_scope(w, n, scope)
+		if serr == .None && !n.disk.dead {
+			tool_op = new_op(m, .Disk_Agent, n, oi)
+			op_done(tool_op, eng.pending_seq(&n.e), .None)
+		}
 	}
 	n.disk.fail_sync = 0
 	if n.disk.dead {
@@ -161,6 +170,19 @@ _merge_crash :: proc(w: ^World, crash_at: u64, sync_fail: bool) -> (crashed: boo
 			world_fail(w, "merge: %q appears %d times in a.txt (%q), crash at disk op %d, sync fail %v", strings.trim_space(line), c, string(data), crash_at, sync_fail)
 		}
 	}
+	for op, i in ([]^M_Op{typed_op, tool_op}) {
+		if op == nil || op.status != .Acked {
+			continue
+		}
+		acked += 1
+		line := typed if i == 0 else tool
+		if strings.count(string(data), line) == 0 {
+			world_fail(w, "merge: acked %q is missing from a.txt (%q), crash at disk op %d, sync fail %v", strings.trim_space(line), string(data), crash_at, sync_fail)
+		}
+	}
+	if wrote && strings.count(string(data), base) == 0 {
+		world_fail(w, "merge: %q is missing from a.txt (%q), crash at disk op %d, sync fail %v", strings.trim_space(base), string(data), crash_at, sync_fail)
+	}
 	return
 }
 
@@ -172,9 +194,12 @@ based_merge_crash :: proc(t: ^testing.T) {
 	test_begin(t)
 	defer test_end(t)
 	for sync_fail in ([]bool{false, true}) {
-		points := 0
+		points, acked := 0, 0
 		for k in u64(1) ..= 4000 {
-			failures, crashed := based_merge_run(1, k, sync_fail)
+			failures, crashed, n_acked := based_merge_run(1, k, sync_fail)
+			if crashed {
+				acked += n_acked
+			}
 			for f in failures {
 				fmt.eprintf("based_merge_crash at disk op %d (sync fail %v): %s\n", k, sync_fail, f)
 				delete(f)
@@ -186,6 +211,7 @@ based_merge_crash :: proc(t: ^testing.T) {
 				break
 			}
 		}
-		fmt.eprintf("based_merge_crash: %d crash points (sync fail %v)\n", points, sync_fail)
+		fmt.eprintf("based_merge_crash: %d crash points (sync fail %v), %d acked lines checked after a crash\n", points, sync_fail, acked)
+		testing.expect(t, acked > 0, "based_merge_crash: no crash came after an acked line")
 	}
 }
