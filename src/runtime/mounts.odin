@@ -73,6 +73,8 @@ _tool_scopes_close :: proc(ws: ^Worktree, t: ^Wt_Tool) {
 Worktree :: struct {
 	r:       ^Runtime,
 	o:       Object,
+	mat_waits: int,
+	mat_done:  proc(ws: ^Worktree),
 	arena:   virtual.Arena,
 	alloc:   runtime.Allocator,
 	root:    string,
@@ -480,21 +482,34 @@ _worktree_begin :: proc(ws: ^Worktree, run: ^Run) -> Error {
 	return .None
 }
 
-worktree_materialized :: proc(ws: ^Worktree) -> bool {
+worktree_await_materialized :: proc(ws: ^Worktree, done: proc(ws: ^Worktree)) -> int {
+	ws.mat_done = done
+	ws.mat_waits = 0
 	for &mb in ws.members {
 		m := mb.m
 		if m == nil || m.history == nil {
 			continue
 		}
 		head, found, herr := fs.history_line(m.history, line_name(mb.run_line), context.temp_allocator)
-		if herr != .None || !found {
+		if herr != .None || !found || fs.mount_holds(m, head) {
 			continue
 		}
-		if !fs.mount_holds(m, head) {
-			return false
-		}
+		ws.mat_waits += 1
+		fs.mount_on_materialized(m, _worktree_mount_materialized, ws)
 	}
-	return true
+	return ws.mat_waits
+}
+
+@(private)
+_worktree_mount_materialized :: proc(m: ^fs.Mount, data: rawptr) {
+	ws := (^Worktree)(data)
+	context = eng.context_for(ws.r.e)
+	ws.mat_waits -= 1
+	if ws.mat_waits == 0 && ws.mat_done != nil {
+		done := ws.mat_done
+		ws.mat_done = nil
+		done(ws)
+	}
 }
 
 worktree_started :: proc(ws: ^Worktree) {
@@ -936,6 +951,11 @@ worktree_hold :: proc(ws: ^Worktree, run: ^Run) {
 
 worktree_close :: proc(ws: ^Worktree) {
 	r := ws.r
+	for &mb in ws.members {
+		if mb.m != nil {
+			fs.mount_materialized_cancel(mb.m, ws)
+		}
+	}
 	for &t in ws.tools {
 		_tool_scopes_close(ws, &t)
 	}
