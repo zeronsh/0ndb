@@ -1653,6 +1653,7 @@ op_agent_chain :: proc(w: ^World, n: ^Node) {
 		strings.write_byte(&b, '\n')
 	}
 	_writer_set(w, n, abs, Writer_Info{scope = scope, agent = true})
+	before := _line_heads(sm.m)
 	err := _disk_write(vfs, abs, transmute([]u8)strings.to_string(b), false)
 	if err != .None || n.disk.dead {
 		_truncated_by_failure(w, op, cur)
@@ -1680,7 +1681,7 @@ op_agent_chain :: proc(w: ^World, n: ^Node) {
 	gained := stat_get(&w.stats, STAT_BASE_MERGED) + stat_get(&w.stats, STAT_BASE_CURRENT) - good
 	lost := stat_get(&w.stats, STAT_BASE_MISMATCH) + stat_get(&w.stats, STAT_BASE_OTHER) - bad
 	if gained == 0 && lost == 0 {
-		deferred_close_note(w, n, sm.root, name, actor)
+		deferred_close_note(w, n, sm.root, name, actor, op.tokens[:], before)
 		return
 	}
 	if gained != 1 || lost != 0 {
