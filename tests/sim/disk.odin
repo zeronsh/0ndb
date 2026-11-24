@@ -833,8 +833,9 @@ _d_sync :: proc(data: rawptr, fd: prim.Fd) -> prim.Error {
 		return err
 	}
 	owned := len(d.ghost_root) > 0 && strings.has_prefix(of.path, d.ghost_root) && (len(of.path) == len(d.ghost_root) || of.path[len(d.ghost_root)] == '/')
-	if d.fail_sync > 0 || _inject_fd(d, fd, false) != .None || _tmp_sync_fail(d, n, of.path) {
-		if d.fail_sync > 0 {
+	armed := d.fail_sync > 0 && !_engine_store(of.path)
+	if armed || _inject_fd(d, fd, false) != .None || _tmp_sync_fail(d, n, of.path) {
+		if armed {
 			d.fail_sync -= 1
 		}
 		if n.kind == .File {
@@ -905,6 +906,11 @@ _d_sync :: proc(data: rawptr, fd: prim.Fd) -> prim.Error {
 	_pend_drop(d, n)
 	clear(&n.pend)
 	return .None
+}
+
+@(private = "file")
+_engine_store :: proc(path: string) -> bool {
+	return path == NODE_DIR + "/registry" || path == NODE_DIR + "/pack" || strings.has_prefix(path, NODE_DIR + "/pack/")
 }
 
 @(private = "file")
