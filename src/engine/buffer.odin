@@ -356,6 +356,9 @@ buffer_open :: proc(e: ^Engine, o: Object, opts: Buffer_Options, allocator := co
 	h.pins += 1
 	append(&e.buffers, b)
 	_buffer_live_follow(e, h, true)
+	if h.sp.repl_on && !e.cfg.buffer_live_off && !e.closing {
+		_live_arm(e)
+	}
 	info.id = b.id
 	info.length = _length(b)
 	info.actor = b.base

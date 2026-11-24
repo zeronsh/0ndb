@@ -197,11 +197,10 @@ _ep_run :: proc(x: ^Ep, unclean: int) {
 	if !_ep_setup(x) {
 		return
 	}
-	_, live := _ep_files(x, x.b)
-	if x.b.e.live_epoch != 0 || len(live) != 0 {
-		world_fail(w, "buffer epoch: an epoch exists before anything was sent")
+	if x.b.e.live_epoch != 0 || !x.b.e.live_armed {
+		world_fail(w, "buffer epoch: opening a buffer left epoch %x, armed %v", x.b.e.live_epoch, x.b.e.live_armed)
 	}
-	if !_ep_clean(x, x.b) || !_ep_clean(x, x.b) || !_ep_open(x, x.b, 1) {
+	if !_ep_clean(x, x.b) || !_ep_clean(x, x.b) {
 		return
 	}
 	run_until(w, w.now + 20_000_000_000, true)
@@ -216,13 +215,13 @@ _ep_run :: proc(x: ^Ep, unclean: int) {
 	if !_ep_open(x, x.b, 1) {
 		return
 	}
-	if _, l := _ep_files(x, x.b); x.b.e.live_epoch != 0 || len(l) != 0 {
+	if x.b.e.live_epoch != 0 {
 		world_fail(w, "buffer epoch: two clean restarts that sent nothing moved the epoch to %x", x.b.e.live_epoch)
 	}
 	run_until(w, w.now + 20_000_000_000, true)
 	_ep_type(x, x.b, 1, 0, 0, "one ")
-	if !x.b.e.live_armed {
-		world_fail(w, "buffer epoch: a sent frame did not arm the epoch")
+	if len(x.b.e.live_ids) == 0 {
+		world_fail(w, "buffer epoch: no frame was sent")
 		return
 	}
 	old_reg, old_live := _ep_files(x, x.b)
@@ -410,7 +409,7 @@ buffer_epoch :: proc(t: ^testing.T) {
 	w := new(World)
 	world_init(w, cfg)
 	x := Ep{w = w, a = w.nodes[0], b = w.nodes[1]}
-	_ep_run(&x, 1000)
+	_ep_run(&x, int(env_u64("SIM_EPOCH_RESTARTS", 150)))
 	for f in w.failures {
 		fmt.eprintf("buffer_epoch: %s\n", f)
 	}

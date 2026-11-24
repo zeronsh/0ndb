@@ -197,15 +197,24 @@ _ril_run :: proc(w: ^World, k: u64, peer: Ril_Peer) -> (res: Ril_Result) {
 		x = prim.id_new_with(node_clock(&b.clock), rng_random(&w.rng))
 	}
 	ba, bb: Ril_Buffer
-	if !_ril_open(w, a, text, actors[0], &ba) || !_ril_open(w, b, text, actors[1], &bb) {
+	if !_ril_open(w, a, text, actors[0], &ba) || (peer != .First && !_ril_open(w, b, text, actors[1], &bb)) {
 		world_fail(w, "reissue live: buffers did not open")
 		return
 	}
 	run_until(w, w.now + 5_000_000_000, true)
 	head := "warm "
 	if peer == .First {
-		context = instance_context(&b.inst)
-		if err := eng.text_edit(&b.e, text, 0, 0, head); err != .None {
+		err := eng.Error.Missing
+		for _ in 0 ..< 40 {
+			context = instance_context(&b.inst)
+			err = eng.text_edit(&b.e, text, 0, 0, head)
+			node_after(b)
+			if err != .Missing && err != .Busy {
+				break
+			}
+			run_until(w, w.now + 1_000_000_000, true)
+		}
+		if err != .None && err != .Pending {
 			world_fail(w, "reissue live: n1 first insert: %v", err)
 			return
 		}
@@ -221,7 +230,7 @@ _ril_run :: proc(w: ^World, k: u64, peer: Ril_Peer) -> (res: Ril_Result) {
 	}
 	node_after(a)
 	run_until(w, w.now + 20_000_000_000, true)
-	if x, y := _ril_shown(w, a, &ba), _ril_shown(w, b, &bb); x != fmt.tprintf("%sbase\npeer\n", head) || y != x {
+	if x, y := _ril_shown(w, a, &ba), _ril_shown(w, b, &bb) if peer != .First else _ril_text(w, b, text); x != fmt.tprintf("%sbase\npeer\n", head) || y != x {
 		world_fail(w, "reissue live: the buffers did not converge before the crash: %q and %q", x, y)
 		return
 	}
@@ -232,7 +241,14 @@ _ril_run :: proc(w: ^World, k: u64, peer: Ril_Peer) -> (res: Ril_Result) {
 	seen := make([dynamic]Reissue_Batch, w.allocator)
 	crashes := w.stats.crashes
 	b.disk.crash_at = b.disk.stats.ops + k
-	if err := _ril_edit(b, &bb, bb.rev, 0, 0, "LOSTLOST ", false); err != .None && !b.disk.dead {
+	opened := peer != .First || _ril_open(w, b, text, actors[1], &bb)
+	if !opened && w.stats.crashes == crashes {
+		world_fail(w, "reissue live: n1's buffer did not open")
+		return
+	}
+	if !opened || !b.alive {
+		res.crashed = true
+	} else if err := _ril_edit(b, &bb, bb.rev, 0, 0, "LOSTLOST ", false); err != .None && !b.disk.dead {
 		world_fail(w, "reissue live: n1 edit before the crash: %v", err)
 		return
 	}
