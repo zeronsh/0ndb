@@ -2356,8 +2356,11 @@ mount_durable_now :: proc(m: ^Mount) -> bool {
 	fp := history_fp(h)
 	if fp != h.mark_fp {
 		h.mark += 1
+		if h.content_dirty {
+			h.content_mark = h.mark
+			h.content_dirty = false
+		}
 		h.mark_fp = fp
-		h.content_mark = h.mark
 	}
 	if (h.content_mark if m.mat_fast else h.mark) <= h.durable {
 		return true
@@ -2432,8 +2435,11 @@ mount_settle :: proc(m: ^Mount) -> Error {
 	}
 	if fp != h.mark_fp {
 		h.mark += 1
+		if h.content_dirty {
+			h.content_mark = h.mark
+			h.content_dirty = false
+		}
 		h.mark_fp = fp
-		h.content_mark = h.mark
 	}
 	shadow_flush(m) or_return
 	if n := len(m.waits); n > 0 && m.waits[n - 1].mark == h.mark {
