@@ -44,7 +44,7 @@ Named_Arm :: struct {
 NV_EDIT :: "edit line\n"
 
 @(private = "file")
-NV_STEPS_LANDED :: false
+NV_STEPS_LANDED :: true
 
 @(private = "file")
 NV_OTHER :: "other line\n"

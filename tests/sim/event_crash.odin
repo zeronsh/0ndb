@@ -32,7 +32,7 @@ EC_TWO :: "edit two\n"
 EC_ROOT_2 :: "/work/event-crash2-n0-git"
 
 @(private = "file")
-EC_STEPS_LANDED :: false
+EC_STEPS_LANDED :: true
 
 @(private = "file")
 EC_MORE :: "more line\n"

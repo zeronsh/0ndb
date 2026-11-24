@@ -1691,6 +1691,7 @@ mat_snapshot_named :: proc(m: ^Mount, it: ^Mat_Item, at: []fstree.Op_Id, base, p
 			builder_init(&b, h, actor)
 			emit_text_edits(m, &b, it.inode, it.path, old, data) or_return
 			if attributed {
+				step_mark(&b, a.step)
 				if mk := scope_marker(who, a.scope); mk != nil {
 					builder_opaque(&b, mk)
 				}
@@ -1752,6 +1753,7 @@ mat_snapshot_writer :: proc(m: ^Mount, it: ^Mat_Item, a: Attrib, st: Stat, data:
 			b: Builder
 			builder_init(&b, h, actor)
 			emit_text_edits(m, &b, it.inode, it.path, old, data) or_return
+			step_mark(&b, a.step)
 			if mk := scope_marker(a.actor, a.scope); mk != nil {
 				builder_opaque(&b, mk)
 			}

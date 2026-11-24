@@ -157,6 +157,8 @@ switch_advance :: proc(m: ^Mount) -> (finished: bool, err: Error) {
 		}
 		m.switch_fence_ok = false
 		switch_line_ensure(m, to) or_return
+		shown_put(&m.shown, m.line, m.synced[:], m.allocator)
+		shown_named(m) or_return
 		delete(m.line, m.allocator)
 		m.line, _ = clone_string(to, m.allocator)
 		mount_line_actor(m) or_return

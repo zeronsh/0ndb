@@ -38,6 +38,7 @@ TOP_OBSERVE :: u8(19)
 TOP_RENAMED :: u8(21)
 TOP_ACCEPT :: u8(22)
 TOP_SCOPE :: u8(23)
+TOP_STEP :: u8(24)
 TOP_REVERT :: u8(20)
 
 OBSERVE_VERSION :: u8(1)
@@ -980,6 +981,22 @@ encode_scope :: proc(buf: ^[dynamic]u8, scope: prim.Id) {
 	prim.write_u8(&w, TOP_SCOPE)
 	prim.write_u8(&w, 1)
 	prim.write_id(&w, scope)
+}
+
+encode_step :: proc(buf: ^[dynamic]u8, step: prim.Id) {
+	w := prim.writer(buf)
+	prim.write_u8(&w, TOP_STEP)
+	prim.write_u8(&w, 1)
+	prim.write_id(&w, step)
+}
+
+decode_step :: proc(content: []u8) -> (step: prim.Id, ok: bool) {
+	r := prim.reader(content)
+	if prim.read_u8(&r) != TOP_STEP || prim.read_u8(&r) != 1 {
+		return
+	}
+	step = prim.read_id(&r)
+	return step, prim.reader_ok(&r) && prim.reader_remaining(&r) == 0
 }
 
 decode_scope :: proc(content: []u8) -> (scope: prim.Id, ok: bool) {

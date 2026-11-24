@@ -1242,6 +1242,45 @@ history_marked :: proc(h: ^History, from: i64, mark: []u8, out: ^[dynamic]Intent
 }
 
 @(private)
+history_steps :: proc(h: ^History, from: i64, out: ^map[prim.Id]bool, redacted: ^bool) -> Error {
+	end := journal.journal_durable_len(&h.journal)
+	if from >= end {
+		return .None
+	}
+	r: journal.Reader
+	journal.journal_reader(&h.journal, &r, context.temp_allocator)
+	defer journal.reader_close(&r)
+	off := max(from, 0)
+	for off < end {
+		body, next, jerr := journal.record_at(&r, off)
+		if jerr == .Redacted && next > off {
+			off = next
+			redacted^ = true
+			continue
+		}
+		if jerr != .None {
+			return from_journal(jerr)
+		}
+		off = next
+		if len(body) == 0 || body[0] != REC_BATCH {
+			continue
+		}
+		b, derr := crdt.batch_decode(body[1:], context.temp_allocator, &h.dict)
+		if derr != .None {
+			return .Corrupt
+		}
+		for op in b.ops {
+			if op.kind == .Opaque && len(op.content) > 0 {
+				if step, sok := fshist.decode_step(op.content); sok {
+					out[step] = true
+				}
+			}
+		}
+	}
+	return .None
+}
+
+@(private)
 line_after :: proc(h: ^History, name: string, parents: []crdt.Lv, last: crdt.Op_Id) -> (key: []u8, version: []u8, err: Error) {
 	key = line_key(name, context.temp_allocator)
 	out := make([dynamic]crdt.Op_Id, context.temp_allocator)

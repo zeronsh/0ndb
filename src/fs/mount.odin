@@ -442,6 +442,10 @@ Mount :: struct {
 	shadow:      Shadow,
 	ignore:      Ignore,
 	awake:       bool,
+	shown:       map[string][]crdt.Op_Id,
+	shown_paths: map[string][dynamic]Shown_Path,
+	named:       map[string]bool,
+	named_known: bool,
 	synced:      [dynamic]crdt.Op_Id,
 	placed:      [dynamic]crdt.Op_Id,
 	has_placed:  bool,
@@ -482,6 +486,8 @@ Mount :: struct {
 	attrib:      map[string]Attrib,
 	log_fd:      prim.Fd,
 	attrib_chain: map[string][dynamic]Attrib_Step,
+	landed: map[prim.Id]bool,
+	landed_gone: bool,
 	log_sync:    ^Log_Sync,
 	log_next:    [dynamic]Obs_Wait,
 	log_len:     i64,
@@ -667,6 +673,8 @@ mount_open :: proc(m: ^Mount, reg: ^Registry, h: ^History, db: ^odb.Odb, id: pri
 	m.open_scopes = make(map[string]^Scope, allocator)
 	m.fences = make([dynamic]Fence, allocator)
 	m.intents = make([dynamic]Intent, allocator)
+	m.landed = make(map[prim.Id]bool, allocator)
+	m.named = make(map[string]bool, allocator)
 	m.unwatched = make([dynamic]string, allocator)
 	m.collided = make([dynamic]string, allocator)
 	m.absent = make([dynamic]string, allocator)
@@ -768,6 +776,7 @@ mount_open :: proc(m: ^Mount, reg: ^Registry, h: ^History, db: ^odb.Odb, id: pri
 @(private)
 mount_open_rest :: proc(m: ^Mount, fresh: bool) -> Error {
 	if fresh {
+		m.named_known = shadow_empty(&m.shadow) or_return
 		save_mount_state(m) or_return
 		mount_import(m) or_return
 	} else if !m.imported {
@@ -881,6 +890,11 @@ mount_close :: proc(m: ^Mount) {
 		delete(k, m.allocator)
 	}
 	delete(m.attrib_chain)
+	delete(m.landed)
+	for k in m.named {
+		delete(k, m.allocator)
+	}
+	delete(m.named)
 	if m.shadow.dir != "" {
 		shadow_close(&m.shadow)
 	}
@@ -971,6 +985,8 @@ mount_close :: proc(m: ^Mount) {
 	}
 	delete(m.open_scopes)
 	delete(m.synced)
+	shown_free(&m.shown, m.allocator)
+	shown_paths_free(&m.shown_paths, m.allocator)
 	delete(m.placed)
 	for p in m.reverts {
 		delete(p.before)
@@ -1016,6 +1032,7 @@ mount_wake :: proc(m: ^Mount) -> Error {
 	if !shadow_attached(&m.shadow) {
 		if m.shadow.dir == "" {
 			shadow_open(&m.shadow, m.vfs, sp, format, m.allocator) or_return
+			m.shadow.named = &m.named
 			if m.history != nil {
 				m.shadow.clock = m.history.opts.clock
 			}
@@ -1397,8 +1414,9 @@ _observe_begin :: proc(m: ^Mount, rel: string, scope: ^Scope, since: Observe_Sin
 	if c, ok := m.attrib[rel]; ok && c.actor == scope.actor && !c.used {
 		return false, .None
 	}
-	attrib_set(m, rel, scope.actor, false, {}, scope.id)
-	if aerr := attrib_log_append(m, rel, scope.actor, {}, scope.id); aerr != .None {
+	base := observe_base(m, rel, scope)
+	attrib_set(m, rel, scope.actor, false, {}, scope.id, base)
+	if aerr := attrib_log_append(m, rel, scope.actor, {}, scope.id, base); aerr != .None {
 		return false, aerr
 	}
 	return m.log_fd >= 0, .None
@@ -1542,6 +1560,19 @@ attrib_log_open :: proc(m: ^Mount) -> Error {
 		if prim.reader_remaining(&rd) >= len(sc) {
 			sc = prim.read_id(&rd)
 		}
+		base: Step_Base
+		step: prim.Id
+		if prim.reader_remaining(&rd) > 0 {
+			bok: bool
+			if base, bok = step_base_read(&rd); !bok {
+				break
+			}
+		}
+		at: i64
+		if prim.reader_remaining(&rd) >= len(step) {
+			step = prim.read_id(&rd)
+			at = prim.read_ivarint(&rd)
+		}
 		if !prim.reader_ok(&rd) {
 			break
 		}
@@ -1555,10 +1586,10 @@ attrib_log_open :: proc(m: ^Mount) -> Error {
 				base_step := actor == m.actor && o != {} && sc == {}
 				b, pending := m.attrib[path]
 				if !base_step || !pending || b.used {
-					attrib_set(m, path, actor, false, o, sc)
+					attrib_set(m, path, actor, false, o, sc, base, step, at)
 				}
 				if o != {} {
-					attrib_chain_add(m, path, Attrib_Step{actor, o, sc})
+					attrib_chain_add(m, path, Attrib_Step{actor, o, sc, base, step, at})
 				}
 			}
 		}
@@ -1569,7 +1600,7 @@ attrib_log_open :: proc(m: ^Mount) -> Error {
 }
 
 @(private)
-attrib_log_append :: proc(m: ^Mount, rel: string, actor: prim.Id, oid := odb.Oid{}, scope := prim.Id{}) -> Error {
+attrib_log_append :: proc(m: ^Mount, rel: string, actor: prim.Id, oid := odb.Oid{}, scope := prim.Id{}, base := Step_Base{}, step := prim.Id{}, at := i64(0)) -> Error {
 	if m.log_fd < 0 {
 		return save_mount_state(m)
 	}
@@ -1577,12 +1608,19 @@ attrib_log_append :: proc(m: ^Mount, rel: string, actor: prim.Id, oid := odb.Oid
 	w := prim.writer(&body)
 	prim.write_str(&w, rel)
 	prim.write_id(&w, actor)
-	if oid != {} || scope != {} {
+	if oid != {} || scope != {} || base.kind != STEP_BASE_NONE || step != {} {
 		o := oid
 		prim.write_raw(&w, o[:])
 	}
-	if scope != {} {
+	if scope != {} || base.kind != STEP_BASE_NONE || step != {} {
 		prim.write_id(&w, scope)
+	}
+	if base.kind != STEP_BASE_NONE || step != {} {
+		step_base_write(&w, base)
+	}
+	if step != {} {
+		prim.write_id(&w, step)
+		prim.write_ivarint(&w, at)
 	}
 	rec := make([]u8, 8 + len(body), context.temp_allocator)
 	prim.put_u32le(rec[0:4], u32(len(body)))
@@ -1597,6 +1635,9 @@ Attrib_Step :: struct {
 	actor: prim.Id,
 	oid:   odb.Oid,
 	scope: prim.Id,
+	base:  Step_Base,
+	step:  prim.Id,
+	at:    i64,
 }
 
 @(private)
@@ -1688,8 +1729,10 @@ mount_closed :: proc(m: ^Mount, rel: string) {
 	if has_prev && prev.kind == .File && prev.oid != {} && prev.oid != oid && a.oid != prev.oid && attrib_base_stored(m, prev) {
 		attrib_log_append(m, rel, m.actor, prev.oid)
 	}
-	attrib_set(m, rel, a.actor, false, oid, a.scope)
-	if attrib_log_append(m, rel, a.actor, oid, a.scope) == .None {
+	step := step_new(m)
+	at := mount_jlen(m)
+	attrib_set(m, rel, a.actor, false, oid, a.scope, a.base, step, at)
+	if attrib_log_append(m, rel, a.actor, oid, a.scope, a.base, step, at) == .None {
 		attrib_log_durable(m, nil, nil)
 	}
 }
@@ -1992,8 +2035,14 @@ scope_close :: proc(reg: ^Registry, s: ^Scope) -> Error {
 				}
 				v := sm.dirty[k]
 				if v == s {
-					attrib_set(sm, k, s.actor, false, {}, s.id)
-					attrib_log_append(sm, k, s.actor, {}, s.id)
+					base := Step_Base{}
+					if prev, had := sm.attrib[k]; had && prev.scope == s.id && prev.actor == s.actor {
+						base = prev.base
+					} else {
+						base = observe_base(sm, k, s)
+					}
+					attrib_set(sm, k, s.actor, false, {}, s.id, base)
+					attrib_log_append(sm, k, s.actor, {}, s.id, base)
 				}
 			}
 			scope_retire_unwritten(sm, s)
@@ -2224,6 +2273,75 @@ load_mount_state :: proc(m: ^Mount) -> (fresh: bool, err: Error) {
 		rec_head.commit = prim.read_str(&rd)
 		rec_reflog = prim.read_ivarint(&rd)
 	}
+	if prim.reader_remaining(&rd) > 0 {
+		nr := prim.read_uvarint(&rd)
+		if nr > u64(prim.reader_remaining(&rd)) {
+			return false, .Corrupt
+		}
+		for _ in 0 ..< nr {
+			k := prim.read_str(&rd)
+			row := decode_version(prim.read_bytes(&rd), context.temp_allocator) or_return
+			if !prim.reader_ok(&rd) {
+				return false, .Corrupt
+			}
+			shown_put(&m.shown, k, row, m.allocator)
+		}
+	}
+	if prim.reader_remaining(&rd) > 0 {
+		ns := prim.read_uvarint(&rd)
+		if ns > u64(prim.reader_remaining(&rd)) {
+			return false, .Corrupt
+		}
+		for _ in 0 ..< ns {
+			k := prim.read_str(&rd)
+			step := prim.read_id(&rd)
+			at := prim.read_ivarint(&rd)
+			base, bok := step_base_read(&rd)
+			if !bok || !prim.reader_ok(&rd) {
+				return false, .Corrupt
+			}
+			if a, ok := &m.attrib[k]; ok {
+				a.step = step
+				a.at = at
+				a.base = base
+			}
+		}
+	}
+	if prim.reader_remaining(&rd) > 0 {
+		np := prim.read_uvarint(&rd)
+		if np > u64(prim.reader_remaining(&rd)) {
+			return false, .Corrupt
+		}
+		for _ in 0 ..< np {
+			k := prim.read_str(&rd)
+			nl := prim.read_uvarint(&rd)
+			if nl > u64(prim.reader_remaining(&rd)) {
+				return false, .Corrupt
+			}
+			for _ in 0 ..< nl {
+				path := prim.read_str(&rd)
+				ids := decode_version(prim.read_bytes(&rd), context.temp_allocator) or_return
+				if !prim.reader_ok(&rd) {
+					return false, .Corrupt
+				}
+				shown_path_add(&m.shown_paths, k, path, ids, m.allocator)
+			}
+		}
+	}
+	if prim.reader_remaining(&rd) > 0 {
+		m.named_known = prim.read_bool(&rd)
+		nn := prim.read_uvarint(&rd)
+		if nn > u64(prim.reader_remaining(&rd)) {
+			return false, .Corrupt
+		}
+		for _ in 0 ..< nn {
+			k := prim.read_str(&rd)
+			if k not_in m.named {
+				c, _ := clone_string(k, m.allocator)
+				m.named[c] = true
+			}
+		}
+	}
 	m.jpend = m.jpos
 	if !prim.reader_ok(&rd) {
 		return false, .Corrupt
@@ -2292,6 +2410,10 @@ Mount_Image :: struct {
 	chained:    bool,
 	line:       string,
 	absent:     [dynamic]string,
+	shown:      map[string][]crdt.Op_Id,
+	shown_paths: map[string][dynamic]Shown_Path,
+	named:       [dynamic]string,
+	named_known: bool,
 }
 
 Mount_Wait :: struct {
@@ -2336,6 +2458,21 @@ image_take :: proc(m: ^Mount, img: ^Mount_Image) {
 		c, _ := clone_string(a, m.allocator)
 		append(&img.absent, c)
 	}
+	for k, v in prim.unordered(m.shown) {
+		shown_put(&img.shown, k, v, m.allocator)
+	}
+	for k, l in prim.unordered(m.shown_paths) {
+		for sp in l {
+			shown_path_add(&img.shown_paths, k, sp.path, sp.ids, m.allocator)
+		}
+	}
+	img.named_known = m.named_known
+	img.named = make([dynamic]string, m.allocator)
+	named_prune(m)
+	for k in prim.sorted_keys(m.named) {
+		c, _ := clone_string(k, m.allocator)
+		append(&img.named, c)
+	}
 }
 
 @(private)
@@ -2352,6 +2489,12 @@ image_free :: proc(m: ^Mount, img: ^Mount_Image) {
 		delete(a, m.allocator)
 	}
 	delete(img.absent)
+	shown_free(&img.shown, m.allocator)
+	shown_paths_free(&img.shown_paths, m.allocator)
+	for c in img.named {
+		delete(c, m.allocator)
+	}
+	delete(img.named)
 	img^ = {}
 }
 
@@ -2389,16 +2532,181 @@ Attrib :: struct {
 	used:  bool,
 	oid:   odb.Oid,
 	scope: prim.Id,
+	base:  Step_Base,
+	step:  prim.Id,
+	at:    i64,
+}
+
+STEP_BASE_NONE :: u8(0)
+STEP_BASE_VERSION :: u8(1)
+STEP_BASE_CHAIN :: u8(2)
+STEP_BASE_CONTENT :: u8(3)
+STEP_BASE_HEADS :: 4
+
+Step_Base :: struct {
+	kind: u8,
+	oid:  odb.Oid,
+	n:    u8,
+	ver:  [STEP_BASE_HEADS]crdt.Op_Id,
 }
 
 @(private)
-attrib_set :: proc(m: ^Mount, path: string, actor: prim.Id, used := false, oid := odb.Oid{}, scope := prim.Id{}) {
+attrib_set :: proc(m: ^Mount, path: string, actor: prim.Id, used := false, oid := odb.Oid{}, scope := prim.Id{}, base := Step_Base{}, step := prim.Id{}, at := i64(0)) {
 	if p, ok := &m.attrib[path]; ok {
-		p^ = Attrib{actor, used, oid, scope}
+		p^ = Attrib{actor, used, oid, scope, base, step, at}
 		return
 	}
 	k, _ := clone_string(path, m.allocator)
-	m.attrib[k] = Attrib{actor, used, oid, scope}
+	m.attrib[k] = Attrib{actor, used, oid, scope, base, step, at}
+}
+
+@(private)
+landed_read :: proc(m: ^Mount) -> Error {
+	clear(&m.landed)
+	m.landed_gone = false
+	from := max(i64)
+	for _, l in prim.unordered(m.attrib_chain) {
+		for st in l {
+			if st.step != {} {
+				from = min(from, st.at)
+			}
+		}
+	}
+	for _, a in prim.unordered(m.attrib) {
+		if a.step != {} {
+			from = min(from, a.at)
+		}
+	}
+	if from == max(i64) {
+		return .None
+	}
+	history_steps(m.history, min(from, m.jpos), &m.landed, &m.landed_gone) or_return
+	for _, &a in m.attrib {
+		if a.step != {} && a.step in m.landed {
+			a.used = true
+		}
+	}
+	return .None
+}
+
+@(private)
+step_new :: proc(m: ^Mount) -> (id: prim.Id) {
+	prim.random_fill(m.reg.random if m.reg != nil else prim.Random{}, id[:])
+	return
+}
+
+@(private)
+step_base_write :: proc(w: ^prim.Writer, base: Step_Base) {
+	prim.write_u8(w, base.kind)
+	if base.kind == STEP_BASE_NONE {
+		return
+	}
+	bo := base.oid
+	prim.write_raw(w, bo[:])
+	prim.write_uvarint(w, u64(base.n))
+	bv := base.ver
+	for id in bv[:base.n] {
+		prim.write_id(w, id.actor)
+		prim.write_uvarint(w, id.seq)
+	}
+}
+
+@(private)
+step_base_read :: proc(rd: ^prim.Reader) -> (base: Step_Base, ok: bool) {
+	base.kind = prim.read_u8(rd)
+	if base.kind == STEP_BASE_NONE {
+		return base, prim.reader_ok(rd)
+	}
+	if base.kind > STEP_BASE_CONTENT {
+		return {}, false
+	}
+	prim.read_fixed(rd, base.oid[:])
+	n := prim.read_uvarint(rd)
+	if n > STEP_BASE_HEADS {
+		return {}, false
+	}
+	base.n = u8(n)
+	for i in 0 ..< int(n) {
+		base.ver[i].actor = prim.read_id(rd)
+		base.ver[i].seq = prim.read_uvarint(rd)
+	}
+	return base, prim.reader_ok(rd)
+}
+
+@(private)
+step_base_version :: proc(v: []crdt.Op_Id, oid: odb.Oid) -> (b: Step_Base) {
+	if len(v) == 0 || len(v) > STEP_BASE_HEADS {
+		return Step_Base{kind = STEP_BASE_CONTENT, oid = oid}
+	}
+	b.kind = STEP_BASE_VERSION
+	b.oid = oid
+	b.n = u8(len(v))
+	copy(b.ver[:], v)
+	return
+}
+
+@(private)
+observe_base :: proc(m: ^Mount, rel: string, scope: ^Scope) -> Step_Base {
+	h := m.history
+	if h == nil || m.db == nil {
+		return {}
+	}
+	if p := _pin(scope, rel, false); p != nil {
+		if p.has_read {
+			if t, err := history_text_at(h, p.read_inode, p.read[:], context.temp_allocator); err == .None && _content_hash(t) == p.read_hash {
+				if oid, werr := odb.write(m.db, .Blob, t); werr == .None {
+					return step_base_version(p.read[:], oid)
+				}
+			}
+		}
+		if p.has_write && p.has_base {
+			if t, err := history_text_at(h, p.write_inode, p.write[:], context.temp_allocator); err == .None && _content_hash(t) == p.base_hash {
+				if oid, werr := odb.write(m.db, .Blob, t); werr == .None {
+					return step_base_version(p.write[:], oid)
+				}
+			}
+		}
+	}
+	e, found, serr := shadow_get(&m.shadow, rel)
+	if serr != .None || !found || e.kind != .File {
+		return {}
+	}
+	if !disk_matches(m, rel, e) {
+		abuf: prim.Path_Buf
+		abs := abs_path(m, rel, abuf[:])
+		st, lerr := prim.lstat(m.vfs, abs)
+		if lerr != .None || st.kind != .File || st.size > m.opts.large_limit {
+			return Step_Base{kind = STEP_BASE_CHAIN}
+		}
+		data, rerr := prim.read_file(m.vfs, abs, context.temp_allocator)
+		if rerr != .None {
+			return Step_Base{kind = STEP_BASE_CHAIN}
+		}
+		clean, cok := eol_clean(m, rel, data, e.inode, true)
+		if !cok {
+			return Step_Base{kind = STEP_BASE_CHAIN}
+		}
+		oid, werr := odb.write(m.db, .Blob, clean)
+		if werr != .None {
+			return Step_Base{kind = STEP_BASE_CHAIN}
+		}
+		return Step_Base{kind = STEP_BASE_CHAIN, oid = oid}
+	}
+	at, text, terr := _pin_at(m, rel, e.inode)
+	if terr != .None {
+		return {}
+	}
+	oid, werr := odb.write(m.db, .Blob, text)
+	if werr != .None {
+		return {}
+	}
+	if oid != e.oid {
+		if e.oid != {} && odb.exists(m.db, e.oid) {
+			return Step_Base{kind = STEP_BASE_CONTENT, oid = e.oid}
+		}
+		return {}
+	}
+	return step_base_version(at, oid)
 }
 
 @(private)
@@ -2574,6 +2882,43 @@ save_mount_state :: proc(m: ^Mount) -> Error {
 	prim.write_str(&w, rec.head.branch)
 	prim.write_str(&w, rec.head.commit)
 	prim.write_ivarint(&w, rec.reflog_pos)
+	prim.write_uvarint(&w, u64(len(img.shown)))
+	for k in sorted_strings(img.shown) {
+		rb := make([dynamic]u8, context.temp_allocator)
+		encode_version(&rb, img.shown[k])
+		prim.write_str(&w, k)
+		prim.write_bytes(&w, rb[:])
+	}
+	stepped := make([dynamic]string, context.temp_allocator)
+	for k in sorted_strings(attrib) {
+		if attrib[k].step != {} || attrib[k].base.kind != STEP_BASE_NONE {
+			append(&stepped, k)
+		}
+	}
+	prim.write_uvarint(&w, u64(len(stepped)))
+	for k in stepped {
+		prim.write_str(&w, k)
+		prim.write_id(&w, attrib[k].step)
+		prim.write_ivarint(&w, attrib[k].at)
+		step_base_write(&w, attrib[k].base)
+	}
+	prim.write_uvarint(&w, u64(len(img.shown_paths)))
+	for k in sorted_strings(img.shown_paths) {
+		prim.write_str(&w, k)
+		l := img.shown_paths[k]
+		prim.write_uvarint(&w, u64(len(l)))
+		for sp in l {
+			prim.write_str(&w, sp.path)
+			pv := make([dynamic]u8, context.temp_allocator)
+			encode_version(&pv, sp.ids)
+			prim.write_bytes(&w, pv[:])
+		}
+	}
+	prim.write_bool(&w, img.named_known)
+	prim.write_uvarint(&w, u64(len(img.named)))
+	for k in img.named {
+		prim.write_str(&w, k)
+	}
 	sum := xxhash.XXH3_64_with_seed(buf[:], 0) | 1
 	if sum == m.saved {
 		return .None
@@ -2626,6 +2971,7 @@ intents_dedupe :: proc(list: ^[dynamic]Intent) {
 mount_recover :: proc(m: ^Mount) -> Error {
 	h := m.history
 	if h != nil {
+		landed_read(m) or_return
 		history_marked(h, m.jpos, commit_mark(m), &m.intents) or_return
 	}
 	intents_dedupe(&m.intents)

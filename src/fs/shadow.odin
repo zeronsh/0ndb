@@ -114,6 +114,7 @@ Shadow :: struct {
 	ver_index:  map[u64]u32,
 	ver_gen:    u32,
 	ver_ids:    [dynamic]fstree.Op_Id,
+	named:      ^map[string]bool,
 }
 
 SHADOW_VERSION_MAX :: 1024
@@ -410,6 +411,15 @@ shadow_put :: proc(s: ^Shadow, path: string, e: Entry) -> Error {
 }
 
 @(private = "file")
+named_note :: proc(s: ^Shadow, path: string, e: Entry) {
+	if s.named == nil || e.kind != .File || e.ver == 0 || path in s.named {
+		return
+	}
+	k, _ := clone_string(path, s.named.allocator)
+	s.named[k] = true
+}
+
+@(private = "file")
 racy_mark :: proc(s: ^Shadow, e: Entry) -> Entry {
 	ne := e
 	if ne.kind == .File && s.clock.wall_ms != nil {
@@ -445,6 +455,7 @@ shadow_append :: proc(s: ^Shadow, path: string, e: Entry) -> Error {
 	defer if s.lock != nil {
 		sync.mutex_unlock(s.lock)
 	}
+	named_note(s, path, e)
 	p, aerr := clone_string(path, s.allocator)
 	if aerr != nil {
 		return .No_Memory
@@ -797,6 +808,7 @@ pending_set :: proc(s: ^Shadow, path: string, del: bool, e: Entry) -> Error {
 		if _, ok := shadow_version(s, e); !ok {
 			return .Corrupt
 		}
+		named_note(s, path, e)
 	}
 	if i, ok := s.index[path]; ok {
 		p := &s.pending[i]

@@ -1246,6 +1246,9 @@ Change :: struct {
 	scope:   ^Scope,
 	actor:   prim.Id,
 	scope_id: prim.Id,
+	step: prim.Id,
+	base: Step_Base,
+	at: i64,
 	moved:   string,
 	carried: bool,
 	copy_src: fstree.Inode_Id,
@@ -1266,6 +1269,7 @@ Pass :: struct {
 	rebased:    [dynamic]crdt.Op_Id,
 	stash:      map[fstree.Inode_Id][dynamic]Stashed,
 	restored:   bool,
+	departing:  bool,
 	scope_of:   map[string]^Scope,
 	cutoff:     i64,
 	now:        i64,
@@ -1346,6 +1350,7 @@ commit_group :: proc(p: ^Pass, b: ^Builder, indices: []int) -> Error {
 		if err = emit_change(p, b, &p.changes[i]); err != .None {
 			break
 		}
+		step_mark(b, p.changes[i].step)
 	}
 	if err == .None {
 		err = builder_commit(m, b)
@@ -1371,8 +1376,14 @@ attribute_consumed :: proc(p: ^Pass, actor: prim.Id, idx: []int, scope := prim.I
 		if serr != .None || !found || e.oid == {} {
 			continue
 		}
-		attrib_set(m, c.path, actor, true, e.oid, scope)
-		attrib_log_append(m, c.path, actor, e.oid, scope) or_return
+		if m.db != nil && !odb.exists(m.db, e.oid) {
+			data, oid, _, ok := read_content(m, c.path, c.stat, e.inode, true) or_return
+			if ok && oid == e.oid {
+				odb.write(m.db, .Blob, data)
+			}
+		}
+		attrib_set(m, c.path, actor, true, e.oid, scope, c.base, c.step, c.at)
+		attrib_log_append(m, c.path, actor, e.oid, scope, c.base, c.step, c.at) or_return
 		logged = true
 	}
 	if logged {
@@ -1384,6 +1395,17 @@ attribute_consumed :: proc(p: ^Pass, actor: prim.Id, idx: []int, scope := prim.I
 @(private)
 attribute_changes :: proc(p: ^Pass) -> Error {
 	m := p.m
+	consumed := make(map[string]bool, context.temp_allocator)
+	defer if len(consumed) > 0 {
+		keep := make([dynamic]Change, 0, len(p.changes), context.temp_allocator)
+		for c in p.changes {
+			if !consumed[c.path] {
+				append(&keep, c)
+			}
+		}
+		clear(&p.changes)
+		append(&p.changes, ..keep[:])
+	}
 	for &c in p.changes {
 		if c.scope != nil {
 			continue
@@ -1404,8 +1426,8 @@ attribute_changes :: proc(p: ^Pass) -> Error {
 			append(&steps, ..chain[:])
 			attrib_chain_drop(m, c.path)
 		}
-		if has && a.oid != {} && (len(steps) == 0 || steps[len(steps) - 1] != Attrib_Step{a.actor, a.oid, a.scope}) {
-			append(&steps, Attrib_Step{a.actor, a.oid, a.scope})
+		if has && a.oid != {} && (len(steps) == 0 || steps[len(steps) - 1] != Attrib_Step{a.actor, a.oid, a.scope, a.base, a.step, a.at}) {
+			append(&steps, Attrib_Step{a.actor, a.oid, a.scope, a.base, a.step, a.at})
 		}
 		if !m.lost {
 			kept := 0
@@ -1428,7 +1450,7 @@ attribute_changes :: proc(p: ^Pass) -> Error {
 			}
 			continue
 		}
-		_, disk_oid, _, ok := read_content(m, c.path, c.stat, c.old.inode, c.kind == .Modify) or_return
+		disk_data, disk_oid, _, ok := read_content(m, c.path, c.stat, c.old.inode, c.kind == .Modify) or_return
 		if !ok {
 			if has {
 				c.actor = a.actor
@@ -1437,27 +1459,48 @@ attribute_changes :: proc(p: ^Pass) -> Error {
 			continue
 		}
 		matched, broken, gone := false, false, false
+		replayed := false
+		last: Attrib_Step
 		cur := c.old.oid if c.kind == .Modify else odb.Oid{}
-		for st in steps {
-			if disk_oid == st.oid {
-				c.actor = st.actor
-				c.scope_id = st.scope
-				matched = true
-				break
-			}
-			if st.oid == cur {
+		for st in steps_pending(m, steps[:], cur) {
+			if st.step == {} && st.oid == cur {
 				continue
 			}
 			if !odb.exists(m.db, st.oid) {
-				broken = true
-				break
+				stored: odb.Oid
+				if st.oid == disk_oid {
+					stored, _ = odb.write(m.db, .Blob, disk_data)
+				}
+				if stored != st.oid {
+					broken = true
+					break
+				}
 			}
-			committed := attribute_step(p, &c, st) or_return
+			committed := replay_step(p, &c, st) or_return
 			if !committed {
 				gone = true
 				break
 			}
+			replayed = true
 			cur = st.oid
+			last = st
+		}
+		if replayed && !broken && !gone && cur == disk_oid {
+			c.actor = last.actor
+			c.scope_id = last.scope
+			matched = true
+		}
+		if matched && replayed {
+			k, _ := clone_string(c.path, p.long)
+			consumed[k] = true
+			continue
+		}
+		if replayed && !gone {
+			if settled := replay_rest(p, &c) or_return; settled {
+				k, _ := clone_string(c.path, p.long)
+				consumed[k] = true
+				continue
+			}
 		}
 		if matched || gone {
 			continue
@@ -1502,6 +1545,344 @@ attrib_chain_settle :: proc(p: ^Pass) {
 	for k in drop {
 		attrib_chain_drop(m, k)
 	}
+	landed_settle(m)
+}
+
+@(private)
+landed_settle :: proc(m: ^Mount) {
+	if len(m.attrib_chain) > 0 {
+		return
+	}
+	for _, a in prim.unordered(m.attrib) {
+		if a.step != {} && (!a.used || m.lost) {
+			return
+		}
+	}
+	clear(&m.landed)
+	m.landed_gone = false
+}
+
+@(private)
+steps_pending :: proc(m: ^Mount, steps: []Attrib_Step, shown: odb.Oid) -> []Attrib_Step {
+	#reverse for st, i in steps {
+		landed := st.step != {} && (st.step in m.landed || m.landed_gone)
+		if landed || (st.step == {} && st.scope != {} && shown != {} && st.oid == shown) {
+			return steps[i + 1:]
+		}
+	}
+	return steps
+}
+
+@(private)
+step_mark :: proc(b: ^Builder, step: prim.Id) {
+	if step == {} {
+		return
+	}
+	buf := make([dynamic]u8, context.temp_allocator)
+	fshist.encode_step(&buf, step)
+	builder_opaque(b, buf[:])
+}
+
+@(private)
+Replayed :: struct {
+	inodes: map[fstree.Inode_Id]bool,
+	heads:  [dynamic]crdt.Op_Id,
+}
+
+@(private)
+replay_departing :: proc(m: ^Mount, long: runtime.Allocator, out: ^Replayed) -> Error {
+	if m.history == nil || m.db == nil || len(m.attrib_chain) == 0 {
+		return .None
+	}
+	q: Pass
+	q.m = m
+	q.long = long
+	q.rebased = make([dynamic]crdt.Op_Id, long)
+	q.departing = true
+	keys := make([dynamic]string, context.temp_allocator)
+	for k in prim.sorted_keys(m.attrib_chain) {
+		append(&keys, k)
+	}
+	for k in keys {
+		chain, ok := m.attrib_chain[k]
+		if !ok {
+			continue
+		}
+		steps := slice.clone(chain[:], context.temp_allocator)
+		path, _ := clone_string(k, long)
+		attrib_chain_drop(m, path)
+		e, found := shadow_get(&m.shadow, path) or_return
+		if !found || e.kind != .File {
+			continue
+		}
+		c := Change{kind = .Modify, path = path, disk = .File, old = e}
+		cur := e.oid
+		for st in steps_pending(m, steps, e.oid) {
+			if st.step == {} && st.oid == cur {
+				continue
+			}
+			if !odb.exists(m.db, st.oid) {
+				break
+			}
+			if !(replay_step(&q, &c, st) or_return) {
+				break
+			}
+			cur = st.oid
+			out.inodes[e.inode] = true
+		}
+		if e.inode in out.inodes {
+			if named, found2 := shadow_get(&m.shadow, path) or_return; found2 && named.ver != 0 {
+				if ids, vok := shadow_version(&m.shadow, named); vok {
+					for id in ids {
+						append(&out.heads, inode_op(m.history, id))
+					}
+				}
+			}
+		}
+		if a, has := m.attrib[path]; has && !a.used && a.oid == cur {
+			attrib_set(m, path, a.actor, true, a.oid, a.scope, a.base)
+		}
+	}
+	return .None
+}
+
+@(private)
+replay_rest :: proc(p: ^Pass, c: ^Change) -> (settled: bool, err: Error) {
+	m := p.m
+	h := m.history
+	if c.kind != .Modify || c.old.kind != .File || c.old.ver == 0 {
+		return false, .None
+	}
+	ids, ok := shadow_version(&m.shadow, c.old)
+	if !ok || len(ids) == 0 {
+		return false, .None
+	}
+	v := make([]crdt.Op_Id, len(ids), context.temp_allocator)
+	for id, i in ids {
+		v[i] = inode_op(h, id)
+	}
+	actor := m.actor
+	event := _chain_blocks(h, actor, v)
+	rest := c^
+	rest.scope = nil
+	rest.scope_id = {}
+	rest.actor = actor
+	rest.step = {}
+	done, rerr := rebase_commit(p, &rest, v, c.old.inode, actor, event)
+	if rerr != .None && rerr != .Reloading {
+		return false, rerr
+	}
+	return done, rerr
+}
+
+@(private)
+replay_step :: proc(p: ^Pass, c: ^Change, st: Attrib_Step) -> (committed: bool, err: Error) {
+	m := p.m
+	h := m.history
+	if h == nil || c.kind != .Modify || c.old.kind != .File || c.moved != "" || c.disk != .File {
+		return attribute_step(p, c, st)
+	}
+	inode := c.old.inode
+	if st.step == {} && st.scope == {} {
+		if version_reads(m, inode, m.synced[:], st.oid) {
+			return true, .None
+		}
+		if head, found := history_line(h, m.line, context.temp_allocator) or_return; found && version_reads(m, inode, head, st.oid) {
+			return true, .None
+		}
+	}
+	if .Opaque in tree_flags(h, inode) {
+		return attribute_step(p, c, st)
+	}
+	actor := st.actor
+	if st.scope != {} && !actor_on_line(m, actor) {
+		actor = scope_line_actor(m, actor)
+	}
+	if v := step_base_resolve(p, c, st, inode) or_return; v != nil {
+		event := _chain_blocks(h, actor, v)
+		if m.override == nil {
+			m.override = make(map[string]odb.Oid, m.allocator)
+		}
+		k, _ := clone_string(c.path, m.allocator)
+		m.override[k] = st.oid
+		first := c^
+		first.stat = {}
+		first.scope = nil
+		first.scope_id = st.scope
+		first.step = st.step
+		done, rerr := rebase_commit(p, &first, v, inode, actor, event)
+		key, _ := delete_key(&m.override, k)
+		delete(key, m.allocator)
+		if rerr != .None && rerr != .Reloading {
+			return false, rerr
+		}
+		if done {
+			attrib_set(m, c.path, st.actor, true, st.oid, st.scope)
+			e, found := shadow_get(&m.shadow, c.path) or_return
+			if !found {
+				return false, rerr
+			}
+			if !p.departing {
+				mount_reshow_add(m, c.path)
+			}
+			c.kind = .Modify
+			c.old = e
+			c.actor = {}
+			return true, rerr
+		}
+	}
+	return replay_merge(p, c, st, actor, inode)
+}
+
+@(private)
+step_base_resolve :: proc(p: ^Pass, c: ^Change, st: Attrib_Step, inode: fstree.Inode_Id) -> (v: []crdt.Op_Id, err: Error) {
+	m := p.m
+	h := m.history
+	want := st.base.oid
+	if st.base.kind == STEP_BASE_CHAIN && want == {} {
+		want = c.old.oid
+	}
+	if st.base.kind == STEP_BASE_NONE || want == {} {
+		return nil, .None
+	}
+	if st.base.kind == STEP_BASE_VERSION {
+		sb := st.base
+		if ids := slice.clone(sb.ver[:sb.n], context.temp_allocator); version_reads(m, inode, ids, want) {
+			return ids, .None
+		}
+	}
+	if c.old.ver != 0 && c.old.inode == inode {
+		if ids, ok := shadow_version(&m.shadow, c.old); ok && len(ids) > 0 {
+			out := make([]crdt.Op_Id, len(ids), context.temp_allocator)
+			for id, i in ids {
+				out[i] = inode_op(h, id)
+			}
+			if version_reads(m, inode, out, want) {
+				return out, .None
+			}
+		}
+	}
+	if version_reads(m, inode, m.synced[:], want) {
+		return slice.clone(m.synced[:], context.temp_allocator), .None
+	}
+	if head, found := history_line(h, m.line, context.temp_allocator) or_return; found && version_reads(m, inode, head, want) {
+		return head, .None
+	}
+	return nil, .None
+}
+
+@(private)
+version_reads :: proc(m: ^Mount, inode: fstree.Inode_Id, v: []crdt.Op_Id, want: odb.Oid) -> bool {
+	h := m.history
+	if len(v) == 0 || want == {} {
+		return false
+	}
+	for id in v {
+		if _, ok := crdt.graph_lv(&h.g, id); !ok {
+			return false
+		}
+	}
+	t, terr := history_text_at(h, inode, v, context.temp_allocator)
+	if terr != .None {
+		return false
+	}
+	oid, _ := odb.hash(m.db.format, .Blob, t)
+	return oid == want
+}
+
+@(private)
+replay_merge :: proc(p: ^Pass, c: ^Change, st: Attrib_Step, actor: prim.Id, inode: fstree.Inode_Id) -> (committed: bool, err: Error) {
+	m := p.m
+	h := m.history
+	head: Version = m.synced[:]
+	if lv, found := history_line(h, m.line, context.temp_allocator) or_return; found && len(lv) > 0 {
+		head = lv
+	}
+	line_text := history_text_at(h, inode, head, context.temp_allocator) or_return
+	t, data, rerr := odb.read(m.db, st.oid, context.temp_allocator)
+	if rerr != .None || t != .Blob {
+		return false, .None
+	}
+	if textdiff.is_binary(data) || textdiff.is_binary(line_text) {
+		return attribute_step(p, c, st)
+	}
+	merged: []u8
+	if st.base.oid != {} && odb.exists(m.db, st.base.oid) {
+		bt, bdata, berr := odb.read(m.db, st.base.oid, context.temp_allocator)
+		if berr == .None && bt == .Blob {
+			if res, merr := textdiff.merge3(bdata, line_text, data, {}, context.temp_allocator); merr == nil && res.conflicts == 0 {
+				merged = res.data
+			}
+		}
+	}
+	if merged == nil {
+		merged = insert_only(line_text, data) or_return
+	}
+	if string(merged) != string(line_text) {
+		event := _chain_blocks(h, actor, head)
+		who := actor
+		if event {
+			who = event_actor(m, actor, head, _event_digest(inode_op(h, inode), merged)) or_return
+		}
+		if crdt.graph_known(&h.g, who) == 0 || !event {
+			b: Builder
+			builder_init(&b, h, who)
+			if st.scope != {} {
+				b.scope = scope_marker(actor, st.scope)
+			}
+			emit_text_edits(m, &b, inode, c.path, line_text, merged) or_return
+			step_mark(&b, st.step)
+			if b.scope != nil {
+				builder_opaque(&b, b.scope)
+				b.scope = nil
+			}
+			ch, has, cerr := builder_commit_at(m, &b, head)
+			if cerr != .None && cerr != .Reloading {
+				return false, cerr
+			}
+			if has {
+				append(&p.rebased, ch)
+			}
+		} else {
+			append(&p.rebased, crdt.Op_Id{who, crdt.graph_known(&h.g, who) - 1})
+		}
+	}
+	e := c.old
+	e.oid = st.oid
+	e.stat = {}
+	e.ver = 0
+	shadow_put(&m.shadow, c.path, e) or_return
+	attrib_set(m, c.path, st.actor, true, st.oid, st.scope)
+	if !p.departing {
+		mount_reshow_add(m, c.path)
+	}
+	c.kind = .Modify
+	c.old = e
+	c.actor = {}
+	return true, .None
+}
+
+@(private)
+insert_only :: proc(ours, theirs: []u8) -> (out: []u8, err: Error) {
+	a, aerr := textdiff.split_lines(ours, context.temp_allocator)
+	b, berr := textdiff.split_lines(theirs, context.temp_allocator)
+	if aerr != nil || berr != nil {
+		return nil, .No_Memory
+	}
+	edits, derr := textdiff.diff_lines(a, b, textdiff.DEFAULT_DIFF, context.temp_allocator)
+	if derr != nil {
+		return nil, .No_Memory
+	}
+	buf := make([dynamic]u8, 0, len(ours) + len(theirs), context.temp_allocator)
+	at := u32(0)
+	for e in edits {
+		end := e.a_start + e.a_len
+		append(&buf, ..ours[a.offs[at]:a.offs[end]])
+		append(&buf, ..theirs[b.offs[e.b_start]:b.offs[e.b_start + e.b_len]])
+		at = end
+	}
+	append(&buf, ..ours[a.offs[at]:])
+	return buf[:], .None
 }
 
 @(private)
@@ -1521,6 +1902,7 @@ attribute_step :: proc(p: ^Pass, c: ^Change, st: Attrib_Step) -> (committed: boo
 	b: Builder
 	builder_init(&b, m.history, actor)
 	b.scope = scope_marker(actor, st.scope)
+	step_mark(&b, st.step)
 	attrib_set(m, c.path, st.actor, true, st.oid, st.scope)
 	shadow_txn_begin(&m.shadow)
 	eerr := emit_change(p, &b, &first)
@@ -1593,7 +1975,12 @@ mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> (err: Error) {
 			delete(m.branch, m.allocator)
 			m.branch, _ = clone_string(key, m.allocator)
 			if follow {
-				line_follow(m, key) or_return
+				replayed := Replayed {
+					inodes = make(map[fstree.Inode_Id]bool, p.long),
+					heads  = make([dynamic]crdt.Op_Id, p.long),
+				}
+				replay_departing(m, p.long, &replayed) or_return
+				line_follow(m, key, &replayed) or_return
 				p.git_wrote = true
 			}
 		}
@@ -1761,13 +2148,228 @@ mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> (err: Error) {
 }
 
 @(private)
-line_follow :: proc(m: ^Mount, key: string) -> Error {
+shown_free :: proc(shown: ^map[string][]crdt.Op_Id, allocator: runtime.Allocator) {
+	for k, v in shown {
+		delete(k, allocator)
+		delete(v, allocator)
+	}
+	delete(shown^)
+	shown^ = nil
+}
+
+Shown_Path :: struct {
+	path: string,
+	ids:  []crdt.Op_Id,
+}
+
+@(private)
+shown_paths_free :: proc(shown: ^map[string][dynamic]Shown_Path, allocator: runtime.Allocator) {
+	for k, l in shown {
+		for sp in l {
+			delete(sp.path, allocator)
+			delete(sp.ids, allocator)
+		}
+		delete(l)
+		delete(k, allocator)
+	}
+	delete(shown^)
+	shown^ = nil
+}
+
+@(private)
+shown_paths_reset :: proc(shown: ^map[string][dynamic]Shown_Path, line: string, allocator: runtime.Allocator) {
+	if l, ok := &shown[line]; ok {
+		for sp in l {
+			delete(sp.path, allocator)
+			delete(sp.ids, allocator)
+		}
+		clear(l)
+	}
+}
+
+@(private)
+shown_path_add :: proc(shown: ^map[string][dynamic]Shown_Path, line: string, path: string, ids: []crdt.Op_Id, allocator: runtime.Allocator) {
+	if shown^ == nil {
+		shown^ = make(map[string][dynamic]Shown_Path, allocator)
+	}
+	if line not_in shown^ {
+		k, _ := clone_string(line, allocator)
+		shown[k] = make([dynamic]Shown_Path, allocator)
+	}
+	p, _ := clone_string(path, allocator)
+	append(&shown[line], Shown_Path{path = p, ids = slice.clone(ids, allocator)})
+}
+
+@(private)
+named_prune :: proc(m: ^Mount) {
+	if len(m.named) == 0 || !shadow_attached(&m.shadow) {
+		return
+	}
+	for k in prim.sorted_keys(m.named) {
+		e, found, err := shadow_get(&m.shadow, k)
+		if err != .None || (found && e.kind == .File && e.ver != 0) {
+			continue
+		}
+		key, _ := delete_key(&m.named, k)
+		delete(key, m.allocator)
+	}
+}
+
+@(private)
+named_walk :: proc(m: ^Mount) -> Error {
+	stack := make([dynamic]string, context.temp_allocator)
+	append(&stack, "")
+	for len(stack) > 0 {
+		dir := pop(&stack)
+		kids := make([dynamic]Shadow_Child, context.temp_allocator)
+		shadow_children(&m.shadow, dir, &kids, context.temp_allocator) or_return
+		for k in kids {
+			path := k.name if dir == "" else strings.concatenate({dir, "/", k.name}, context.temp_allocator)
+			if k.entry.kind == .Dir {
+				append(&stack, path)
+			} else if k.entry.kind == .File && k.entry.ver != 0 && path not_in m.named {
+				c, _ := clone_string(path, m.allocator)
+				m.named[c] = true
+			}
+		}
+	}
+	m.named_known = true
+	return .None
+}
+
+@(private)
+shown_named :: proc(m: ^Mount) -> Error {
+	shown_paths_reset(&m.shown_paths, m.line, m.allocator)
+	if !m.named_known {
+		named_walk(m) or_return
+	}
+	named_prune(m)
+	for path in prim.sorted_keys(m.named) {
+		e, found := shadow_get(&m.shadow, path) or_return
+		if !found || e.kind != .File || e.ver == 0 || !disk_matches(m, path, e) {
+			continue
+		}
+		ids, ok := shadow_version(&m.shadow, e)
+		if !ok || len(ids) == 0 {
+			continue
+		}
+		out := make([]crdt.Op_Id, len(ids), context.temp_allocator)
+		for id, i in ids {
+			out[i] = inode_op(m.history, id)
+		}
+		shown_path_add(&m.shown_paths, m.line, path, out, m.allocator)
+	}
+	return .None
+}
+
+@(private)
+shown_apply :: proc(m: ^Mount, line: string) -> Error {
 	h := m.history
+	l, ok := m.shown_paths[line]
+	if !ok {
+		return .None
+	}
+	for sp in l {
+		e, found := shadow_get(&m.shadow, sp.path) or_return
+		if !found || e.kind != .File || e.ver != 0 {
+			continue
+		}
+				t, terr := history_text_at(h, e.inode, sp.ids, context.temp_allocator)
+		if terr != .None {
+			continue
+		}
+		fids := make([]fstree.Op_Id, len(sp.ids), context.temp_allocator)
+		for id, i in sp.ids {
+			fids[i] = op_inode(h, id)
+		}
+		oid, _ := odb.hash(m.db.format, .Blob, t)
+		e.ver = shadow_version_add(&m.shadow, fids[:]) or_return
+		e.oid = oid
+		e.stat = {}
+		shadow_put(&m.shadow, sp.path, e) or_return
+		mount_reshow_add(m, sp.path)
+	}
+	return .None
+}
+
+@(private)
+shown_put :: proc(shown: ^map[string][]crdt.Op_Id, line: string, v: []crdt.Op_Id, allocator: runtime.Allocator) {
+	if shown^ == nil {
+		shown^ = make(map[string][]crdt.Op_Id, allocator)
+	}
+	c := slice.clone(v, allocator)
+	if old, ok := &shown[line]; ok {
+		delete(old^, allocator)
+		old^ = c
+		return
+	}
+	k, _ := clone_string(line, allocator)
+	shown[k] = c
+}
+
+@(private)
+shown_version :: proc(m: ^Mount, line: string, head: Version) -> (v: Version, ok: bool) {
+	row := m.shown[line] or_return
+	h := m.history
+	rl := make([dynamic]crdt.Lv, context.temp_allocator)
+	hl := make([dynamic]crdt.Lv, context.temp_allocator)
+	if crdt.graph_version_lvs(&h.g, row, &rl) != .None || crdt.graph_version_lvs(&h.g, head, &hl) != .None {
+		return nil, false
+	}
+	if !crdt.graph_contains_all(&h.g, hl[:], rl[:]) {
+		return nil, false
+	}
+	return row, true
+}
+
+@(private)
+shown_with_own :: proc(m: ^Mount, line: string, row: Version) -> (v: Version, err: Error) {
+	h := m.history
+	actor := line_actor(m, line) or_return
+	known := crdt.graph_known(&h.g, actor)
+	if known == 0 {
+		return row, .None
+	}
+	own, ok := crdt.graph_lv(&h.g, crdt.Op_Id{actor, known - 1})
+	rl := make([dynamic]crdt.Lv, context.temp_allocator)
+	if !ok || crdt.graph_version_lvs(&h.g, row, &rl) != .None {
+		return nil, .Corrupt
+	}
+	if crdt.graph_contains(&h.g, rl[:], own) {
+		return row, .None
+	}
+	one := [1]crdt.Lv{own}
+	both := make([dynamic]crdt.Lv, context.temp_allocator)
+	crdt.version_union(&h.g, rl[:], one[:], &both)
+	return crdt.graph_version_ids(&h.g, both[:], context.temp_allocator), .None
+}
+
+@(private)
+line_follow :: proc(m: ^Mount, key: string, replayed: ^Replayed) -> Error {
+	h := m.history
+	shown_put(&m.shown, m.line, m.synced[:], m.allocator)
+	shown_named(m) or_return
 	v, found := history_line(h, key, context.temp_allocator) or_return
 	if !found || len(v) == 0 {
-		history_set_line(h, key, m.synced[:]) or_return
+		sl := make([dynamic]crdt.Lv, context.temp_allocator)
+		rl := make([dynamic]crdt.Lv, context.temp_allocator)
+		if crdt.graph_version_lvs(&h.g, m.synced[:], &sl) != .None || crdt.graph_version_lvs(&h.g, replayed.heads[:], &rl) != .None {
+			return .Corrupt
+		}
+		both := make([dynamic]crdt.Lv, context.temp_allocator)
+		crdt.version_union(&h.g, sl[:], rl[:], &both)
+		ids := crdt.graph_version_ids(&h.g, both[:], context.temp_allocator)
+		history_set_line(h, key, ids) or_return
+		clear(&m.synced)
+		append(&m.synced, ..ids)
+
 	} else {
-		line_retarget(m, v) or_return
+		target := v
+		if row, ok := shown_version(m, key, v); ok {
+			target = shown_with_own(m, key, row) or_return
+		}
+		line_retarget(m, target, replayed.inodes) or_return
+		shown_apply(m, key) or_return
 	}
 	delete(m.line, m.allocator)
 	m.line, _ = clone_string(key, m.allocator)
@@ -1775,18 +2377,21 @@ line_follow :: proc(m: ^Mount, key: string) -> Error {
 }
 
 @(private)
-line_retarget :: proc(m: ^Mount, target: Version) -> Error {
+line_retarget :: proc(m: ^Mount, target: Version, replayed: map[fstree.Inode_Id]bool) -> Error {
 	h := m.history
 	sl := make([dynamic]crdt.Lv, context.temp_allocator)
 	tl := make([dynamic]crdt.Lv, context.temp_allocator)
 	if crdt.graph_version_lvs(&h.g, m.synced[:], &sl) != .None || crdt.graph_version_lvs(&h.g, target, &tl) != .None {
 		return .Corrupt
 	}
-	if !crdt.frontier_eq(sl[:], tl[:]) {
+	if !crdt.frontier_eq(sl[:], tl[:]) || len(replayed) > 0 {
 		only_a := make([dynamic]crdt.Lv_Span, context.temp_allocator)
 		only_b := make([dynamic]crdt.Lv_Span, context.temp_allocator)
 		crdt.graph_diff(&h.g, sl[:], tl[:], &only_a, &only_b)
 		touched := make(map[fstree.Inode_Id]bool, context.temp_allocator)
+		for ino in replayed {
+			touched[ino] = true
+		}
 		spans_touched(h, only_a[:], &touched) or_return
 		spans_touched(h, only_b[:], &touched) or_return
 		snap := version_snapshot(h, tl[:]) or_return
@@ -1811,8 +2416,12 @@ line_retarget :: proc(m: ^Mount, target: Version) -> Error {
 		tracked := make(map[string]Commit_Entry, context.temp_allocator)
 		has_git_tree := departed_entries(m, &tracked)
 		order := sorted_inodes(touched)
+		named := make(map[fstree.Inode_Id]Entry, context.temp_allocator)
 		for ino in order {
-			if old, _, had := shadow_by_inode(&m.shadow, ino, context.temp_allocator) or_return; had {
+			if old, e, had := shadow_by_inode(&m.shadow, ino, context.temp_allocator) or_return; had {
+				if entry_holds(m, old, e, tl[:]) {
+					named[ino] = e
+				}
 				shadow_remove(&m.shadow, old) or_return
 			}
 		}
@@ -1836,6 +2445,11 @@ line_retarget :: proc(m: ^Mount, target: Version) -> Error {
 				mount_absent_add(m, p)
 				continue
 			}
+			if e, kept := named[ino]; kept && disk_matches(m, p, e) {
+				shadow_put(&m.shadow, p, e) or_return
+				mount_reshow_add(m, p)
+				continue
+			}
 			shadow_put(&m.shadow, p, Entry{inode = ino, kind = info.kind}) or_return
 		}
 	}
@@ -1843,6 +2457,24 @@ line_retarget :: proc(m: ^Mount, target: Version) -> Error {
 	append(&m.synced, ..target)
 	m.rescan = true
 	return .None
+}
+
+@(private)
+entry_holds :: proc(m: ^Mount, path: string, e: Entry, tl: []crdt.Lv) -> bool {
+	if e.ver == 0 || e.kind != .File {
+		return false
+	}
+	ids, ok := shadow_version(&m.shadow, e)
+	if !ok || len(ids) == 0 {
+		return false
+	}
+	for id in ids {
+		lv, known := crdt.graph_lv(&m.history.g, inode_op(m.history, id))
+		if !known || !crdt.graph_contains(&m.history.g, tl, lv) {
+			return false
+		}
+	}
+	return disk_matches(m, path, e)
 }
 
 @(private)
@@ -2207,7 +2839,16 @@ pass_flush :: proc(p: ^Pass, final := true) -> Error {
 			emit_order(p, idx)
 			if actor != m.actor {
 				for i in idx {
-					attrib_set(m, p.changes[i].path, actor, true, {}, group_scope[key])
+					c := &p.changes[i]
+					if a, has := m.attrib[c.path]; has && !a.used {
+						c.step = a.step
+						c.base = a.base
+					}
+					c.at = mount_jlen(m)
+					if c.step == {} && (c.kind == .Modify || c.kind == .Create) && c.disk == .File {
+						c.step = step_new(m)
+					}
+					attrib_set(m, c.path, actor, true, {}, group_scope[key])
 				}
 			}
 			for lo := 0; lo < len(idx); lo += PASS_CHUNK {
