@@ -1258,6 +1258,9 @@ Pass :: struct {
 	reflog_pos: i64,
 	running:    bool,
 	side:       bool,
+	redo:       [dynamic]string,
+	overridden: [dynamic]string,
+	git_version: [dynamic]crdt.Op_Id,
 }
 
 @(private)
@@ -1339,7 +1342,7 @@ commit_group :: proc(p: ^Pass, b: ^Builder, indices: []int) -> Error {
 		}
 	}
 	if err == .None {
-		err = builder_commit(m, b)
+		err = chain_commit(p, b) if p.git_wrote && !p.side else builder_commit(m, b)
 	}
 	if err != .None && err != .Reloading {
 		shadow_txn_rollback(&m.shadow)
@@ -1347,6 +1350,59 @@ commit_group :: proc(p: ^Pass, b: ^Builder, indices: []int) -> Error {
 	}
 	shadow_txn_end(&m.shadow)
 	return err
+}
+
+@(private)
+chain_commit :: proc(p: ^Pass, b: ^Builder) -> Error {
+	m := p.m
+	h := m.history
+	if b.n == 0 {
+		return .None
+	}
+	parents := make([dynamic]crdt.Op_Id, context.temp_allocator)
+	append(&parents, ..p.git_version[:])
+	if known := crdt.graph_known(&h.g, b.actor); known > 0 && !version_holds(h, p.git_version[:], crdt.Op_Id{b.actor, known - 1}) {
+		append(&parents, crdt.Op_Id{b.actor, known - 1})
+	}
+	if b.scope != nil {
+		builder_opaque(b, b.scope)
+	}
+	head, has, err := builder_commit_at(m, b, parents[:])
+	if err != .None && err != .Reloading {
+		return err
+	}
+	if has {
+		clear(&p.git_version)
+		append(&p.git_version, head)
+		sl := make([dynamic]crdt.Lv, context.temp_allocator)
+		if crdt.graph_version_lvs(&h.g, m.synced[:], &sl) != .None {
+			return .Corrupt
+		}
+		lv, ok := crdt.graph_lv(&h.g, head)
+		if !ok {
+			return .Corrupt
+		}
+		one := [1]crdt.Lv{lv}
+		both := make([dynamic]crdt.Lv, context.temp_allocator)
+		crdt.version_union(&h.g, sl[:], one[:], &both)
+		ids := crdt.graph_version_ids(&h.g, both[:], context.temp_allocator)
+		clear(&m.synced)
+		append(&m.synced, ..ids)
+	}
+	return err
+}
+
+@(private)
+version_holds :: proc(h: ^History, v: []crdt.Op_Id, op: crdt.Op_Id) -> bool {
+	lv, ok := crdt.graph_lv(&h.g, op)
+	if !ok {
+		return false
+	}
+	vl := make([dynamic]crdt.Lv, context.temp_allocator)
+	if crdt.graph_version_lvs(&h.g, v, &vl) != .None {
+		return false
+	}
+	return crdt.graph_contains(&h.g, vl[:], lv)
 }
 
 @(private)
@@ -1679,9 +1735,7 @@ pass_open :: proc(p: ^Pass) -> Error {
 	}
 	if p.git_wrote {
 		collect_alias_sources(m, p)
-		if m.opts.index_trust {
-			trust_index(m)
-		}
+		trust_index(m)
 	}
 	p.changes = make([dynamic]Change, p.long)
 	p.held = make([dynamic]Change, p.long)
@@ -1700,26 +1754,52 @@ pass_open :: proc(p: ^Pass) -> Error {
 	if !p.side {
 		m.hold_line = p.git_wrote
 	}
+	p.git_version = make([dynamic]crdt.Op_Id, p.long)
+	if p.git_wrote && !p.side {
+		append(&p.git_version, ..m.synced[:])
+	}
 	p.keys = make([dynamic]string, 0, len(m.dirty), p.long)
-	for k in prim.sorted_keys(m.dirty) {
-		if k not_in m.dirty {
-			continue
-		}
-		v := m.dirty[k]
-		c, _ := clone_string(k, p.long)
-		p.scope_of[c] = v
-		append(&p.keys, c)
-	}
-	for k in m.dirty {
-		delete(k, m.allocator)
-	}
-	clear(&m.dirty)
 	p.dirty_at = make(map[string]i64, p.long)
-	for k, v in prim.unordered(m.dirty_at) {
-		c, _ := clone_string(k, p.long)
-		p.dirty_at[c] = v
+	p.redo = make([dynamic]string, p.long)
+	p.overridden = make([dynamic]string, p.long)
+	if p.side {
+		for k in prim.sorted_keys(m.dirty) {
+			if k not_in m.dirty || m.dirty[k] == nil || side_owned(m, k) {
+				continue
+			}
+			v := m.dirty[k]
+			c, _ := clone_string(k, p.long)
+			p.scope_of[c] = v
+			append(&p.keys, c)
+			if at, ok := m.dirty_at[k]; ok {
+				p.dirty_at[c] = at
+			}
+		}
+		for c in p.keys {
+			key, _ := delete_key(&m.dirty, c)
+			delete(key, m.allocator)
+			dirty_at_drop(m, c)
+		}
+	} else {
+		for k in prim.sorted_keys(m.dirty) {
+			if k not_in m.dirty {
+				continue
+			}
+			v := m.dirty[k]
+			c, _ := clone_string(k, p.long)
+			p.scope_of[c] = v
+			append(&p.keys, c)
+		}
+		for k in m.dirty {
+			delete(k, m.allocator)
+		}
+		clear(&m.dirty)
+		for k, v in prim.unordered(m.dirty_at) {
+			c, _ := clone_string(k, p.long)
+			p.dirty_at[c] = v
+		}
+		dirty_at_clear(m)
 	}
-	dirty_at_clear(m)
 	if !p.side {
 		p.rescan_was = m.rescan
 		m.rescan = false
@@ -1784,6 +1864,13 @@ pass_finish :: proc(p: ^Pass) -> Error {
 			dirty_at_note(m, y, at)
 		}
 	}
+	for y in p.redo {
+		if y in m.dirty {
+			continue
+		}
+		k, _ := clone_string(y, m.allocator)
+		m.dirty[k] = p.scope_of[y]
+	}
 	if rerr := rebase_materialize(m, p.rebased[:], p.restored); rerr != .None && rerr != .Deferred {
 		return rerr
 	}
@@ -1796,7 +1883,7 @@ pass_finish :: proc(p: ^Pass) -> Error {
 		builder_commit(m, &b) or_return
 	}
 	if m.has_git && len(p.head.commit) > 0 && !p.side {
-		record_commit_version(m, p.head.commit, p.git_wrote, p.alias_commits[:]) or_return
+		record_commit_version(m, p.head.commit, p.git_wrote, p.alias_commits[:], p.git_version[:] if len(p.git_version) > 0 else m.synced[:]) or_return
 	}
 	if m.has_git && !p.side {
 		git_head_destroy(&m.head, m.allocator)
@@ -1805,7 +1892,7 @@ pass_finish :: proc(p: ^Pass) -> Error {
 		m.reflog_pos = p.reflog_pos
 		m.stamp = p.stamp
 	}
-	if len(m.dirty) > len(p.holding) {
+	if len(m.dirty) > len(p.holding) || len(p.redo) > 0 {
 		mount_schedule(m, m.opts.settle_ms)
 	}
 	m.passes += 1
@@ -1858,19 +1945,16 @@ pass_free :: proc(p: ^Pass) {
 }
 
 @(private)
-synced_holds :: proc(m: ^Mount, v: Version) -> bool {
+follow_keeps :: proc(m: ^Mount, key: string, v: Version) -> bool {
 	h := m.history
-	sl := make([dynamic]crdt.Lv, context.temp_allocator)
-	vl := make([dynamic]crdt.Lv, context.temp_allocator)
-	if crdt.graph_version_lvs(&h.g, m.synced[:], &sl) != .None || crdt.graph_version_lvs(&h.g, v, &vl) != .None {
+	self := h.self
+	actor := fshist.ingestion_actor(self, m.id) if key == m.home_line else fshist.ingestion_actor(self, mount_line_pseudo(m.id, key))
+	known := crdt.graph_known(&h.g, actor)
+	if known == 0 {
 		return false
 	}
-	for lv in vl {
-		if !crdt.graph_contains(&h.g, sl[:], lv) {
-			return false
-		}
-	}
-	return true
+	last := crdt.Op_Id{actor, known - 1}
+	return version_holds(h, m.synced[:], last) && !version_holds(h, v, last)
 }
 
 @(private)
@@ -1879,7 +1963,7 @@ line_follow :: proc(m: ^Mount, key: string) -> Error {
 	v, found := history_line(h, key, context.temp_allocator) or_return
 	if !found || len(v) == 0 {
 		history_set_line(h, key, m.synced[:]) or_return
-	} else if !synced_holds(m, v) {
+	} else if !follow_keeps(m, key, v) {
 		line_retarget(m, v) or_return
 	}
 	delete(m.line, m.allocator)
@@ -2126,16 +2210,16 @@ collect_alias_sources :: proc(m: ^Mount, p: ^Pass) {
 }
 
 @(private)
-record_commit_version :: proc(m: ^Mount, commit: string, rewrite: bool, sources: []string) -> Error {
+record_commit_version :: proc(m: ^Mount, commit: string, rewrite: bool, sources: []string, version: []crdt.Op_Id) -> Error {
 	h := m.history
 	key := strings.concatenate({"cv:", commit}, context.temp_allocator)
 	if _, found := kv_get(&h.kv, transmute([]u8)key, context.temp_allocator) or_return; !found {
 		buf := make([dynamic]u8, context.temp_allocator)
-		encode_version(&buf, m.synced[:])
+		encode_version(&buf, version)
 		kv_put(&h.kv, transmute([]u8)key, buf[:]) or_return
 	}
 	if rewrite && len(sources) > 0 {
-		history_alias(h, sources, commit, m.synced[:]) or_return
+		history_alias(h, sources, commit, version) or_return
 	}
 	return history_kv_commit(h)
 }
@@ -2313,6 +2397,12 @@ pass_flush :: proc(p: ^Pass, final := true) -> Error {
 		for key in order {
 			idx := groups[key][:]
 			actor := group_actor[key]
+			if p.side && actor == m.actor {
+				for i in idx {
+					append(&p.redo, clone_string(p.changes[i].path, p.long) or_else "")
+				}
+				continue
+			}
 			marker: []u8
 			if actor != m.actor {
 				marker = scope_marker(actor, group_scope[key])
@@ -2334,6 +2424,7 @@ pass_flush :: proc(p: ^Pass, final := true) -> Error {
 	mount_settle(m) or_return
 	history_trim(m.history)
 	clear(&p.changes)
+	split_clear(p)
 	mem.dynamic_arena_free_all(&p.chunk)
 	return .None
 }
@@ -2407,6 +2498,7 @@ collect_path :: proc(p: ^Pass, rel: string, listed := false) -> Error {
 		if d.kind == .Dir && nested_repo(m, rel) {
 			return .None
 		}
+		git_split(p, rel, &d, {})
 		add_create(p, rel, d) or_return
 		if d.kind == .Dir {
 			collect_subtree(p, rel) or_return
@@ -2450,12 +2542,71 @@ collect_path :: proc(p: ^Pass, rel: string, listed := false) -> Error {
 				defer_ino(p, e)
 				return .None
 			}
+			git_split(p, rel, &d, e.oid)
 			add_modify(p, rel, d, e)
 		}
 	case d.kind == .Symlink:
 		add_modify(p, rel, d, e)
 	}
 	return .None
+}
+
+@(private)
+git_split :: proc(p: ^Pass, rel: string, d: ^Probe, old: odb.Oid) {
+	m := p.m
+	if !p.git_wrote || p.side || m.trusted == nil || m.db == nil || d.kind != .File {
+		return
+	}
+	e, has := &m.trusted[rel]
+	if !has || e.stage != 0 || e.oid == old || e.mode & 0o170000 != 0o100000 {
+		return
+	}
+	mtime := i64(e.mtime_s) * 1_000_000_000 + i64(e.mtime_ns)
+	if mtime == d.stat.mtime_ns && i64(e.size) == d.stat.size || d.stat.mtime_ns < m.trust_mtime {
+		return
+	}
+	if !odb.exists(m.db, e.oid) {
+		return
+	}
+	if m.override == nil {
+		m.override = make(map[string]odb.Oid, m.allocator)
+	}
+	if rel not_in m.override {
+		k, _ := clone_string(rel, m.allocator)
+		m.override[k] = e.oid
+		append(&p.overridden, clone_string(rel, p.long) or_else "")
+	}
+	append(&p.redo, clone_string(rel, p.long) or_else "")
+	d.stat = {}
+}
+
+@(private)
+split_clear :: proc(p: ^Pass) {
+	m := p.m
+	for k in p.overridden {
+		if k in m.override {
+			key, _ := delete_key(&m.override, k)
+			delete(key, m.allocator)
+		}
+	}
+	clear(&p.overridden)
+}
+
+@(private)
+side_owned :: proc(m: ^Mount, rel: string) -> bool {
+	q := m.pass
+	if q == nil || !q.git_wrote || m.trusted == nil {
+		return false
+	}
+	ie, indexed := &m.trusted[rel]
+	se, found, serr := shadow_get(&m.shadow, rel)
+	if serr != .None {
+		return true
+	}
+	if indexed {
+		return !found || se.oid != ie.oid
+	}
+	return false
 }
 
 @(private)
@@ -3274,7 +3425,7 @@ trust_drop :: proc(m: ^Mount) {
 
 @(private)
 read_content :: proc(m: ^Mount, rel: string, stat: Stat, old := fstree.Inode_Id{}, has_old := false) -> (data: []u8, oid: odb.Oid, binary: bool, ok: bool, err: Error) {
-	if m.trusted != nil && m.db != nil && stat.size <= m.opts.large_limit {
+	if m.opts.index_trust && m.trusted != nil && m.db != nil && stat.size <= m.opts.large_limit {
 		if e, has := &m.trusted[rel]; has {
 			if !index_clean(e, stat, .File, m.trust_mtime, mount_trust_exec(m), mount_symlinks(m)) {
 				m.trust_refused += 1

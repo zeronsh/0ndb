@@ -172,6 +172,8 @@ _pc_case :: proc(w: ^World, v: Pc_Variant) {
 	}
 	agent_rel := strings.clone(_pc_name(PC_DIRS - 1, PC_PER_DIR - 1), w.allocator)
 	person_rel := strings.clone(_pc_name(0, 0), w.allocator)
+	late_rel := strings.clone(_pc_name(PC_DIRS - 1, PC_PER_DIR - 2), w.allocator)
+	late_body := transmute([]u8)fmt.aprintf("%slate person line\n", string(_pc_body("other", PC_DIRS - 1, PC_PER_DIR - 2)), allocator = w.allocator)
 	agent_body := transmute([]u8)fmt.aprintf("%sagent line\n", string(_pc_body("other", PC_DIRS - 1, PC_PER_DIR - 1)), allocator = w.allocator)
 	person_body := transmute([]u8)fmt.aprintf("%sperson line\n", string(_pc_body("other", 0, 0)), allocator = w.allocator)
 	actor := prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng))
@@ -201,6 +203,11 @@ _pc_case :: proc(w: ^World, v: Pc_Variant) {
 		}
 		if werr := _pc_write(vfs, fmt.tprintf("%s/%s", PASS_CHUNK_ROOT, person_rel), person_body); werr != .None {
 			world_fail(w, "chunk: person write: %v", werr)
+			node_after(n)
+			return
+		}
+		if werr := _pc_write(vfs, fmt.tprintf("%s/%s", PASS_CHUNK_ROOT, late_rel), late_body); werr != .None {
+			world_fail(w, "chunk: late person write: %v", werr)
 			node_after(n)
 			return
 		}
@@ -243,6 +250,8 @@ _pc_case :: proc(w: ^World, v: Pc_Variant) {
 				want = agent_body
 			} else if v == .Writes && rel == person_rel {
 				want = person_body
+			} else if v == .Writes && rel == late_rel {
+				want = late_body
 			}
 			disk, derr := prim.read_file(vfs, fmt.tprintf("%s/%s", PASS_CHUNK_ROOT, rel), context.temp_allocator)
 			if derr != .None || string(disk) != string(want) {
@@ -268,6 +277,39 @@ _pc_case :: proc(w: ^World, v: Pc_Variant) {
 		}
 		if sc, found, _ := fs.history_scope_of(h, crdt.Op_Id{actor, known - 1}); !found || sc != sid {
 			world_fail(w, "chunk: the agent's write between chunks is attributed to scope %v (found %v), not its tool scope %v", sc, found, sid)
+		}
+		ref, rerr := prim.read_file(vfs, PASS_CHUNK_ROOT + "/.git/refs/heads/other", context.temp_allocator)
+		commit := strings.trim_space(string(ref))
+		for d in 0 ..< PC_DIRS {
+			for i in 0 ..< PC_PER_DIR {
+				rel := _pc_name(d, i)
+				got, found, gerr := fs.history_commit_text(h, commit, rel, context.temp_allocator)
+				if rerr != .None || gerr != .None || !found || string(got) != string(_pc_body("other", d, i)) {
+					world_fail(w, "chunk: at git's checkout of %s, %s reads %q (found %v, %v), want git's %q", commit, rel, string(got), found, gerr, string(_pc_body("other", d, i)))
+				}
+			}
+		}
+		data, spans, berr := eng.tree_blame(&n.e, tree, agent_rel, context.temp_allocator)
+		git_len := len(_pc_body("other", PC_DIRS - 1, PC_PER_DIR - 1))
+		if berr != .None || string(data) != string(agent_body) {
+			world_fail(w, "chunk: blame of %s reads %q (%v)", agent_rel, string(data), berr)
+		} else {
+			pos := 0
+			agent_bytes := 0
+			for sp in spans {
+				lo, hi := pos, pos + sp.len
+				pos = hi
+				if sp.id.actor != actor {
+					continue
+				}
+				agent_bytes += hi - lo
+				if lo < git_len {
+					world_fail(w, "chunk: blame of %s credits bytes %d..%d, git's checkout, to the agent", agent_rel, lo, min(hi, git_len))
+				}
+			}
+			if agent_bytes != len(agent_body) - git_len {
+				world_fail(w, "chunk: blame of %s credits %d bytes to the agent, want its %d", agent_rel, agent_bytes, len(agent_body) - git_len)
+			}
 		}
 	}
 }

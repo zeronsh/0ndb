@@ -278,3 +278,28 @@ mount_synced_text :: proc(m: ^Mount, rel: string, allocator := context.allocator
 	t := history_text_at(h, id, m.synced[:], allocator) or_return
 	return t, true, .None
 }
+
+history_commit_text :: proc(h: ^History, commit: string, rel: string, allocator := context.allocator) -> (text: []u8, found: bool, err: Error) {
+	history_ready(h) or_return
+	key := fmt.tprintf("cv:%s", commit)
+	raw, has := kv_get(&h.kv, transmute([]u8)key, context.temp_allocator) or_return
+	if !has {
+		return nil, false, .None
+	}
+	v := decode_version(raw, context.temp_allocator) or_return
+	lvs := make([dynamic]crdt.Lv, context.temp_allocator)
+	if crdt.graph_version_lvs(&h.g, v, &lvs) != .None {
+		return nil, false, .Corrupt
+	}
+	snap := version_snapshot(h, lvs[:]) or_return
+	defer fstree.snapshot_destroy(&snap)
+	id, ok, lerr := fstree.lookup(&snap, rel)
+	if lerr != nil {
+		return nil, false, .Corrupt
+	}
+	if !ok {
+		return nil, false, .None
+	}
+	t := history_text_at(h, id, v, allocator) or_return
+	return t, true, .None
+}

@@ -921,11 +921,11 @@ equal in both directions.
   path) move
   to the line's paths with their stat cleared, the synced version becomes the line's, and the full pass diffs
   disk against the line, so git's writes (and anything git carried) land on
-  that line only. A line the synced version already holds is not retargeted: a
-  crash can leave a git pass's own chunks durable on a line it had not yet
-  published, and following that line again keeps the synced version (and
-  the disk) where they are instead of moving them back to the line's
-  older version over git's files. A path the line has that is missing on disk after the
+  that line only. Following a line is not a retarget when the synced version
+  holds an op of that line's own ingestion actor that the line does not: only
+  a git pass for that line, interrupted before it published the held line,
+  leaves one, so the synced version (and the disk) stay where the pass left
+  them instead of moving back to the line's older version over git's files. A path the line has that is missing on disk after the
   switch and that the departing commit's git tree does not hold (a collision
   copy or another file of that line git never tracked) is owed: it is
   materialized like a pending path and never ingested as a removal; one the
