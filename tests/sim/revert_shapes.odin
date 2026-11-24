@@ -645,6 +645,27 @@ _rs_turn :: proc(c: ^Rs_Ctx, cs: Rs_Case) -> (r: Rs_Run, ok: bool) {
 }
 
 @(private = "file")
+_rs_released :: proc(c: ^Rs_Ctx, cs: Rs_Case, undo: prim.Id) {
+	n := c.n
+	context = instance_context(&n.inst)
+	defer node_after(n)
+	list, err := eng.convo_undos(&n.e, c.conv, context.temp_allocator)
+	if err != .None {
+		world_fail(c.w, "shapes %s: convo_undos: %v", cs.name, err)
+		return
+	}
+	for u in list {
+		if u.id == undo {
+			if u.phase != .Released {
+				world_fail(c.w, "shapes %s: the undo stopped at %v, not released", cs.name, u.phase)
+			}
+			return
+		}
+	}
+	world_fail(c.w, "shapes %s: the undo left no record", cs.name)
+}
+
+@(private = "file")
 _rs_expect :: proc(c: ^Rs_Ctx, cs: Rs_Case, step: string, want: Rs_Tree) -> bool {
 	got := _rs_read(c, c.alloc)
 	if d := _rs_diff(want, got); len(d) > 0 {
@@ -677,6 +698,7 @@ _rs_case :: proc(w: ^World, cs: Rs_Case, alloc: runtime.Allocator) {
 		undo = u
 	}
 	run_until(w, w.now + 5_000_000_000, true)
+	_rs_released(c, cs, undo)
 	_rs_expect(c, cs, "undo", r.undoneq)
 	if env_u64("SHAPES_TREE", 0) != 0 {
 		context = instance_context(&n.inst)
@@ -685,7 +707,7 @@ _rs_case :: proc(w: ^World, cs: Rs_Case, alloc: runtime.Allocator) {
 		fmt.eprintfln("SHAPES %s tree files after undo: %v; root list %v %v", cs.name, names, lst, lerr)
 		node_after(n)
 	}
-	{
+	redo: {
 		context = instance_context(&n.inst)
 		_, err := eng.convo_redo(&n.e, c.conv, undo)
 		node_after(n)
