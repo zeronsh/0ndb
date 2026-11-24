@@ -172,7 +172,7 @@ _resolve_path :: proc(run: ^Run, path: string) -> (abs: string, ok: bool) {
 	}
 	root := run.ws.root
 	p := path
-	if len(p) > 0 && p[0] == '/' {
+	if fs.path_is_abs(fs.clean_path(p, context.temp_allocator)) {
 		if rel, in_root := observe_under(fs.clean_path(p, context.temp_allocator), root); in_root {
 			p = rel
 		} else {
@@ -187,13 +187,7 @@ _resolve_path :: proc(run: ^Run, path: string) -> (abs: string, ok: bool) {
 }
 
 observe_under :: proc(path: string, root: string) -> (rel: string, ok: bool) {
-	if path == root {
-		return "", true
-	}
-	if len(path) > len(root) && strings.has_prefix(path, root) && path[len(root)] == '/' {
-		return path[len(root) + 1:], true
-	}
-	return "", false
+	return fs.path_rel(path, root)
 }
 
 file_tool :: proc(r: ^Runtime, run: ^Run, name: string, input: string, call_id := "") -> (text: string, is_error: bool) {

@@ -25,7 +25,7 @@ _mounts_close_all :: proc(a: ^Api) {
 
 mount_find :: proc(a: ^Api, ob: Object, root: string) -> ^Mounted {
 	for m in a.mounts {
-		if m.object == ob && (len(root) == 0 || m.root == root) {
+		if m.object == ob && (len(root) == 0 || fs.path_same(m.root, root)) {
 			return m
 		}
 	}
@@ -44,7 +44,7 @@ mount_open :: proc(a: ^Api, ob: Object, root: string) -> (m: ^Mounted, st: Statu
 		return x, .Ok
 	}
 	for x in a.mounts {
-		if x.root == clean {
+		if fs.path_same(x.root, clean) {
 			return nil, .Exists
 		}
 	}
