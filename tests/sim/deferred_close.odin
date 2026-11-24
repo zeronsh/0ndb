@@ -17,8 +17,6 @@ Deferred_Close :: struct {
 	op:     int,
 	line:   string,
 	before: []crdt.Op_Id,
-	eline:  string,
-	was:    map[string]string,
 }
 
 @(private = "file")
@@ -32,27 +30,22 @@ STAT_CLOSE_RESUMED: Stat
 STAT_CLOSE_CRASHED: Stat
 STAT_CLOSE_UNDONE: Stat
 STAT_CLOSE_OTHER_LINE: Stat
-STAT_CLOSE_UNDO_ELSEWHERE: Stat
 
 @(private = "file")
 EV_DC_UNDO: Ev_Kind
 
-@(private = "file")
-EV_DC_CHECK: Ev_Kind
 
 @(init)
 _deferred_close_init :: proc "contextless" () {
 	register_world(67, _closes_init, _closes_destroy)
 	register_final_check(123, check_deferred_closes)
 	EV_DC_UNDO = register_event(_deferred_undo)
-	EV_DC_CHECK = register_event(_deferred_undo_check)
 	register_stat_line(72, "deferred_close")
 	STAT_CLOSE_DEFERRED = register_stat(72, 0, "deferred")
 	STAT_CLOSE_RESUMED = register_stat(72, 1, "resumed")
 	STAT_CLOSE_CRASHED = register_stat(72, 2, "crashed")
 	STAT_CLOSE_UNDONE = register_stat(72, 3, "undone")
-	STAT_CLOSE_OTHER_LINE = register_stat(72, 4, "other_line")
-	STAT_CLOSE_UNDO_ELSEWHERE = register_stat(72, 5, "undo_after_switch")
+	STAT_CLOSE_OTHER_LINE = register_stat(72, 4, "token_gone")
 }
 
 @(private = "file")
@@ -76,7 +69,7 @@ _closes_destroy :: proc(w: ^World) {
 deferred_close_note :: proc(w: ^World, n: ^Node, sm: Sim_Mount, op: ^M_Op, before: []crdt.Op_Id) {
 	stat_add(w, STAT_CLOSE_DEFERRED)
 	world_note(w, "%s a scope close on %s/%s is deferred; its base outcome is owed", n.name, sm.root, op.path)
-	append(&_closes, Deferred_Close{n.idx, int(n.incarnation), strings.clone(sm.root, w.allocator), strings.clone(op.path, w.allocator), op.actor, op.idx, strings.clone(fs.mount_line(sm.m), w.allocator), slice.clone(before, w.allocator), "", nil})
+	append(&_closes, Deferred_Close{n.idx, int(n.incarnation), strings.clone(sm.root, w.allocator), strings.clone(op.path, w.allocator), op.actor, op.idx, strings.clone(fs.mount_line(sm.m), w.allocator), slice.clone(before, w.allocator)})
 }
 
 deferred_close_outcome :: proc(w: ^World, n: ^Node, root: string, path: string, note: fs.Base_Note, actor: prim.Id) {
@@ -116,80 +109,35 @@ _deferred_undo :: proc(w: ^World, ev: ^Sim_Event) {
 	if !n.alive || !n.e_open || int(n.incarnation) != c.inc {
 		return
 	}
-	sm: ^Sim_Mount
-	for &x in n.mounts {
-		if x.root == c.root && x.m != nil {
-			sm = &x
-		}
-	}
-	if sm == nil {
-		return
-	}
-	if fs.mount_line(sm.m) != c.line {
-		stat_add(w, STAT_CLOSE_OTHER_LINE)
-		return
-	}
 	m := &w.model
 	op := m.ops[c.op]
 	context = instance_context(&n.inst)
-	tree := m.objs[sm.oi].o
+	defer node_after(n)
+	tree := m.objs[op.obj].o
 	line := line_eng(strings.clone(op.line, context.temp_allocator))
 	paths := TREE_PATHS
-	was := make(map[string]string, w.allocator)
+	was := make(map[string]string, context.temp_allocator)
 	for p in paths {
 		t, terr := eng.tree_read(&n.e, tree, p, context.temp_allocator, {}, line)
 		if terr != .None && terr != .Not_Found {
 			return
 		}
-		was[p] = strings.clone(string(t), w.allocator)
+		was[p] = strings.clone(string(t), context.temp_allocator)
 	}
 	for tok in op.tokens {
 		if !strings.contains(was[c.path], tok) {
+			stat_add(w, STAT_CLOSE_OTHER_LINE)
 			return
 		}
 	}
-	after := slice.clone(_line_heads(sm.m), context.temp_allocator)
-	if rerr := fs.mount_revert(sm.m, fs.Version(c.before), fs.Version(after), op.actor); rerr != .None {
-		world_fail(w, "deferred close: undo of %s's turn on %s/%s failed: %v", id_short(op.actor), c.root, c.path, rerr)
+	if _, rerr := eng.tree_revert_set(&n.e, tree, fs.Version(c.before), []prim.Id{op.actor}, line); rerr != .None {
+		world_fail(w, "deferred close: undo of %s's turn on %s failed: %v", id_short(op.actor), c.root, rerr)
 		return
 	}
-	_resumed[ev.arg].was = was
-	_resumed[ev.arg].eline = strings.clone(line, w.allocator)
-	schedule(w, Sim_Event{at = w.now + 2_000_000_000, kind = EV_DC_CHECK, node = n.idx, arg = ev.arg})
-	node_after(n)
-}
-
-@(private = "file")
-_deferred_undo_check :: proc(w: ^World, ev: ^Sim_Event) {
-	if len(w.failures) > 0 || int(ev.arg) >= len(_resumed) {
-		return
-	}
-	c := _resumed[ev.arg]
-	n := w.nodes[ev.node]
-	if !n.alive || !n.e_open || int(n.incarnation) != c.inc || c.was == nil {
-		return
-	}
-	m := &w.model
-	op := m.ops[c.op]
-	context = instance_context(&n.inst)
-	tree := m.objs[op.obj].o
-	moved := false
-	for &x in n.mounts {
-		if x.root == c.root && x.m != nil {
-			moved = fs.mount_line(x.m) != c.line
-			if len(x.m.reverts) > 0 {
-				return
-			}
-		}
-	}
-	if moved {
-		stat_add(w, STAT_CLOSE_UNDO_ELSEWHERE)
-		return
-	}
-	paths := TREE_PATHS
 	for p in paths {
-		t, terr := eng.tree_read(&n.e, tree, p, context.temp_allocator, {}, c.eline)
+		t, terr := eng.tree_read(&n.e, tree, p, context.temp_allocator, {}, line)
 		if terr != .None && terr != .Not_Found {
+			world_fail(w, "deferred close: cannot read %s on %s after the undo: %v", p, line, terr)
 			return
 		}
 		if p == c.path {
@@ -199,13 +147,13 @@ _deferred_undo_check :: proc(w: ^World, ev: ^Sim_Event) {
 				}
 			}
 		}
-		it := c.was[p]
-		for line in strings.split_lines_iterator(&it) {
-			if p == c.path && slice.contains(op.tokens[:], line) {
+		it := was[p]
+		for l in strings.split_lines_iterator(&it) {
+			if p == c.path && slice.contains(op.tokens[:], l) {
 				continue
 			}
-			if len(line) > 0 && !strings.contains(string(t), line) {
-				world_fail(w, "deferred close: undo of %s's turn on %s removed %q from %s (%q)", id_short(op.actor), c.root, line, p, string(t))
+			if len(l) > 0 && !strings.contains(string(t), l) {
+				world_fail(w, "deferred close: undo of %s's turn on %s removed %q from %s (%q)", id_short(op.actor), c.root, l, p, string(t))
 			}
 		}
 	}
