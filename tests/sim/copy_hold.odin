@@ -104,9 +104,9 @@ _hold_read :: proc(n: ^Node, tree: eng.Object, line: string) -> (string, bool) {
 	defer node_after(n)
 	data, err := eng.tree_read(&n.e, tree, "a.txt", context.temp_allocator, {}, line)
 	if err != .None {
-		return fmt.tprintf("<%v>", err), false
+		return fmt.aprintf("<%v>", err, allocator = n.w.allocator), false
 	}
-	return strings.clone(string(data), context.temp_allocator), true
+	return strings.clone(string(data), n.w.allocator), true
 }
 
 @(private = "file")
@@ -115,9 +115,9 @@ _hold_blame :: proc(n: ^Node, tree: eng.Object) -> string {
 	defer node_after(n)
 	data, spans, err := eng.tree_blame(&n.e, tree, "a.txt", context.temp_allocator, "main")
 	if err != .None {
-		return fmt.tprintf("error %v", err)
+		return fmt.aprintf("error %v", err, allocator = n.w.allocator)
 	}
-	b := strings.builder_make(context.temp_allocator)
+	b := strings.builder_make(n.w.allocator)
 	strings.write_string(&b, string(data))
 	for sp in spans {
 		fmt.sbprintf(&b, "|%s %d", id_short(sp.id.actor), sp.len)
