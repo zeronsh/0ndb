@@ -677,6 +677,9 @@ cmd_blame :: proc(a: ^Args) -> int {
 	req_str(&fr, "path", path)
 	f := call(s, req_end(&fr))
 	if f.status != .Ok {
+		if f.status == .Newer {
+			return report_error(f.status, "cannot blame %s", path)
+		}
 		return report_error(f.status, "%s is not inside a mounted directory (0ndb mount DIR)", path)
 	}
 	r := req_begin("tree.blame")
