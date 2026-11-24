@@ -79,7 +79,7 @@ node_start :: proc(n: ^Node) -> bool {
 		done(arg)
 	}}
 	cfg.watcher = sim_watcher(n)
-	cfg.history_fault = fs.Persist_Fault{data = n, fail = _persist_fail, zeroed = _redact_zeroed}
+	cfg.history_fault = fs.Persist_Fault{data = n, fail = _persist_fail, zeroed = _redact_zeroed, blob_zeroed = _redact_blob_zeroed}
 	cfg.checkpoint_hook = eng.Checkpoint_Hook{data = n, at = _on_checkpoint}
 	cfg.embedder = sim_embedder()
 	cfg.boot_id = eng.Boot_Source{boot_id = proc(data: rawptr) -> prim.Id {
@@ -830,6 +830,16 @@ _redact_zeroed :: proc(data: rawptr) {
 	n.persist_fail = 1
 	stat_add(n.w, STAT_ZEROED_PERSIST_FAULTS)
 	world_note(n.w, "%s history persist after a redaction zero-fill will fail (injected)", n.name)
+}
+
+_redact_blob_zeroed :: proc(data: rawptr) {
+	n := (^Node)(data)
+	if !n.disk.blob_zero_crash || n.disk.crash_at != 0 {
+		return
+	}
+	n.disk.blob_zero_crash = false
+	n.disk.crash_at = n.disk.stats.ops + 1
+	world_note(n.w, "%s power cut after its zeroed blob copies are durable, before the scrub (injected)", n.name)
 }
 
 _persist_fail :: proc(data: rawptr) -> bool {

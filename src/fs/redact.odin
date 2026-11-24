@@ -1,6 +1,8 @@
 package fs
 
+import "core:hash/xxhash"
 import "core:mem/virtual"
+import "core:strings"
 import "../crdt"
 import "../fshist"
 import "../fstree"
@@ -82,6 +84,7 @@ history_redact :: proc(h: ^History, spans: []crdt.Op_Span, allocator := context.
 	targets := make([dynamic]odb.Oid, context.temp_allocator)
 	protect := make([dynamic]odb.Oid, context.temp_allocator)
 	res.files = apply_redaction(h, all[:], extra[:], &targets, &protect) or_return
+	zero_blobs(h, all[:], targets[:]) or_return
 	if h.db != nil && len(targets) > 0 {
 		from_odb(odb.scrub_note(h.db, targets[:], protect[:])) or_return
 	}
@@ -476,6 +479,7 @@ apply_redact_record :: proc(h: ^History, body: []u8, preflight := false) -> Erro
 	targets := make([dynamic]odb.Oid, context.temp_allocator)
 	protect := make([dynamic]odb.Oid, context.temp_allocator)
 	apply_redaction(h, spans[:], nil, &targets, &protect) or_return
+	zero_blobs(h, spans[:], targets[:]) or_return
 	if h.db != nil && len(targets) > 0 {
 		unstage(h, targets[:], protect[:])
 		_, st, _ := odb.redact(h.db, targets[:], "refs/0ndb/", protect[:], true, context.temp_allocator)
@@ -503,4 +507,302 @@ unstage :: proc(h: ^History, targets: []odb.Oid, protect: []odb.Oid) {
 		delete(s.data, h.allocator)
 		ordered_remove(&h.staged, i)
 	}
+}
+
+@(private)
+ZEROED_DIR :: "/info/0ndb-zeroed"
+@(private)
+ZEROED_MAGIC :: u64(0x3164_6f72_657a_646e)
+@(private)
+ZEROED_HEADER :: 20
+
+@(private)
+Kept_Range :: struct {
+	off: int,
+	len: int,
+}
+
+@(private)
+zeroed_dir :: proc(h: ^History) -> (dir: string, err: Error) {
+	if h.db == nil || len(h.db.dirs) == 0 {
+		return "", .Not_Found
+	}
+	d, cerr := strings.concatenate({h.db.dirs[0].path, ZEROED_DIR}, context.temp_allocator)
+	if cerr != nil {
+		return "", .No_Memory
+	}
+	return d, .None
+}
+
+@(private)
+zeroed_path :: proc(h: ^History, oid: odb.Oid) -> (path: string, err: Error) {
+	dir := zeroed_dir(h) or_return
+	hb: [odb.MAX_HEX]u8
+	id := prim.id_hex(h.id)
+	p, cerr := strings.concatenate({dir, "/", string(id[:]), "-", odb.oid_to_string(oid, h.db.format, &hb)}, context.temp_allocator)
+	if cerr != nil {
+		return "", .No_Memory
+	}
+	return p, .None
+}
+
+@(private)
+zeroed_load :: proc(h: ^History, oid: odb.Oid) -> (size: int, ranges: []Kept_Range, bytes: []u8, err: Error) {
+	p := zeroed_path(h, oid) or_return
+	data, rerr := prim.read_file(h.db.vfs, p, context.temp_allocator)
+	from_prim(rerr) or_return
+	if len(data) < ZEROED_HEADER + 8 || prim.get_u64le(data) != ZEROED_MAGIC {
+		return 0, nil, nil, .Corrupt
+	}
+	end := len(data) - 8
+	if xxhash.XXH3_64_with_seed(data[:end], 0) != prim.get_u64le(data[end:]) {
+		return 0, nil, nil, .Corrupt
+	}
+	size = int(prim.get_u64le(data[8:]))
+	n := int(prim.get_u32le(data[16:]))
+	if n < 0 || ZEROED_HEADER + n * 16 > end {
+		return 0, nil, nil, .Corrupt
+	}
+	ranges = make([]Kept_Range, n, context.temp_allocator)
+	total := 0
+	for &r, i in ranges {
+		r.off = int(prim.get_u64le(data[ZEROED_HEADER + i * 16:]))
+		r.len = int(prim.get_u64le(data[ZEROED_HEADER + i * 16 + 8:]))
+		if r.off < 0 || r.len <= 0 || r.off + r.len > size {
+			return 0, nil, nil, .Corrupt
+		}
+		total += r.len
+	}
+	bytes = data[ZEROED_HEADER + n * 16:end]
+	if len(bytes) != total {
+		return 0, nil, nil, .Corrupt
+	}
+	return size, ranges, bytes, .None
+}
+
+@(private)
+zeroed_fill :: proc(h: ^History, oid: odb.Oid, offset: int, dst: []u8) -> bool {
+	_, ranges, bytes, err := zeroed_load(h, oid)
+	if err != .None {
+		return false
+	}
+	at := 0
+	for r in ranges {
+		if offset >= r.off && offset + len(dst) <= r.off + r.len {
+			copy(dst, bytes[at + offset - r.off:])
+			return true
+		}
+		at += r.len
+	}
+	return false
+}
+
+@(private)
+zeroed_store :: proc(h: ^History, oid: odb.Oid, data: []u8, used: []bool) -> Error {
+	out := make([dynamic]u8, ZEROED_HEADER, context.temp_allocator)
+	prim.put_u64le(out[0:], ZEROED_MAGIC)
+	prim.put_u64le(out[8:], u64(len(data)))
+	count := 0
+	kept := make([dynamic]u8, context.temp_allocator)
+	for i := 0; i < len(data); {
+		if !used[i] {
+			i += 1
+			continue
+		}
+		j := i
+		for j < len(data) && used[j] {
+			j += 1
+		}
+		b: [16]u8
+		prim.put_u64le(b[0:], u64(i))
+		prim.put_u64le(b[8:], u64(j - i))
+		append(&out, ..b[:])
+		append(&kept, ..data[i:j])
+		count += 1
+		i = j
+	}
+	prim.put_u32le(out[16:], u32(count))
+	append(&out, ..kept[:])
+	sum: [8]u8
+	prim.put_u64le(sum[:], xxhash.XXH3_64_with_seed(out[:], 0))
+	append(&out, ..sum[:])
+	p := zeroed_path(h, oid) or_return
+	return from_prim(prim.replace_atomic(h.db.vfs, p, out[:]))
+}
+
+@(private)
+span_holds :: proc(spans: []crdt.Op_Span, actor: prim.Id, seq: u64) -> bool {
+	for sp in spans {
+		if sp.id.actor == actor && seq >= sp.id.seq && seq < sp.id.seq + u64(sp.len) {
+			return true
+		}
+	}
+	return false
+}
+
+@(private)
+Zero_Target :: struct {
+	data: []u8,
+	have: []bool,
+	used: []bool,
+	red:  []bool,
+}
+
+@(private)
+zero_blobs :: proc(h: ^History, spans: []crdt.Op_Span, targets: []odb.Oid) -> Error {
+	if h.db == nil || len(targets) == 0 {
+		return .None
+	}
+	blobs := make(map[odb.Oid]Zero_Target, context.temp_allocator)
+	for b in targets {
+		if b in blobs {
+			continue
+		}
+		t, data, rerr := odb.read(h.db, b, context.temp_allocator)
+		have: []bool
+		if rerr == .Not_Found {
+			size, ranges, bytes, zerr := zeroed_load(h, b)
+			if zerr == .Not_Found {
+				continue
+			}
+			if zerr != .None {
+				return zerr
+			}
+			data = make([]u8, size, context.temp_allocator)
+			have = make([]bool, size, context.temp_allocator)
+			at := 0
+			for r in ranges {
+				copy(data[r.off:][:r.len], bytes[at:])
+				for k in r.off ..< r.off + r.len {
+					have[k] = true
+				}
+				at += r.len
+			}
+		} else {
+			from_odb(rerr) or_return
+			if t != .Blob {
+				continue
+			}
+		}
+		blobs[b] = Zero_Target{data = data, have = have, used = make([]bool, len(data), context.temp_allocator), red = make([]bool, len(data), context.temp_allocator)}
+	}
+	if len(blobs) == 0 {
+		return .None
+	}
+	touched := make(map[fstree.Inode_Id]bool, context.temp_allocator)
+	ignored := make([dynamic]odb.Oid, context.temp_allocator)
+	redaction_touched(h, spans, nil, &touched, &ignored, false) or_return
+	Ref_Scan :: struct {
+		out:   [dynamic]Op_Ref,
+		arena: virtual.Arena,
+	}
+	scan: Ref_Scan
+	scan.out = make([dynamic]Op_Ref, context.temp_allocator)
+	if virtual.arena_init_growing(&scan.arena, 16 << 10) != nil {
+		return .No_Memory
+	}
+	defer virtual.arena_destroy(&scan.arena)
+	visit :: proc(data: rawptr, key: []u8, value: []u8) -> bool {
+		sc := (^Ref_Scan)(data)
+		out := &sc.out
+		if len(key) == 13 && key[0] == 'f' {
+			virtual.arena_free_all(&sc.arena)
+			a := virtual.arena_allocator(&sc.arena)
+			r: File_Record
+			r.cp_version = make([dynamic]crdt.Op_Id, a)
+			r.cp_spans = make([dynamic]crdt.Author_Span, a)
+			if decode_file_record(value, &r) == .None && r.has_base {
+				append(out, r.base)
+			}
+			return true
+		}
+		if len(key) != 18 || key[0] != 'f' || key[1] != 'o' {
+			return true
+		}
+		rd := prim.reader(value)
+		for !prim.reader_done(&rd) {
+			ref: Op_Ref
+			ref.stream = u32(prim.read_uvarint(&rd))
+			ref.off = prim.read_uvarint(&rd)
+			ref.from = u32(prim.read_uvarint(&rd))
+			ref.to = u32(prim.read_uvarint(&rd))
+			if !prim.reader_ok(&rd) {
+				break
+			}
+			append(out, ref)
+		}
+		return true
+	}
+	kv_each(&h.kv, &scan, visit) or_return
+	refs := scan.out
+	for ino in sorted_inodes(touched) {
+		if f, loaded := h.files[ino]; loaded {
+			append(&refs, ..f.new_refs[:])
+		}
+	}
+	seen := make(map[[2]u64]bool, context.temp_allocator)
+	scratch: virtual.Arena
+	if virtual.arena_init_growing(&scratch, 64 << 10) != nil {
+		return .No_Memory
+	}
+	defer virtual.arena_destroy(&scratch)
+	sa := virtual.arena_allocator(&scratch)
+	for ref in refs {
+		key := [2]u64{u64(ref.stream), ref.off}
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		virtual.arena_free_all(&scratch)
+		batch, berr := history_read_batch(h, ref.stream, ref.off, sa)
+		if berr == .Redacted || berr == .Not_Found {
+			continue
+		}
+		if berr != .None {
+			return berr
+		}
+		pos: u64
+		for op in batch.ops {
+			s0 := batch.seq + pos
+			pos += u64(op.len)
+			if op.kind != .Insert_Ref {
+				continue
+			}
+			z, ok := &blobs[odb_oid(op.ref.oid)]
+			if !ok {
+				continue
+			}
+			for k in 0 ..< op.len {
+				p := op.ref.offset + k
+				if p < 0 || p >= len(z.data) {
+					continue
+				}
+				if span_holds(spans, batch.actor, s0 + u64(k)) {
+					z.red[p] = true
+				} else {
+					z.used[p] = z.have == nil || z.have[p]
+				}
+			}
+		}
+	}
+	for _, z in blobs {
+		for p in 0 ..< len(z.data) {
+			z.used[p] &&= !z.red[p]
+		}
+	}
+	dir := zeroed_dir(h) or_return
+	from_prim(prim.mkdir_all(h.db.vfs, dir, 0o700)) or_return
+	from_prim(prim.sync_dir(h.db.vfs, path_parent(dir))) or_return
+	for b in targets {
+		z, ok := blobs[b]
+		if !ok {
+			continue
+		}
+		zeroed_store(h, b, z.data, z.used) or_return
+		delete_key(&blobs, b)
+	}
+	if f := h.opts.fault; f.blob_zeroed != nil {
+		f.blob_zeroed(f.data)
+	}
+	return .None
 }

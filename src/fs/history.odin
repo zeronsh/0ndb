@@ -83,9 +83,10 @@ Redacted_Hook :: struct {
 }
 
 Persist_Fault :: struct {
-	data:   rawptr,
-	fail:   proc(data: rawptr) -> bool,
-	zeroed: proc(data: rawptr),
+	data:        rawptr,
+	fail:        proc(data: rawptr) -> bool,
+	zeroed:      proc(data: rawptr),
+	blob_zeroed: proc(data: rawptr),
 }
 
 @(private)
@@ -2337,6 +2338,10 @@ copy_read_depth :: proc(h: ^History, src: crdt.Op_Id, dst: []u8, authors: ^[dyna
 	return got
 }
 
+history_content :: proc(h: ^History, oid: crdt.Oid, offset: int, dst: []u8) -> bool {
+	return content_read(h, oid, offset, dst)
+}
+
 @(private)
 content_read :: proc(data: rawptr, oid: crdt.Oid, offset: int, dst: []u8) -> (ok: bool) {
 	h := (^History)(data)
@@ -2357,7 +2362,7 @@ content_read :: proc(data: rawptr, oid: crdt.Oid, offset: int, dst: []u8) -> (ok
 			if d != nil {
 				delete(d, h.allocator)
 			}
-			return false
+			return err == .Not_Found && zeroed_fill(h, full, offset, dst)
 		}
 		h.blob_data = d
 		h.blob_cache = full
