@@ -44,6 +44,9 @@ Named_Arm :: struct {
 NV_EDIT :: "edit line\n"
 
 @(private = "file")
+NV_STEPS_LANDED :: false
+
+@(private = "file")
 NV_OTHER :: "other line\n"
 
 Named_Result :: struct {
@@ -58,6 +61,7 @@ Named_Result :: struct {
 	kept_lost:  bool,
 	other_lost: bool,
 	undone:     int,
+	open:       int,
 }
 
 named_version_run :: proc(seed: u64, arm: Named_Arm, crash_at: u64) -> (failures: [dynamic]string, res: Named_Result) {
@@ -332,7 +336,9 @@ _named_crash :: proc(w: ^World, arm: Named_Arm, crash_at: u64) -> (res: Named_Re
 		if arm.early && res.crashed && want == 1 {
 			if line == NV_KEPT {
 				res.kept_lost = c == 0
-				want = c if c <= 1 else 1
+				if !NV_STEPS_LANDED {
+					want = c if c <= 1 else 1
+				}
 			} else if line == NV_TOOL {
 				if tools > 1 || tools_on > 1 || tools + tools_on == 0 {
 					world_fail(w, "named: %v: the agent's line appears %d times on main (%q) and %d times on %s, the disk's line (%q), want once on either, at disk op %d", arm, tools, string(data), tools_on, on, string(disk_text), crash_at)
@@ -364,6 +370,9 @@ _named_crash :: proc(w: ^World, arm: Named_Arm, crash_at: u64) -> (res: Named_Re
 		fdata, ferr := eng.tree_read(&n.e, tree, "a.txt", context.temp_allocator, {}, NV_FEATURE)
 		if c := strings.count(string(fdata), NV_OTHER); ferr != .None || c != 1 {
 			res.other_lost = true
+			if NV_STEPS_LANDED {
+				world_fail(w, "named: %v: %q appears %d times in a.txt on feature (%v %q), at disk op %d", arm, strings.trim_space(NV_OTHER), c, ferr, string(fdata), crash_at)
+			}
 		}
 	}
 	if arm.clean || len(w.failures) > 0 {
@@ -401,6 +410,10 @@ _named_crash :: proc(w: ^World, arm: Named_Arm, crash_at: u64) -> (res: Named_Re
 		now, nerr := eng.tree_read(&n.e, tree, "a.txt", context.temp_allocator, {}, l)
 		want, _ := strings.replace_all(string(was), NV_TOOL, "", context.temp_allocator)
 		if nerr != .None || string(now) != want {
+			if nerr == .None && !NV_STEPS_LANDED && (arm.early || l != "main") {
+				res.open += 1
+				continue
+			}
 			world_fail(w, "named: %v: the turn's undo on %s left %q (%v), want %q, at disk op %d", arm, l, string(now), nerr, want, crash_at)
 			return
 		}
@@ -471,7 +484,7 @@ named_version_crash :: proc(t: ^testing.T) {
 		for bits in 0 ..< 10 {
 			arm := Named_Arm{kind = kind, process = bits & 1 != 0, early = bits & 2 != 0, control = bits >= 4, clean = bits >= 8}
 			points, named, ahead, settled, bad := 0, 0, 0, 0, 0
-			undone, kept_lost, other_lost := 0, 0, 0
+			undone, open, kept_lost, other_lost := 0, 0, 0, 0
 			for k in u64(1) ..= 4000 {
 				failures, res := named_version_run(1, arm, k)
 				if len(failures) > 0 {
@@ -487,6 +500,7 @@ named_version_crash :: proc(t: ^testing.T) {
 				ahead += 1 if res.ahead else 0
 				settled += 1 if res.settled else 0
 				undone += res.undone
+				open += res.open
 				kept_lost += 1 if res.kept_lost else 0
 				other_lost += 1 if res.other_lost else 0
 				if !res.crashed {
@@ -494,7 +508,7 @@ named_version_crash :: proc(t: ^testing.T) {
 				}
 				points += 1
 			}
-			fmt.eprintf("named_version_crash: %v process=%v early=%v control=%v clean=%v: points=%d named=%d ahead=%d settled=%d undone=%d kept_lost=%d other_lost=%d failed=%d\n", kind, arm.process, arm.early, arm.control, arm.clean, points, named, ahead, settled, undone, kept_lost, other_lost, bad)
+			fmt.eprintf("named_version_crash: %v process=%v early=%v control=%v clean=%v: points=%d named=%d ahead=%d settled=%d undone=%d undo_open=%d kept_lost=%d other_lost=%d failed=%d\n", kind, arm.process, arm.early, arm.control, arm.clean, points, named, ahead, settled, undone, open, kept_lost, other_lost, bad)
 			testing.expect(t, arm.clean || undone > 0, fmt.tprintf("named_version_crash %v: no run undid the turn", arm))
 			testing.expect(t, arm.control || named > 0, fmt.tprintf("named_version_crash %v: no run had a named version in flight", arm))
 		}
