@@ -1098,8 +1098,31 @@ adopt_changes :: proc(p: ^Pass) -> Error {
 	}
 	adopted := make([]bool, len(p.changes), context.temp_allocator)
 	dirs := make([dynamic]Adopt_Dir, context.temp_allocator)
+	gone_to := make(map[string]int, context.temp_allocator)
+	carried := make(map[string]int, context.temp_allocator)
 	for c, i in p.changes {
-		if c.moved != "" || c.scope != nil || path_internal(c.path) {
+		if c.kind == .Remove && c.moved != "" && c.scope == nil {
+			gone_to[c.moved] = i
+		}
+		if c.kind == .Modify && c.carried && c.scope == nil {
+			carried[c.path] = i
+		}
+	}
+	for c, i in p.changes {
+		if c.kind != .Create || c.moved == "" || c.scope != nil || path_internal(c.path) || path_internal(c.moved) {
+			continue
+		}
+		r, paired := gone_to[c.path]
+		if !paired || p.changes[r].path != c.moved {
+			continue
+		}
+		if adopt_move(p, &snap, ll[:], line, c, carried, adopted, &ver) or_return {
+			adopted[i] = true
+			adopted[r] = true
+		}
+	}
+	for c, i in p.changes {
+		if adopted[i] || c.moved != "" || c.scope != nil || path_internal(c.path) {
 			continue
 		}
 		if c.kind == .Create && c.disk == .Dir {
@@ -1141,13 +1164,12 @@ adopt_changes :: proc(p: ^Pass) -> Error {
 @(private)
 adopt_one :: proc(p: ^Pass, snap: ^fstree.Snapshot, ll: []crdt.Lv, line: Version, c: Change, ver: ^u32) -> (adopted: bool, err: Error) {
 	m := p.m
-	h := m.history
 	ino, at_line, lerr := fstree.lookup(snap, c.path)
 	if lerr != nil {
 		return false, .Corrupt
 	}
 	if c.kind == .Remove {
-		if (c.old.kind != .File && c.old.kind != .Dir) || (at_line && ino == c.old.inode) {
+		if at_line && ino == c.old.inode {
 			return false, .None
 		}
 		if c.old.kind == .Dir {
@@ -1181,29 +1203,46 @@ adopt_one :: proc(p: ^Pass, snap: ^fstree.Snapshot, ll: []crdt.Lv, line: Version
 		shadow_put(&m.shadow, c.path, Entry{inode = ino, kind = .Dir, ver = ver^}) or_return
 		return true, .None
 	}
-	if c.disk != .File || !at_line || (c.kind == .Modify && (c.old.kind != .File || c.old.inode != ino)) {
+	if !at_line || (c.kind == .Modify && c.old.inode != ino) {
 		return false, .None
 	}
 	info, ok, ierr := fstree.info(snap, ino, context.temp_allocator)
-	if ierr != nil || !ok || !info.present || info.kind != .File || m.db == nil {
+	if ierr != nil || !ok || !info.present || m.db == nil {
+		return false, .None
+	}
+	if info.kind == .Symlink {
+		target := c.target
+		if c.disk == .File && !mount_symlinks(m) {
+			abuf: prim.Path_Buf
+			t, tok := read_link_file(m, abs_path(m, c.path, abuf[:]), c.stat) or_return
+			if !tok {
+				return false, .None
+			}
+			target = t
+		} else if c.disk != .Symlink {
+			return false, .None
+		}
+		if target != info.target || (c.kind == .Modify && c.old.kind != .Symlink) {
+			return false, .None
+		}
+		oid, _ := odb.hash(m.db.format, .Blob, transmute([]u8)target)
+		if c.kind == .Modify && c.old.oid == oid {
+			return false, .None
+		}
+		adopt_version(p, line, ver) or_return
+		shadow_put(&m.shadow, c.path, Entry{inode = ino, kind = .Symlink, stat = c.stat, oid = oid, ver = ver^}) or_return
+		return true, .None
+	}
+	if info.kind != .File || c.disk != .File || (c.kind == .Modify && c.old.kind != .File) {
 		return false, .None
 	}
 	_, disk_oid, _, rok := read_content(m, c.path, c.stat, ino, true) or_return
 	if !rok || (c.kind == .Modify && c.old.oid == disk_oid) {
 		return false, .None
 	}
-	want: odb.Oid
-	if .Opaque in info.flags {
-		reg, has := history_blob_at(h, ino, ll) or_return
-		if !has {
-			return false, .None
-		}
-		want = odb.Oid(reg.oid)
-	} else if oid, has := history_text_oid(h, ino, line) or_return; has {
-		want = oid
-	} else {
-		text := history_text_at(h, ino, line, context.temp_allocator) or_return
-		want, _ = odb.hash(m.db.format, .Blob, text)
+	want, wok := adopt_text(p, ll, line, ino, info.flags) or_return
+	if !wok {
+		return false, .None
 	}
 	if want != disk_oid {
 		return false, .None
@@ -1212,6 +1251,139 @@ adopt_one :: proc(p: ^Pass, snap: ^fstree.Snapshot, ll: []crdt.Lv, line: Version
 	e := Entry{inode = ino, kind = .File, stat = c.stat, oid = disk_oid, ver = ver^}
 	shadow_put(&m.shadow, c.path, e) or_return
 	return true, .None
+}
+
+@(private)
+adopt_text :: proc(p: ^Pass, ll: []crdt.Lv, line: Version, ino: fstree.Inode_Id, flags: fstree.Flags) -> (oid: odb.Oid, ok: bool, err: Error) {
+	h := p.m.history
+	if .Opaque in flags {
+		reg, has := history_blob_at(h, ino, ll) or_return
+		return odb.Oid(reg.oid), has, .None
+	}
+	if found, has := history_text_oid(h, ino, line) or_return; has {
+		return found, true, .None
+	}
+	text := history_text_at(h, ino, line, context.temp_allocator) or_return
+	oid, _ = odb.hash(p.m.db.format, .Blob, text)
+	return oid, true, .None
+}
+
+@(private)
+Adopt_Moved :: struct {
+	from:  string,
+	to:    string,
+	entry: Entry,
+	stale: bool,
+}
+
+@(private)
+adopt_move :: proc(p: ^Pass, snap: ^fstree.Snapshot, ll: []crdt.Lv, line: Version, c: Change, carried: map[string]int, adopted: []bool, ver: ^u32) -> (ok: bool, err: Error) {
+	m := p.m
+	ino, at_line, lerr := fstree.lookup(snap, c.path)
+	if lerr != nil {
+		return false, .Corrupt
+	}
+	held := holds_inode(m, c.moved, c.old.inode) or_return
+	if !at_line || ino != c.old.inode || !held {
+		return false, .None
+	}
+	list := make([dynamic]Adopt_Moved, context.temp_allocator)
+	top := c.old
+	fits, stale := adopt_moved_entry(p, snap, ll, line, c.path, c, true, &top) or_return
+	if !fits {
+		return false, .None
+	}
+	append(&list, Adopt_Moved{c.moved, c.path, top, stale})
+	kids := make([dynamic]Shadow_Child, context.temp_allocator)
+	for at := 0; at < len(list); at += 1 {
+		dir := list[at]
+		if dir.entry.kind != .Dir {
+			continue
+		}
+		clear(&kids)
+		shadow_children(&m.shadow, dir.from, &kids, context.temp_allocator) or_return
+		for k in kids {
+			from, _ := path_join(dir.from, k.name, context.temp_allocator)
+			to, _ := path_join(dir.to, k.name, context.temp_allocator)
+			e := k.entry
+			i, has := carried[to]
+			kfits, kstale := adopt_moved_entry(p, snap, ll, line, to, p.changes[i] if has else {}, has, &e) or_return
+			if !kfits {
+				return false, .None
+			}
+			append(&list, Adopt_Moved{from, to, e, kstale})
+		}
+	}
+	adopt_version(p, line, ver) or_return
+	#reverse for x in list {
+		shadow_remove(&m.shadow, x.from) or_return
+	}
+	before: u32
+	for x in list {
+		e := x.entry
+		if !x.stale {
+			e.ver = ver^
+		} else if e.ver == 0 {
+			adopt_version(p, m.synced[:], &before) or_return
+			e.ver = before
+		}
+		shadow_put(&m.shadow, x.to, e) or_return
+		if e.kind == .Dir {
+			watch_dir(m.reg, m, x.to, -1)
+		}
+		if i, has := carried[x.to]; has {
+			adopted[i] = true
+		}
+	}
+	mount_absent_add(m, c.moved)
+	return true, .None
+}
+
+@(private)
+adopt_moved_entry :: proc(p: ^Pass, snap: ^fstree.Snapshot, ll: []crdt.Lv, line: Version, to: string, c: Change, changed: bool, e: ^Entry) -> (ok: bool, stale: bool, err: Error) {
+	m := p.m
+	ino, at_line, lerr := fstree.lookup(snap, to)
+	if lerr != nil {
+		return false, false, .Corrupt
+	}
+	if !at_line || ino != e.inode {
+		return false, false, .None
+	}
+	info, has, ierr := fstree.info(snap, ino, context.temp_allocator)
+	if ierr != nil || !has || !info.present || info.kind != e.kind || m.db == nil {
+		return false, false, .None
+	}
+	was := e.oid
+	#partial switch e.kind {
+	case .Symlink:
+		if changed && c.disk == .Symlink {
+			e.oid, _ = odb.hash(m.db.format, .Blob, transmute([]u8)c.target)
+		} else if changed && !stat_clean(c.stat, e^) {
+			return false, false, .None
+		}
+		want, _ := odb.hash(m.db.format, .Blob, transmute([]u8)info.target)
+		stale = e.oid != want
+		if stale && e.oid != was {
+			return false, false, .None
+		}
+	case .File:
+		if changed && !stat_clean(c.stat, e^) {
+			_, oid, _, rok := read_content(m, to, c.stat, ino, true) or_return
+			if !rok {
+				return false, false, .None
+			}
+			e.oid = oid
+		}
+		want, wok := adopt_text(p, ll, line, ino, info.flags) or_return
+		stale = e.oid != want
+		if !wok || (stale && e.oid != was) {
+			return false, false, .None
+		}
+	}
+	if changed {
+		e.stat = c.stat
+	}
+	return true, stale, .None
 }
 
 @(private)
