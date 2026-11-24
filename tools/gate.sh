@@ -60,6 +60,51 @@ BUILD=$( { build sim.bin tests/sim -build-mode:test &
 if [ -n "$BUILD" ]; then note "build: FAIL $BUILD"; cat "$OUT/summary"; exit 1; fi
 note "build: ok"
 
+fail_list() {
+	printf '%s\n' "$1" | sed 's/\x1b\[[0-9;]*m//g' | awk '
+	match($0, /^\[(ERROR|FATAL)\] --- \[[^]]*\] \[[^]]*:[0-9]+:[A-Za-z0-9_]+\(\)\] /) {
+		head = substr($0, 1, RLENGTH)
+		msg = substr($0, RLENGTH + 1)
+		sub(/\(\)\] $/, "", head)
+		n = split(head, a, ":")
+		if (!(a[n] in first)) first[a[n]] = msg
+		next
+	}
+	/^sim: seed [0-9]+ FAILED/ {
+		seeds++
+		if (!("simulate" in own)) own["simulate"] = $0
+	}
+	/^membership seed [0-9]+: / && !("membership" in own) {
+		own["membership"] = $0
+	}
+	/^ - [A-Za-z0-9_]+\.[A-Za-z0-9_]+[ \t]/ {
+		line = substr($0, 4)
+		name = line
+		sub(/[ \t].*$/, "", name)
+		msg = line
+		sub(/^[^ \t]+[ \t]+/, "", msg)
+		if (!(name in seen)) {
+			seen[name] = 1
+			order[++k] = name
+			last[name] = msg
+		}
+	}
+	END {
+		out = ""
+		for (i = 1; i <= k; i++) {
+			name = order[i]
+			short = name
+			sub(/^.*\./, "", short)
+			m = (short in own) ? own[short] : (short in first) ? first[short] : last[name]
+			if (length(m) > 160) m = substr(m, 1, 160) "..."
+			if (short == "simulate" && seeds > 1) m = m " (+" (seeds - 1) " more seeds)"
+			out = out (i > 1 ? " | " : "") name ": " m
+		}
+		print k + 0
+		print out
+	}'
+}
+
 ok_run() {
 	echo "$1" | grep -q "FATAL" && return 1
 	echo "$1" | grep -E "Finished [0-9]+ tests?" | tail -1 | grep -qE "All tests were successful|The test was successful"
@@ -107,7 +152,7 @@ jitter_lane() {
 	lane until-run SIM_STORAGE=until-run 61 80 > "$OUT/l18" &
 	lane until-run SIM_STORAGE=until-run 81 100 > "$OUT/l19" &
 	( r=$(SIM_MEMBER_SEED=1 SIM_MEMBER_SEEDS=30 timeout 2400 "$OUT/mem.bin" 2>&1); n=$(echo "$r" | grep -c 'membership seed [0-9]*: '); ok_run "$r" || n=$((n+1)); echo "membership 1-30 isolated: $n failure lines $(echo "$r" | grep -E 'membership seed [0-9]+: ' | sort -u | head -2 | tr '\n' ' ')" ) > "$OUT/l7" &
-	( r=$(timeout 2400 "$OUT/sim.bin" 2>&1); echo "scenarios: $(ok_run "$r" && echo 0 || echo 1) failed $(echo "$r" | grep -E 'seed [0-9]+ FAILED|membership seed [0-9]+: |local_first.*FAIL|staged.*FAIL|FATAL' | head -3 | tr '\n' ' ')" ) > "$OUT/l8" &
+	( r=$(timeout 2400 "$OUT/sim.bin" 2>&1); f=$(fail_list "$r"); n=$(printf '%s\n' "$f" | head -1); list=$(printf '%s\n' "$f" | tail -n +2); if [ "$n" = 0 ] && ! ok_run "$r"; then n=1; list="no test summary (killed or timed out): $(printf '%s\n' "$r" | tail -1 | cut -c1-160)"; fi; if [ "$n" = 0 ]; then echo "scenarios: 0 failed"; else echo "scenarios: $n failed [$list]"; fi ) > "$OUT/l8" &
 	( r=$(timeout 900 "$OUT/cvg.bin" 2>&1 | grep -E "Finished|FAILED|panic|FATAL" | tail -1); echo "convergence: $r" ) > "$OUT/l9" &
 	( r=$(timeout 900 "$OUT/fst.bin" 2>&1 | grep -E "Finished|FAILED|panic|FATAL" | tail -1); echo "fstree: $r" ) > "$OUT/l10" &
 	( r=$(cd docs/relay-vectors && timeout 300 "$OUT/relayvec" check . 2>&1 | tail -1); echo "relay vectors: $r" ) > "$OUT/l11" &
