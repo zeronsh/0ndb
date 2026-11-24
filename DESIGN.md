@@ -935,7 +935,13 @@ equal in both directions.
   sources are delivery dependencies, never version parents: admitting a
   batch whose source is not yet in the graph answers `Need_Source` with the
   missing ops (the batch is held, never cut), a redacted source redacts the
-  copied range, and a local commit whose source is missing is corruption. A
+  copied range, and a local commit whose source is missing is corruption.
+  The engine holds the batch's stream at that record the way it holds one
+  whose parents are missing, keeps every other stream of the tree wanted to
+  its relay length, and resumes on their growth; it stalls the stream (an
+  error, counted, never a cut batch and never a retry loop) only once the
+  stream that writes the source is in view and complete and the source is
+  still absent, which only a lying writer or relay causes. A
   materialization whose pass switched lines restarts at the
   new line rather than writing the old one back. Ingestion on a line other
   than the mount's own uses an actor derived from the mount and the line,

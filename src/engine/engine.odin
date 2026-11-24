@@ -267,6 +267,8 @@ Stats :: struct {
 	subs:        int,
 	fetches:     u64,
 	probes:      u64,
+	copy_source_holds: u64,
+	copy_source_stalls: u64,
 	indexed:     u64,
 	wakeups:     u64,
 	live_bytes:  u64,
