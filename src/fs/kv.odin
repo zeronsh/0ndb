@@ -42,7 +42,23 @@ Kv :: struct {
 	out:       [dynamic]u8,
 	mapped:    []u8,
 	map_lock:  ^sync.Mutex,
-	commits:     u64,
+	commits:   u64,
+	pages:     map[u64]^Kv_Page,
+	paged:     bool,
+	fresh:     bool,
+	torn:      bool,
+}
+
+@(private = "file")
+KV_PAGE :: 4096
+
+@(private = "file")
+KV_PAGES_MAX :: 1024
+
+@(private = "file")
+Kv_Page :: struct {
+	data:  [KV_PAGE]u8,
+	dirty: bool,
 }
 
 @(private = "file")
@@ -114,7 +130,7 @@ kv_attach :: proc(kv: ^Kv) -> Error {
 
 kv_detach :: proc(kv: ^Kv) {
 	kv_unmap(kv)
-	if kv.idx_fd >= 0 && kv.log_fd >= 0 && len(kv.order) == 0 {
+	if kv.idx_fd >= 0 && kv.log_fd >= 0 && len(kv.order) == 0 && !kv.torn {
 		if kv.covered == kv.log_end || kv_checkpoint(kv) == .None {
 			kv_write_header(kv, true)
 		}
@@ -194,7 +210,7 @@ kv_commit :: proc(kv: ^Kv) -> Error {
 	}
 	want := kv_cap_for(kv.used + u64(len(kv.order)) + 1)
 	kv.commits += 1
-	if want > kv.cap || kv_rebuild_every > 0 && kv.commits % kv_rebuild_every == 0 {
+	if kv.torn || want > kv.cap || kv_rebuild_every > 0 && kv.commits % kv_rebuild_every == 0 {
 		kv_rebuild(kv, max(want, kv.cap)) or_return
 	}
 	if kv.clean_disk {
@@ -223,6 +239,9 @@ kv_commit :: proc(kv: ^Kv) -> Error {
 	}
 	kv.log_end = start + u64(len(kv.out))
 	kv_map(kv)
+	kv_pages_open(kv, false)
+	defer kv_pages_close(kv)
+	kv.torn = true
 	pos := 0
 	for pos < len(kv.out) {
 		n := int(prim.get_u32le(kv.out[pos:pos + 4]))
@@ -240,6 +259,8 @@ kv_commit :: proc(kv: ^Kv) -> Error {
 		pos += n + 8
 	}
 	kv_unmap(kv)
+	kv_pages_flush(kv) or_return
+	kv.torn = false
 	kv_pending_clear(kv)
 	if cap(kv.out) > 1 << 20 {
 		delete(kv.out)
@@ -414,6 +435,9 @@ kv_compact :: proc(kv: ^Kv) -> Error {
 	if len(kv.order) > 0 {
 		kv_commit(kv) or_return
 	}
+	if kv.torn {
+		kv_rebuild(kv, kv.cap) or_return
+	}
 	n := Kv {
 		vfs       = kv.vfs,
 		dir       = kv.dir,
@@ -543,6 +567,9 @@ kv_slot_read :: proc(kv: ^Kv, i: u64) -> (h: u64, off: u64, err: Error) {
 			return 0, 0, .Corrupt
 		}
 		copy(b[:], kv.mapped[pos:])
+	} else if kv.paged {
+		pg := kv_page(kv, pos / KV_PAGE) or_return
+		copy(b[:], pg.data[pos % KV_PAGE:])
 	} else {
 		got, rerr := prim.read_at(kv.vfs, kv.idx_fd, b[:], i64(pos))
 		if rerr != .None {
@@ -568,7 +595,90 @@ kv_slot_write :: proc(kv: ^Kv, i: u64, h: u64, off: u64) -> Error {
 		copy(kv.mapped[pos:], b[:])
 		return .None
 	}
+	if kv.paged {
+		pg := kv_page(kv, pos / KV_PAGE) or_return
+		copy(pg.data[pos % KV_PAGE:], b[:])
+		pg.dirty = true
+		return .None
+	}
 	return from_prim(prim.write_at(kv.vfs, kv.idx_fd, b[:], i64(pos)))
+}
+
+@(private = "file")
+kv_pages_open :: proc(kv: ^Kv, fresh: bool) {
+	if kv.mapped != nil {
+		return
+	}
+	kv.pages = make(map[u64]^Kv_Page, kv.allocator)
+	kv.paged = true
+	kv.fresh = fresh
+}
+
+@(private = "file")
+kv_pages_drop :: proc(kv: ^Kv) {
+	for _, pg in prim.unordered(kv.pages) {
+		free(pg, kv.allocator)
+	}
+	clear(&kv.pages)
+}
+
+@(private = "file")
+kv_pages_close :: proc(kv: ^Kv) {
+	kv_pages_drop(kv)
+	delete(kv.pages)
+	kv.pages = nil
+	kv.paged = false
+	kv.fresh = false
+}
+
+@(private = "file")
+kv_page :: proc(kv: ^Kv, at: u64) -> (pg: ^Kv_Page, err: Error) {
+	if x, ok := kv.pages[at]; ok {
+		return x, .None
+	}
+	if len(kv.pages) >= KV_PAGES_MAX {
+		kv_pages_flush(kv) or_return
+		kv_pages_drop(kv)
+		kv.fresh = false
+	}
+	pg = new(Kv_Page, kv.allocator)
+	if !kv.fresh {
+		if _, rerr := prim.read_at(kv.vfs, kv.idx_fd, pg.data[:], i64(at * KV_PAGE)); rerr != .None {
+			free(pg, kv.allocator)
+			return nil, from_prim(rerr)
+		}
+	}
+	kv.pages[at] = pg
+	return pg, .None
+}
+
+@(private = "file")
+kv_pages_flush :: proc(kv: ^Kv) -> Error {
+	if !kv.paged {
+		return .None
+	}
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+	run := make([dynamic]u8, 0, 16 * KV_PAGE, context.temp_allocator)
+	start := u64(0)
+	for at in prim.sorted_keys(kv.pages) {
+		pg := kv.pages[at]
+		if !pg.dirty {
+			continue
+		}
+		if len(run) > 0 && (start + u64(len(run) / KV_PAGE) != at || len(run) >= 16 * KV_PAGE) {
+			from_prim(prim.write_at(kv.vfs, kv.idx_fd, run[:], i64(start * KV_PAGE))) or_return
+			clear(&run)
+		}
+		if len(run) == 0 {
+			start = at
+		}
+		append(&run, ..pg.data[:])
+		pg.dirty = false
+	}
+	if len(run) > 0 {
+		from_prim(prim.write_at(kv.vfs, kv.idx_fd, run[:], i64(start * KV_PAGE))) or_return
+	}
+	return .None
 }
 
 @(private = "file")
@@ -951,6 +1061,8 @@ kv_rebuild_into :: proc(kv: ^Kv, capacity: u64) -> (full: bool, err: Error) {
 	}
 	kv_zero(kv, ifd, i64(KV_HEADER + capacity * KV_SLOT)) or_return
 	kv_map(kv)
+	kv_pages_open(kv, true)
+	defer kv_pages_close(kv)
 	end := kv.log_end
 	off := u64(KV_LOG_HEADER)
 	good := off
@@ -1022,11 +1134,13 @@ kv_rebuild_into :: proc(kv: ^Kv, capacity: u64) -> (full: bool, err: Error) {
 		kv.log_end = good
 	}
 	kv_unmap(kv)
+	kv_pages_flush(kv) or_return
 	from_prim(prim.datasync(kv.vfs, ifd)) or_return
 	kv.covered = kv.log_end
 	kv_write_header(kv, false)
 	from_prim(prim.rename(kv.vfs, tmp_path, idx_path)) or_return
 	kv.clean_disk = false
+	kv.torn = false
 	ok = true
 	if saved.idx_fd >= 0 {
 		prim.close_file(kv.vfs, saved.idx_fd)

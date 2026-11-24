@@ -406,6 +406,7 @@ history_groups_retry :: proc(h: ^History) -> Error {
 	if !h.groups_blocked {
 		return .None
 	}
+	h.groups_blocked = false
 	return history_durable(h, h.durable)
 }
 
@@ -448,8 +449,13 @@ history_durable :: proc(h: ^History, mark: u64) -> Error {
 		h.settled = max(h.settled, h.kv_upto)
 		h.kv_at = 0
 	}
-	committed, cerr := history_commit_groups(h)
-	blocked := cerr == .Busy
+	blocked := h.groups_blocked
+	committed := false
+	cerr: Error
+	if !blocked {
+		committed, cerr = history_commit_groups(h)
+		blocked = cerr == .Busy
+	}
 	if blocked {
 		committed = false
 		cerr = .None
