@@ -402,10 +402,6 @@ _on_repl_event :: proc(user: rawptr, ev: ^osync.Repl_Event) {
 	case .Object_Stored, .Object_Fetched, .Object_Missing, .Object_Failed:
 		_content_on_event(e, sp, ev)
 		return
-	case .Checkpoint, .Checkpoint_Missing:
-		if _search_retired_checkpoint(e, ev) {
-			return
-		}
 	case .Device_Seen, .Dropped, .Object_Shredded:
 		return
 	case .Direct, .Undelivered:
