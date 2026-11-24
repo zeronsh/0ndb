@@ -534,6 +534,7 @@ Mount :: struct {
 	switch_to:   string,
 	switch_from: string,
 	switch_phase: u8,
+	switch_tail: bool,
 	switch_fence: u64,
 	switch_fence_ok: bool,
 	switch_timer: prim.Timer,
@@ -2616,6 +2617,10 @@ mount_recover :: proc(m: ^Mount) -> Error {
 			both := make([dynamic]crdt.Lv, context.temp_allocator)
 			crdt.version_union(&h.g, have[:], ends[:], &both)
 			target = both[:]
+			only_a := make([dynamic]crdt.Lv_Span, context.temp_allocator)
+			only_b := make([dynamic]crdt.Lv_Span, context.temp_allocator)
+			crdt.graph_diff(&h.g, have[:], target, &only_a, &only_b)
+			spans_touched(h, only_b[:], &touched) or_return
 		}
 		snap := version_snapshot(h, target) or_return
 		defer fstree.snapshot_destroy(&snap)

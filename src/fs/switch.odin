@@ -31,9 +31,11 @@ switch_record :: proc(m: ^Mount, img: ^Mount_Image) -> (rec: Switch_Record) {
 		}
 		return
 	}
-	if m.has_git && len(img.line) > 0 && len(m.branch) > 0 && img.line != m.branch {
-		rec = Switch_Record{to = m.branch, from = img.line, phase = SWITCH_DONE, head = m.head, reflog_pos = m.reflog_pos}
+	if !m.switch_tail || !m.has_git || len(img.line) == 0 || len(m.branch) == 0 || img.line == m.branch {
+		m.switch_tail = false
+		return
 	}
+	rec = Switch_Record{to = m.branch, from = img.line, phase = SWITCH_DONE, head = m.head, reflog_pos = m.reflog_pos}
 	return
 }
 
@@ -210,6 +212,7 @@ switch_advance :: proc(m: ^Mount) -> (finished: bool, err: Error) {
 	m.branch, _ = clone_string(to, m.allocator)
 	done, data := m.switch_done, m.switch_data
 	switch_clear(m)
+	m.switch_tail = true
 	save_mount_state(m) or_return
 	if m.reg != nil && m.reg.on_line != nil {
 		m.reg.on_line(m, line_key_of(m, from, context.temp_allocator), line_key_of(m, to, context.temp_allocator), m.reg.hook_data)

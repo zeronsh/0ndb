@@ -970,13 +970,17 @@ equal in both directions.
   git HEAD already there adopts it before its first pass, with the reflog
   position just past the `0ndb: switch` entry and no trusted index stamp, so
   the pass does not read the switch as a user checkout. The saved head and line
-  come from the settled image, which lags the mount, so after any completed
-  line change (a 0ndb switch or a followed git checkout) the state carries a
-  done record (`SWITCH_DONE`: the line the worktree holds, its head and reflog
-  position) until the image catches up: no saved state names a line other
-  than the one the worktree holds. A reopen applies a done record as the
-  mount's branch and head and never reruns git; HEAD moved since is a user
-  checkout from that head. A line learns a commit only from the worktree. A
+  come from the settled image, which lags the mount, so after a completed 0ndb
+  switch the state carries a done record (`SWITCH_DONE`: the line the worktree
+  holds, its head and reflog position) until the image catches up: no saved
+  state names a line other than the one the worktree holds. A reopen applies
+  a done record as the mount's branch and head and never reruns git; HEAD
+  moved since is a user checkout from that head. A followed git checkout
+  writes no done record: git wrote that worktree, so a reopen whose image
+  still names the old line re-walks the checkout as git's write (carried
+  files stay git's), and recovery, when it raises the synced version past the
+  image, shadows every path that version changed, so the re-walk finds the
+  target line's files as its own rather than as creates. A line learns a commit only from the worktree. A
   commit its line never saw on disk (made and checked away from between
   passes, or in a pass a crash lost) lands on that line as a git-op batch the
   next time its branch is checked out; no reflog position needs to be durable
