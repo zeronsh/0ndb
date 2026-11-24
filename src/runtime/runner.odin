@@ -129,6 +129,9 @@ evaluate :: proc(r: ^Runtime, o: Object) {
 			return
 		}
 		waiting_msg = head
+		if eng.convo_move_pending(r.e, o) {
+			return
+		}
 		if _placed_here(r, o, v, &t, &hm) {
 			start_run(r, o, head)
 		}

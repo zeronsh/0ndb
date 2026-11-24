@@ -624,7 +624,7 @@ _batch_cb :: proc(data: rawptr, err: pack.Error) {
 		append(&e.batch_late, Late_Batch{b, _perr(err)})
 		return
 	}
-	_batch_complete(e, b, _perr(err))
+	_batch_complete(e, b, _perr(err), true)
 }
 
 @(private)
@@ -644,7 +644,7 @@ _batches_done :: proc(e: ^Engine, err: Error) {
 }
 
 @(private)
-_batch_complete :: proc(e: ^Engine, b: ^Durable_Batch, err: Error) {
+_batch_complete :: proc(e: ^Engine, b: ^Durable_Batch, err: Error, direct := false) {
 	idx := -1
 	for x, i in e.batches {
 		if x == b {
@@ -713,6 +713,13 @@ _batch_complete :: proc(e: ^Engine, b: ^Durable_Batch, err: Error) {
 				}
 				if fs.history_durable_mark(h.hist) > h.hist.durable {
 					_touch(e)
+				}
+				if direct && e.plug.reg_on && !e.in_tick && !prim.loop_nested(e.loop) {
+					for mt in e.plug.mounts {
+						if mt.object.id == m.object && fs.mount_take_ready(&mt.mount) && !fs.mount_lock_held(&mt.mount) {
+							_on_mount_ready(&mt.mount, e)
+						}
+					}
 				}
 			}
 		}

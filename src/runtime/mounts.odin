@@ -515,7 +515,7 @@ _worktree_mount_materialized :: proc(m: ^fs.Mount, data: rawptr) {
 worktree_started :: proc(ws: ^Worktree) {
 	for &mb in ws.members {
 		if mb.m != nil {
-			mb.start = clone_version(fs.mount_synced(mb.m), ws.alloc)
+			mb.start = clone_version(fs.mount_placed(mb.m), ws.alloc)
 		}
 	}
 }
