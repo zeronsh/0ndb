@@ -1715,13 +1715,58 @@ mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> (err: Error) {
 }
 
 @(private)
+shown_free :: proc(shown: ^map[string][]crdt.Op_Id, allocator: runtime.Allocator) {
+	for k, v in shown {
+		delete(k, allocator)
+		delete(v, allocator)
+	}
+	delete(shown^)
+	shown^ = nil
+}
+
+@(private)
+shown_put :: proc(m: ^Mount, line: string, v: []crdt.Op_Id) {
+	if m.shown == nil {
+		m.shown = make(map[string][]crdt.Op_Id, m.allocator)
+	}
+	c := slice.clone(v, m.allocator)
+	if old, ok := &m.shown[line]; ok {
+		delete(old^, m.allocator)
+		old^ = c
+		return
+	}
+	k, _ := clone_string(line, m.allocator)
+	m.shown[k] = c
+}
+
+@(private)
+shown_version :: proc(m: ^Mount, line: string, head: Version) -> (v: Version, ok: bool) {
+	row := m.shown[line] or_return
+	h := m.history
+	rl := make([dynamic]crdt.Lv, context.temp_allocator)
+	hl := make([dynamic]crdt.Lv, context.temp_allocator)
+	if crdt.graph_version_lvs(&h.g, row, &rl) != .None || crdt.graph_version_lvs(&h.g, head, &hl) != .None {
+		return nil, false
+	}
+	if !crdt.graph_contains_all(&h.g, hl[:], rl[:]) {
+		return nil, false
+	}
+	return row, true
+}
+
+@(private)
 line_follow :: proc(m: ^Mount, key: string) -> Error {
 	h := m.history
+	shown_put(m, m.line, m.synced[:])
 	v, found := history_line(h, key, context.temp_allocator) or_return
 	if !found || len(v) == 0 {
 		history_set_line(h, key, m.synced[:]) or_return
 	} else {
-		line_retarget(m, v) or_return
+		target := v
+		if row, ok := shown_version(m, key, v); ok {
+			target = row
+		}
+		line_retarget(m, target) or_return
 	}
 	delete(m.line, m.allocator)
 	m.line, _ = clone_string(key, m.allocator)
