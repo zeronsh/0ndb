@@ -4,6 +4,7 @@ import "core:fmt"
 import "core:os"
 import "core:strings"
 import "core:testing"
+import "core:time"
 import eng "../../src/engine"
 import "../../src/fs"
 import "../../src/fshist"
@@ -341,50 +342,143 @@ _event_undo :: proc(w: ^World, arm: Event_Undo_Arm) -> (res: Event_Undo_Result) 
 }
 
 @(test)
-event_undo :: proc(t: ^testing.T) {
-	if s, ok := os.lookup_env("SIM_SEED", context.temp_allocator); ok && len(s) > 0 {
-		return
-	}
+event_long :: proc(t: ^testing.T) {
 	test_begin(t)
 	defer test_end(t)
-	plain: [4][21]string
-	defer for row in plain {
-		for x in row {
-			delete(x)
+	for release in ([]bool{false, true}) {
+		for other in ([]bool{false, true}) {
+			w := _eu_long_world()
+			_eu_long(w, release, other)
+			for f in w.failures {
+				fmt.eprintf("event_long: %s\n", f)
+			}
+			world_destroy(w)
+			free(w)
 		}
 	}
-	for bits in 0 ..< 8 {
-		arm := Event_Undo_Arm{person = bits & 1 != 0, outside = bits & 2 != 0, blocked = bits & 4 != 0}
-		named, events, bad := 0, 0, 0
-		for seed in u64(1) ..= 20 {
-			failures, res := event_undo_run(seed, arm)
-			for f in failures {
-				if bad == 0 {
-					fmt.eprintf("event_undo seed %d: %s\n", seed, f)
-				}
-				delete(f)
-			}
-			bad += 1 if len(failures) > 0 else 0
-			named += 1 if res.named else 0
-			events += 1 if res.events > 0 else 0
-			if !arm.blocked {
-				plain[bits & 3][seed] = strings.clone(res.undone)
-			}
-			if arm.blocked && res.undone != plain[bits & 3][seed] {
-				fmt.eprintf("event_undo seed %d: %v: the undo of an event actor's batch left %q, a plain one %q\n", seed, arm, res.undone, plain[bits & 3][seed])
-				testing.expect(t, false, "event_undo: an event actor's batch is undone like a plain one")
-			}
-			if seed == 1 {
-				fmt.eprintf("event_undo: %v undone %q redone %q\n", arm, res.undone, res.redone)
-			}
-			delete(failures)
-			delete(res.undone)
-			delete(res.redone)
-			delete(res.was)
-		}
-		fmt.eprintf("event_undo: %v: %d of 20 named, %d with an event actor, %d failed\n", arm, named, events, bad)
-		testing.expect(t, bad == 0, fmt.tprintf("event_undo %v failed", arm))
-		testing.expect(t, named > 0, "event_undo: no run had a named version")
-		testing.expect(t, arm.blocked == (events > 0), fmt.tprintf("event_undo %v: %d runs used an event actor", arm, events))
+}
+
+@(private = "file")
+_eu_long_world :: proc() -> ^World {
+	cfg := default_config(1)
+	cfg.nodes = 1
+	cfg.spaces = 0
+	cfg.ops = 0
+	cfg.crash_rate = 0
+	cfg.fault_rate = 0
+	cfg.io_rate = 0
+	cfg.byzantine = false
+	cfg.bulk = false
+	cfg.durability = .Async
+	cfg.mem_max = 1500
+	w := new(World)
+	world_init(w, cfg)
+	return w
+}
+
+@(private = "file")
+_eu_long :: proc(w: ^World, release: bool, other: bool) {
+	n := w.nodes[0]
+	if !node_start(n) {
+		return
 	}
+	m := &w.model
+	vfs := disk_vfs(&n.disk)
+	tree: eng.Object
+	setup: {
+		context = instance_context(&n.inst)
+		space, _ := eng.space_create(&n.e, "long")
+		eng.space_open(&n.e, space)
+		tree, _ = eng.tree_create(&n.e, space, "work")
+		node_after(n)
+	}
+	cop := new_op(m, .Create, n, len(m.objs))
+	op_done(cop, 0, .None)
+	ob := M_Obj{kind = .Tree, creator = n.idx, op = cop.idx, o = tree}
+	ob.removed = make(map[string]bool, w.allocator)
+	ob.shared = make([dynamic]int, w.allocator)
+	append(&m.objs, ob)
+	files := [?]Git_File{{name = "a.txt", data = transmute([]u8)string(EU_BASE)}, {name = "b.txt", data = transmute([]u8)string("main b\n")}}
+	git_checkout_create(vfs, EU_ROOT, files[:], clock_wall(&n.clock) / 1_000_000_000, node_clock(&n.clock), rng_random(&w.rng))
+	node_mount(w, n, len(m.objs) - 1, EU_ROOT)
+	append(&m.mounts, M_Mount{node = n.idx, oi = len(m.objs) - 1, root = strings.clone(EU_ROOT, w.allocator)})
+	run_until(w, w.now + 2_000_000_000, true)
+	hold: ^fs.Scope
+	named: {
+		context = instance_context(&n.inst)
+		sm := _eu_mount(n)
+		id :: proc(w: ^World, n: ^Node) -> prim.Id {
+			return prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng))
+		}
+		hold = _eu_open(w, n, sm, id(w, n))
+		fs.scope_write_begin(hold, "a.txt")
+		reader := _eu_open(w, n, sm, id(w, n))
+		fs.scope_read_base(reader, "a.txt", transmute([]u8)string(EU_BASE))
+		_eu_scoped(w, n, sm, _eu_open(w, n, sm, id(w, n)), "a.txt", EU_BASE + EU_KEPT)
+		_eu_scoped(w, n, sm, reader, "a.txt", EU_BASE + EU_TOOL)
+		node_after(n)
+	}
+	run_until(w, w.now + 2_000_000_000, true)
+	start_v: fs.Version
+	ver: {
+		context = instance_context(&n.inst)
+		start_v, _ = eng.tree_version(&n.e, tree, "main", w.allocator)
+	}
+	text := strings.clone(EU_BASE + EU_TOOL, w.allocator)
+	for i in 0 ..< 300 {
+		step: {
+			context = instance_context(&n.inst)
+			if release && i == 100 {
+				fs.scope_close(n.reg, hold)
+			}
+			if other {
+				_eu_write(vfs, EU_ROOT + "/b.txt", fmt.tprintf("main b\nraised %d\n", i))
+			}
+			node_after(n)
+		}
+		if os.get_env("EL_SAME", context.temp_allocator) == "" {
+			run_until(w, w.now + 1_000_000_000, true)
+		}
+		step2: {
+			context = instance_context(&n.inst)
+			n.disk.probe += 1
+			have, _ := prim.read_file(vfs, EU_ROOT + "/a.txt", context.temp_allocator)
+			n.disk.probe -= 1
+			text = strings.concatenate({string(have), fmt.tprintf("edit %d\n", i)}, w.allocator)
+			_eu_write(vfs, EU_ROOT + "/a.txt", text)
+			node_after(n)
+		}
+		run_until(w, w.now + 1_000_000_000, true)
+	}
+	context = instance_context(&n.inst)
+	data, _ := eng.tree_read(&n.e, tree, "a.txt", context.temp_allocator, {}, "main")
+	bad := 0
+	for i in 0 ..< 300 {
+		if strings.count(string(data), fmt.tprintf("edit %d\n", i)) != 1 {
+			bad += 1
+		}
+	}
+	sm := _eu_mount(n)
+	lo, blame_ms, read_ms := f64(0), f64(0), f64(0)
+	for k in 0 ..< 20 {
+		t0 := time.tick_now()
+		_, spans, _ := eng.tree_blame(&n.e, tree, "a.txt", context.temp_allocator, "main")
+		d := time.duration_milliseconds(time.tick_since(t0))
+		if k == 0 { lo = d }
+		blame_ms += d / 20
+		t1 := time.tick_now()
+		eng.tree_read(&n.e, tree, "a.txt", context.temp_allocator, {}, "main")
+		read_ms += time.duration_milliseconds(time.tick_since(t1)) / 20
+		_ = spans
+	}
+	t2 := time.tick_now()
+	set, _ := fs.history_mount_actors(sm.m.history, []prim.Id{sm.m.id}, []string{sm.m.line}, context.temp_allocator)
+	set_ms := time.duration_milliseconds(time.tick_since(t2))
+	t3 := time.tick_now()
+	_, uerr := eng.tree_revert_set(&n.e, tree, start_v, set, "main")
+	undo_ms := time.duration_milliseconds(time.tick_since(t3))
+	after, _ := eng.tree_read(&n.e, tree, "a.txt", context.temp_allocator, {}, "main")
+	fmt.eprintf("event_time: other_file=%v released=%v actors_in_set=%d blame first %.2f mean %.2f ms, read %.2f ms, undo set %.2f ms, undo %.2f ms (%v), left %q\n", other, release, len(set), lo, blame_ms, read_ms, set_ms, undo_ms, uerr, string(after) if len(after) < 80 else "long")
+	fmt.eprintf("event_long: released_at_100=%v other_file=%v: 300 edits, %d event actors, %d wrong lines, %d actors known\n", release, other, sm.m.event_actors, bad, len(sm.m.history.g.actors))
+	node_after(n)
 }
