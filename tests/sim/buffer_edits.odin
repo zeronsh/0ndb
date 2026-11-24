@@ -48,9 +48,6 @@ _buffer_token_removed :: proc(m: ^Model, oi: int, tok: string) -> bool {
 		if d.obj != oi || !op_maybe(d) {
 			continue
 		}
-		if d.kind == .Redact_Text {
-			return true
-		}
 		for x in d.deletes {
 			if x == tok {
 				return true
