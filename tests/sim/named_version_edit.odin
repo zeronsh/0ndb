@@ -33,6 +33,7 @@ Named_Edit_Arm :: struct {
 	again:     bool,
 	more:      bool,
 	process:   bool,
+	atomic:    bool,
 }
 
 Named_Edit_Result :: struct {
@@ -211,7 +212,12 @@ _named_edit :: proc(w: ^World, arm: Named_Edit_Arm, crash_at: u64) -> (res: Name
 		n.disk.crash_at = n.disk.stats.ops + crash_at
 	}
 	if arm.edit {
-		if _nv_write(vfs, NV_ROOT + "/a.txt", strings.concatenate({disk, NV_EDIT}, w.allocator)) != .None {
+		to := NV_ROOT + "/a.txt.save" if arm.atomic else NV_ROOT + "/a.txt"
+		werr := _nv_write(vfs, to, strings.concatenate({disk, NV_EDIT}, w.allocator))
+		if werr == .None && arm.atomic {
+			werr = prim.rename(vfs, to, NV_ROOT + "/a.txt")
+		}
+		if werr != .None {
 			if !n.disk.dead {
 				world_fail(w, "named edit: the person's edit")
 				return
@@ -276,6 +282,7 @@ _named_edit :: proc(w: ^World, arm: Named_Edit_Arm, crash_at: u64) -> (res: Name
 	n.disk.probe += 1
 	shown, _ := prim.read_file(vfs, NV_ROOT + "/a.txt", context.temp_allocator)
 	n.disk.probe -= 1
+
 	edited := crash_at == 0 || strings.contains(string(shown), NV_EDIT)
 	if !edited && strings.contains(string(data), NV_EDIT) {
 		world_fail(w, "named edit: %v: the line has an edit the disk does not (%q, disk %q), at disk op %d", arm, string(data), string(shown), crash_at)
@@ -337,9 +344,11 @@ named_version_edit :: proc(t: ^testing.T) {
 		fmt.eprintf("named_version_edit: again: %d of 20 failed, most event actors %d\n", bad, events)
 		testing.expect(t, bad == 0, "named_version_edit: the same edit made again")
 	}
-	for more in ([]bool{false, true}) {
-		for process in ([]bool{false, true}) {
-			arm := Named_Edit_Arm{elsewhere = true, edit = true, named = true, more = more, process = process}
+	for bits in 0 ..< 8 {
+		more := bits & 1 != 0
+		process := bits & 2 != 0
+		sweep: {
+			arm := Named_Edit_Arm{elsewhere = true, edit = true, named = true, more = more, process = process, atomic = bits & 4 != 0}
 			points, typed, bad := 0, 0, 0
 			events: u64
 			for k in u64(1) ..= 3000 {
@@ -357,9 +366,9 @@ named_version_edit :: proc(t: ^testing.T) {
 				}
 				points += 1
 			}
-			fmt.eprintf("named_version_edit: crash more=%v process=%v: points=%d typed_after=%d failed=%d most event actors=%d\n", more, process, points, typed, bad, events)
+			fmt.eprintf("named_version_edit: crash more=%v process=%v atomic=%v: points=%d typed_after=%d failed=%d most event actors=%d\n", more, process, arm.atomic, points, typed, bad, events)
 			testing.expect(t, bad == 0, fmt.tprintf("named_version_edit crash more=%v process=%v failed", more, process))
-			testing.expect(t, !more || typed > 0, "named_version_edit: nobody typed after a crash")
+			testing.expect(t, !more || arm.atomic || typed > 0, "named_version_edit: nobody typed after a crash")
 		}
 	}
 }
