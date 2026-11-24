@@ -6,6 +6,9 @@ import "../pack"
 import "../prim"
 
 @(private)
+ROOT_REDACT :: 4
+
+@(private)
 RLOG_INTENT :: u8(1)
 @(private)
 RLOG_CLEAR :: u8(2)

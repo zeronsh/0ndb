@@ -126,9 +126,7 @@ Event_Kind :: enum u8 {
 	Lease_Lapsed,
 	Space_Left,
 	Line_Switched,
-	Replica_Redacted,
 	Rename_Offered,
-	Redact_Unreached,
 	Models_Changed,
 }
 
@@ -375,7 +373,6 @@ Engine :: struct {
 	db:           odb.Odb,
 	db_open:      bool,
 	pack_more:    bool,
-	redact_tick:  u64,
 	rlog:         Rlog,
 	dlog:         dl.Log,
 	dlog_open:    bool,
@@ -512,7 +509,6 @@ open :: proc(e: ^Engine, cfg: Config, allocator := context.allocator) -> (err: E
 	_spaces_load(e) or_return
 	_unclean_mark_spaces(e) or_return
 	_account_load(e)
-	_redact_recover(e)
 	_leave_resume(e)
 	if e.account.have {
 		_touch(e)
@@ -945,7 +941,7 @@ _on_settle :: proc(l: ^prim.Loop, data: rawptr) {
 	}
 
 	e.settling = true
-	_redact_settle(e)
+	e.rlog.idle = true
 	_mounts_settle(e)
 	_full_settle(e)
 	_index_settle(e)
