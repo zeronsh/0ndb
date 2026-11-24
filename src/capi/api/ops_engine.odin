@@ -475,10 +475,6 @@ op_assign :: proc(c: ^Call, o: ^Out) -> Status {
 	return exec(c, o, eng.Cmd_Assign{object = a_object(c, "object"), msg = a_rid(c, "msg"), runner = a_id(c, "runner")})
 }
 
-op_redact :: proc(c: ^Call, o: ^Out) -> Status {
-	return exec(c, o, eng.Cmd_Redact{object = a_object(c, "object"), msg = a_rid(c, "msg")})
-}
-
 op_map_create :: proc(c: ^Call, o: ^Out) -> Status {
 	ob, err := eng.map_create(c.api.e, a_id(c, "space"), a_str(c, "title"), a_bytes(c, "settings"))
 	if err != .None {
@@ -548,10 +544,6 @@ op_map_remove :: proc(c: ^Call, o: ^Out) -> Status {
 	return exec(c, o, eng.Cmd_Map_Remove{object = a_object(c, "object"), key = a_bytes(c, "key"), tag = u32(a_u64(c, "tag")), element = a_bytes(c, "element")})
 }
 
-op_map_redact :: proc(c: ^Call, o: ^Out) -> Status {
-	return status_of(eng.map_redact(c.api.e, a_object(c, "object"), a_bytes(c, "key")))
-}
-
 op_text_create :: proc(c: ^Call, o: ^Out) -> Status {
 	ob, err := eng.text_create(c.api.e, a_id(c, "space"), a_str(c, "title"), a_str(c, "initial"))
 	if err != .None {
@@ -586,10 +578,6 @@ op_text_spans :: proc(c: ^Call, o: ^Out) -> Status {
 
 op_text_edit :: proc(c: ^Call, o: ^Out) -> Status {
 	return exec(c, o, eng.Cmd_Text_Edit{object = a_object(c, "object"), pos = a_int(c, "pos"), remove = a_int(c, "remove"), insert = a_str(c, "insert")})
-}
-
-op_text_redact :: proc(c: ^Call, o: ^Out) -> Status {
-	return status_of(eng.text_redact(c.api.e, a_object(c, "object"), a_int(c, "pos"), a_int(c, "len")))
 }
 
 op_tree_create :: proc(c: ^Call, o: ^Out) -> Status {
@@ -1112,4 +1100,8 @@ op_takeover_set :: proc(c: ^Call, o: ^Out) -> Status {
 		rt.wake(c.api.r, ob)
 	}
 	return .Ok
+}
+
+op_removed :: proc(c: ^Call, o: ^Out) -> Status {
+	return .Unsupported
 }

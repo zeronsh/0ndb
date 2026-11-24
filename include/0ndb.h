@@ -119,8 +119,8 @@
  *                 19 members_changed, 20 epoch_changed, 21 access_revoked,
  *                 22 runner_enrolled, 23 runner_anomaly, 24 approval_requested,
  *                 25 login_done, 26 login_failed, 27 lease_lapsed, 28 space_left,
- *                 29 line_switched, 30 replica_redacted, 31 rename_offered,
- *                 32 redact_unreached, 33 models_changed, 34 authors_resolved
+ *                 29 line_switched, 30 reserved, 31 rename_offered,
+ *                 32 reserved, 33 models_changed, 34 authors_resolved
  *   owner         0 person, 1 agent, 2 unresolved (the author's record has
  *                 not reached this device)
  *   member_kind   0 device, 1 account, 2 recovery, 3 custodian, 4 pool,
@@ -319,11 +319,6 @@
  *                 object and detail "<source path>\n<destination path>"
  *                 when edits to a file another device renamed onto an
  *                 existing name are offered on the destination;
- *                 redact_unreached carries the redacted object (zero for
- *                 a scrub resumed at open) and detail
- *                 "<reason>\n<blob>\n<ref>\n<commit>\n<place>" for each
- *                 copy a redaction could not remove (reason protected,
- *                 shared, pinned, repository or left);
  *                 caught_up carries space and length the relay feed
  *                 position the device has read up to; indexer_wanted
  *                 carries the space a search wanted a full indexer in
@@ -1277,8 +1272,7 @@ int ondb_tool_result(ondb *h, const uint8_t space[16], const uint8_t object[16],
 #define ONDB_OP_AWAIT 72u
 /* assign(object: object, msg: rid, runner: id) -> Result */
 #define ONDB_OP_ASSIGN 73u
-/* redact(object: object, msg: rid) -> Result */
-#define ONDB_OP_REDACT 74u
+/* 74: removed, returns ONDB_UNSUPPORTED */
 /* map.create(space: id, title: str, settings: bytes) -> object:object */
 #define ONDB_OP_MAP_CREATE 75u
 /* map.get(object: object, key: bytes) -> found:bool entry:Entry */
@@ -1293,8 +1287,7 @@ int ondb_tool_result(ondb *h, const uint8_t space[16], const uint8_t object[16],
 #define ONDB_OP_MAP_ADD 80u
 /* map.remove(object: object, key: bytes, tag: uvarint, element: bytes) -> Result */
 #define ONDB_OP_MAP_REMOVE 81u
-/* map.redact(object: object, key: bytes) -> {} */
-#define ONDB_OP_MAP_REDACT 82u
+/* 82: removed, returns ONDB_UNSUPPORTED */
 /* text.create(space: id, title: str, initial: str) -> object:object */
 #define ONDB_OP_TEXT_CREATE 83u
 /* text.read(object: object) -> text:str */
@@ -1303,8 +1296,7 @@ int ondb_tool_result(ondb *h, const uint8_t space[16], const uint8_t object[16],
 #define ONDB_OP_TEXT_SPANS 85u
 /* text.edit(object: object, pos: uvarint, remove: uvarint, insert: str) -> Result */
 #define ONDB_OP_TEXT_EDIT 86u
-/* text.redact(object: object, pos: uvarint, len: uvarint) -> {} */
-#define ONDB_OP_TEXT_REDACT 87u
+/* 87: removed, returns ONDB_UNSUPPORTED */
 /* tree.create(space: id, title: str) -> object:object */
 #define ONDB_OP_TREE_CREATE 88u
 /* tree.read(object: object, path: str, line: str, version: bytes) -> text:str line:str base:bytes */

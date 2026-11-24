@@ -94,7 +94,7 @@ src/
   textdiff/  line and byte diff, three-way merge
   fs/        file-tree objects on disk: mounts, scanning, ignore, watching, ingestion, materialization, git, lines, land
   search/    full-text and vector indexes over any objects, code-to-conversation lookup
-  agent/     harness drivers (Claude Code, Codex, Pi, Muse, ACP agents), session portability, purge
+  agent/     harness drivers (Claude Code, Codex, Pi, Muse, ACP agents), session portability
   model/     the native agent loop over model APIs (streaming, tools, caching, compaction)
   mcp/       MCP client (tools for the native loop) and server (0ndb tools for any harness)
   sync/      keys, encryption, relay core and protocol, announce feeds, replicator
@@ -168,6 +168,10 @@ The engine is designed so that none of these has an exception:
   (its tree for that writer is not loaded) reads as `Need_Keys`, surfaced as
   `Missing`. Every derived reader (the map table, the conversation view and
   index) stops there, keeps how far it got, and resumes on the rekey.
+- **Upgrade: redaction is removed.** Content already hidden on a device stays
+  hidden there, nothing new can be redacted, and a redaction a device had not
+  applied before it upgraded is not applied afterwards, so that device's copy
+  stays readable.
 - **Each participant has its own view.** The leaf is per participant (in its
   own segment); the thread's shared head is the newest sent message. Browsing
   an old branch on one device never moves anyone else.
@@ -2398,11 +2402,9 @@ what it holds, so search reaches across devices:
   search through peer queries; runners keep a persistent local index like
   any device. (Snapshots were measured at 1.75x the information of the
   conversations they indexed, plus merge rewrites and checkpoint
-  zero-fills, to save one download at restore.) A device upgraded from a
-  version that published snapshots retires them once per space: it shreds
-  its snapshot objects, zero-fills its `ckpt/0ndb:search` records and drops
-  their registry rows; an interrupted snapshot import found at open
-  rebuilds the index.
+  zero-fills, to save one download at restore.) An interrupted snapshot
+  import an older version left is found at open: the index is rebuilt and
+  its rows are deleted.
 - *Plug.* `Search_Remote` routes peer queries to an embedder's own hosted
   indexer instead of the relay path; its answers are verified the same way.
 

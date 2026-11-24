@@ -265,23 +265,11 @@ Event codes: 0 connected, 1 disconnected, 2 durable, 3 uploaded,
 24 approval_requested, 25 login_done, 26 login_failed, 27 lease_lapsed, 28 space_left,
 29 line_switched (a mount's tree moved lines on a branch switch: `object` is the
 tree, `detail` is `<from line>\n<to line>`),
-30 replica_redacted (this device zero-filled its replica of `device`'s segment
-of `object` for a redaction it learned of; `tick` is the range start and
-`length` its end),
+30 reserved,
 31 rename_offered (edits made to a file after another device renamed it onto
 an existing name are offered on the destination: `object` is the tree,
 `detail` is `<source path>\n<destination path>`),
-32 redact_unreached (a redaction of `object` could not remove one blob from
-every copy: `detail` is `<reason>\n<blob>\n<ref>\n<commit>\n<place>`.
-`protected`: a ref, `HEAD` or a reflog of the store reaches it (`ref` names
-it, `commit` is its tip), and 0ndb never rewrites that history. `repository`:
-the user's git repository at `place` holds it, reached from `ref` at
-`commit` (both empty when no ref reaches it); 0ndb never rewrites the user's
-history. `shared`: other live content still uses the same bytes. `pinned`:
-a pack git pinned with `.keep` or `.promisor` (`place`) holds it. `left`: its
-removal failed and the scrub stays pending; it resumes at the next redaction
-and the next open. `object` is zero for a scrub resumed at open),
-33 models_changed,
+32 reserved, 33 models_changed,
 34 authors_resolved (an author a `tree.blame` span of `object` showed as
 `unresolved` became known: blame it again for its owner). The meaning of each
 field per kind is in the header (`Event`). For a UI: `placement` (where a
@@ -751,7 +739,7 @@ up exist only over the socket.
 | 71 | `unmount` | object: object, name: str | Result |
 | 72 | `await` | object: object, tasks: ids, condition: enum any|all, deadline: uvarint, expr: str | Result |
 | 73 | `assign` | object: object, msg: rid, runner: id | Result (without `msg`: resume the conversation on `runner`, empty result) |
-| 74 | `redact` | object: object, msg: rid | Result |
+| 74 | removed (redaction) | | unsupported |
 | 124 | `record` | object: object, source: str, external_id: str, sequence: uvarint, role: enum user|assistant|system|tool, parent: rid, blocks: blocks, status: enum open|done|interrupted|failed|cancelled, input: uvarint, output: uvarint, cache_read: uvarint, cache_write: uvarint, provider: str, model: str, native: str | receipt:enum msg:rid |
 | 131 | `land` | tree: object, from: str, into: str, dry: bool | landed:bool files:uvarint conflicts:strs |
 | 171 | `line.hold` | tree: object, line: str, reason: enum branch_changed|branch_deleted|undo | held:uvarint |
@@ -775,12 +763,12 @@ up exist only over the socket.
 | 79 | `map.delete` | object: object, key: bytes, tags: uvarints | Result |
 | 80 | `map.add` | object: object, key: bytes, tag: uvarint, element: bytes | Result |
 | 81 | `map.remove` | object: object, key: bytes, tag: uvarint, element: bytes | Result |
-| 82 | `map.redact` | object: object, key: bytes | {} |
+| 82 | removed (redaction) | | unsupported |
 | 83 | `text.create` | space: id, title: str, initial: str | object:object |
 | 84 | `text.read` | object: object | text:str |
 | 85 | `text.spans` | object: object | spans:[Span] |
 | 86 | `text.edit` | object: object, pos: uvarint, remove: uvarint, insert: str | Result |
-| 87 | `text.redact` | object: object, pos: uvarint, len: uvarint | {} |
+| 87 | removed (redaction) | | unsupported |
 | 88 | `tree.create` | space: id, title: str | object:object |
 | 89 | `tree.read` | object: object, path: str, line: str, version: bytes | text:str line:str base:bytes |
 | 90 | `tree.list` | object: object, path: str, line: str, version: bytes | names:[str] line:str entries:[TreeEntry] base:bytes |

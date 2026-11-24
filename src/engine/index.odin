@@ -357,7 +357,6 @@ _scan_object :: proc(e: ^Engine, h: ^Handle, budget: int) -> (used: int, more: b
 			if mi < 0 {
 				continue
 			}
-			vs := obj.view_find(&h.view, s.device)
 			pos := rec.members[mi].scanned
 			end := journal.reader_end(&s.jr)
 			n := 0
@@ -384,20 +383,7 @@ _scan_object :: proc(e: ^Engine, h: ^Handle, budget: int) -> (used: int, more: b
 				used += 1
 				n += 1
 				rk := obj.record_kind(body)
-				if rk == obj.RECORD_REDACT {
-					env, derr := obj.decode_envelope(body, at)
-					if derr == .None && _apply_remote_redact(e, h, vs, &env) == .Missing {
-						_handle_want(h)
-						pos = at
-						break
-					}
-				} else if h.kind == .Conversation && rk == u8(convo.Kind.Redact_Msg) {
-					if _apply_remote_redact_msg(e, h, vs, body, at) == .Missing {
-						_handle_want(h)
-						pos = at
-						break
-					}
-				} else if h.id == h.sp.catalog && rk == u8(omap.Kind.Put) {
+				if h.id == h.sp.catalog && rk == u8(omap.Kind.Put) {
 					_full_catalog_record(e, h.sp, body, at)
 				} else if h.id == h.sp.catalog && rk == u8(omap.Kind.Add) {
 					env, derr := obj.decode_envelope(body, at)
@@ -750,4 +736,20 @@ _index_tree :: proc(e: ^Engine, h: ^Handle, budget: int) -> (used: int, more: bo
 		return used, true
 	}
 	return max(used, 1), to < end
+}
+
+@(private)
+_index_reindex :: proc(e: ^Engine, h: ^Handle) {
+	if !e.cfg.search {
+		return
+	}
+	if _index_open(e) != .None {
+		return
+	}
+	search.delete_content(&e.index, _source_id(h.id, e.self), 0, h.id)
+	for s in h.segs {
+		search.advance(&e.index, _source_id(h.id, s.device), 0)
+	}
+	search.erase(&e.index)
+	_index_item_add(e, h.sp.id, h.id, h.kind)
 }

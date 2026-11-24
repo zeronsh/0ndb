@@ -19,12 +19,11 @@ Builtin :: enum u8 {
 	Memory,
 	Schedule,
 	History,
-	Redact,
 }
 
 Builtins :: bit_set[Builtin;u8]
 
-ALL_BUILTINS :: Builtins{.Files, .Shell, .Orchestration, .Memory, .Schedule, .History, .Redact}
+ALL_BUILTINS :: Builtins{.Files, .Shell, .Orchestration, .Memory, .Schedule, .History}
 
 Mcp_Spec :: struct {
 	name:    string,
@@ -201,8 +200,6 @@ agent_resolve :: proc(r: ^Runtime, o: Object, provider := "", model_id := "", al
 				a.builtins += {.Schedule}
 			case "history":
 				a.builtins += {.History}
-			case "redact":
-				a.builtins += {.Redact}
 			case "all":
 				a.builtins = ALL_BUILTINS
 				a.catalog = true

@@ -6,12 +6,10 @@ import "core:strings"
 import "../../src/convo"
 import "../../src/crdt"
 import "../../src/fs"
-import "../../src/journal"
 import eng "../../src/engine"
 import omap "../../src/map"
 import "../../src/obj"
 import "../../src/prim"
-import "../../src/search"
 import osync "../../src/sync"
 
 Digest :: struct {
@@ -534,31 +532,25 @@ check_object_model :: proc(w: ^World, oi: int, n: ^Node, digest: string) {
 				world_note(w, "model: message %s unknown on %s (Busy)", op.token, n.name)
 				continue
 			}
-			present := err == .None && msg.author == op.actor && (msg.redacted || msg_text(msg) == msg_body(op.token))
-			if err == .None {
-				_settle_redaction(m, op, msg.redacted)
-			}
-			redacted := _redacted_by(m, op)
+			present := err == .None && msg.author == op.actor && msg_text(msg) == msg_body(op.token)
 			switch op.status {
 			case .Acked, .Observed, .Done:
 				if !present {
 					world_fail(w, "model: message %s (op %d, %v) missing on %s: %v", op.token, op.idx, op.status, n.name, err)
-				} else if redacted && !msg.redacted {
-					world_fail(w, "redaction: message %s still readable on %s", op.token, n.name)
 				}
 			case .Uncertain:
 				if present {
 					op.status = .Observed
 				} else {
 					op.status = .Lost
-					if err == .None && !msg.redacted {
+					if err == .None {
 						world_fail(w, "rid: id of lost message %s names %q on %s", op.token, msg_text(msg), n.name)
 					}
 				}
 			case .Lost:
 				if present && msg_text(msg) == msg_body(op.token) {
 					world_fail(w, "model: lost message %s resurrected on %s", op.token, n.name)
-				} else if err == .None && !msg.redacted {
+				} else if err == .None {
 					world_fail(w, "rid: id of lost message %s names %q on %s", op.token, msg_text(msg), n.name)
 				}
 			case .Issued, .Failed:
@@ -580,21 +572,6 @@ check_object_model :: proc(w: ^World, oi: int, n: ^Node, digest: string) {
 					present ||= r.tag == 1 && string(r.value) == op.token
 				}
 			}
-			if !obj.rid_none(op.rid) {
-				if state, known := _record_state(n, ob, op.rid); known {
-					_settle_redaction(m, op, state == .Redacted)
-				}
-			}
-			redacted := _redacted_by(m, op)
-			if redacted {
-				if present {
-					world_fail(w, "redaction: map key %s still readable on %s", op.key, n.name)
-				}
-				continue
-			}
-			if !present && redaction_maybe(m, op) {
-				continue
-			}
 			switch op.status {
 			case .Acked, .Observed, .Done:
 				if !present {
@@ -613,46 +590,6 @@ check_object_model :: proc(w: ^World, oi: int, n: ^Node, digest: string) {
 	case .Text, .Tree:
 		_check_tokens(w, oi, n)
 	}
-}
-
-@(private = "file")
-_redacted_by :: proc(m: ^Model, target: ^M_Op) -> bool {
-	for op in m.ops {
-		if op.target == target.idx && (op.kind == .Redact_Msg || op.kind == .Redact_Map) && op_happened(op) {
-			return true
-		}
-	}
-	return false
-}
-
-@(private = "file")
-_settle_redaction :: proc(m: ^Model, target: ^M_Op, gone: bool) {
-	for op in m.ops {
-		if op.target == target.idx && (op.kind == .Redact_Msg || op.kind == .Redact_Map) && op.status == .Uncertain {
-			op.status = .Observed if gone else .Lost
-		}
-	}
-}
-
-@(private = "file")
-_record_state :: proc(n: ^Node, ob: ^M_Obj, rid: eng.Rid) -> (state: Rec_State, known: bool) {
-	h, ok := n.e.handles[ob.o.id]
-	if !ok {
-		return
-	}
-	for s in h.segs {
-		if s.device != rid.seg {
-			continue
-		}
-		_, _, err := journal.record_at(&s.jr, rid.off)
-		#partial switch err {
-		case .None:
-			return .Live, true
-		case .Redacted:
-			return .Redacted, true
-		}
-	}
-	return
 }
 
 @(private = "file")
@@ -993,61 +930,6 @@ crdt_span :: struct {
 	len:   int,
 }
 
-check_redaction :: proc(w: ^World) {
-	check_index_rebuild(w)
-	m := &w.model
-	secrets := make([dynamic]string, context.temp_allocator)
-	owners := make([dynamic]int, context.temp_allocator)
-	for op in m.ops {
-		if !op_happened(op) {
-			continue
-		}
-		switch op.kind {
-		case .Redact_Msg, .Redact_Map:
-			if op.target >= 0 {
-				t := m.ops[op.target]
-				append(&secrets, t.token)
-				append(&owners, op.obj)
-			}
-		case .Redact_Text:
-			for d in op.deletes {
-				append(&secrets, d)
-				append(&owners, op.obj)
-			}
-		case .Create, .Send, .Queue, .Steer, .Edit, .Cancel, .Interrupt, .Switch, .Back, .Follow, .Answer, .Assign, .Mount, .Unmount, .Map_Set, .Map_Hot, .Map_Add, .Map_Remove, .Map_Delete, .Count, .Text_Insert, .Text_Delete, .Tree_Write, .Tree_Remove, .Catalog, .Usage, .Share, .Mount_Tree, .Disk_Agent, .Disk_Person, .Git_Mount, .Search_Peer, .Promote, .Read_Live, .Stream, .Buffer_Open, .Buffer_Type, .Buffer_Delete, .Buffer_Undo, .Buffer_Anchor, .Buffer_Sync, .Buffer_Burst:
-		}
-	}
-	for s, si in secrets {
-		needle := transmute([]u8)s
-		for n in w.nodes {
-			if p, found := disk_contains(&n.disk, needle); found {
-				redaction_finding(w, n, owners[si], "redaction: %s still on %s disk in %s", s, n.name, p)
-			}
-			if n.alive && n.e_open {
-				context = instance_context(&n.inst)
-				req := search.Request{limit = 8, now = eng.hlc_now(&n.e)}
-				res, err := eng.search_query(&n.e, s[1:len(s) - 1], req, context.temp_allocator)
-				if err == .None {
-					for h in res.hits {
-						if _snippet_leaks(h.snippet, s[1:len(s) - 1]) {
-							redaction_finding(w, n, owners[si], "redaction: search on %s still returns %s in a snippet (object %s): %q", n.name, s, id_short(h.object), h.snippet)
-						}
-					}
-				}
-				node_after(n)
-			}
-		}
-		if p, found := disk_contains(&w.relay.disk, needle); found {
-			world_fail(w, "redaction: %s still on relay disk in %s", s, p)
-		}
-		if p, found := relay_checkpoint_contains(w, needle); found {
-			world_fail(w, "redaction: %s still in %s", s, p)
-		}
-	}
-	check_search_models(w, secrets[:], owners[:])
-	check_peer_redaction(w, secrets[:], owners[:])
-}
-
 @(private = "file")
 _snippet_leaks :: proc(snippet: string, tok: string) -> bool {
 	rest := snippet
@@ -1190,16 +1072,6 @@ _strip_catalog :: proc(text: string, strip: bool) -> string {
 	return text[i + 1:] if i >= 0 else ""
 }
 
-Rec_State :: enum u8 {
-	Live,
-	Redacted,
-}
-
-Rec_Key :: struct {
-	device: prim.Id,
-	off:    i64,
-}
-
 @(private = "file")
 _kind_prefix :: proc(k: M_Kind) -> u8 {
 	switch k {
@@ -1229,203 +1101,6 @@ _open_handle :: proc(n: ^Node, ob: ^M_Obj) -> ^eng.Handle {
 	}
 	h, ok := n.e.handles[ob.o.id]
 	return h if ok else nil
-}
-
-@(private = "file")
-_node_records :: proc(w: ^World, n: ^Node, ob: ^M_Obj, out: ^map[Rec_Key]Rec_State) {
-	context = instance_context(&n.inst)
-	defer node_after(n)
-	h := _open_handle(n, ob)
-	if h == nil {
-		return
-	}
-	for s in h.segs {
-		end := journal.reader_end(&s.jr)
-		pos: i64
-		for pos < end {
-			_, next, err := journal.record_at(&s.jr, pos)
-			if err == .Redacted {
-				out[Rec_Key{s.device, pos}] = .Redacted
-			} else if err == .None {
-				out[Rec_Key{s.device, pos}] = .Live
-			} else {
-				break
-			}
-			if next <= pos {
-				break
-			}
-			pos = next
-		}
-	}
-}
-
-@(private = "file")
-_relay_records :: proc(w: ^World, space: prim.Id, id: osync.Stream_Id, out: ^map[i64]Rec_State, zeros_bad: ^[dynamic]i64) -> bool {
-	rn := &w.relay
-	if !rn.alive {
-		return false
-	}
-	context = instance_context(&rn.inst)
-	defer relay_after(rn)
-	was := rn.slow.inline
-	rn.slow.inline = true
-	defer rn.slow.inline = was
-	if rn.tiered {
-		sim_objects_flush(&rn.slow)
-	}
-	r := &rn.r
-	st := r.store
-	ns: rawptr
-	opened_ns := false
-	if sp, ok := r.spaces[space]; ok && sp.ns != nil {
-		ns = sp.ns
-	} else {
-		h, _, err := st.namespace_open(st.data, space)
-		if err != .None {
-			return false
-		}
-		ns = h
-		opened_ns = true
-	}
-	defer if opened_ns {
-		st.namespace_close(st.data, ns)
-	}
-	sh, length, serr := st.stream_open(st.data, ns, id, false)
-	if serr != .None || sh == nil {
-		return false
-	}
-	defer st.stream_close(st.data, sh)
-	hdr: [20]u8
-	pos := st.stream_base(st.data, sh)
-	for pos + 24 <= length {
-		got, rerr := st.stream_read(st.data, sh, pos, hdr[:])
-		if rerr == .Pending {
-			world_fail(w, "relay redaction: a cold read of stream %x at %d is still pending during the check", id[0], pos)
-			break
-		}
-		if rerr != .None || got != len(hdr) {
-			break
-		}
-		n := i64(prim.get_u32le(hdr[0:4]))
-		if pos + n + 24 > length {
-			break
-		}
-		tag: journal.Tag
-		copy(tag[:], hdr[4:20])
-		if tag == journal.redacted_tag(pos, int(n)) {
-			out[pos] = .Redacted
-			body := make([]u8, n, context.temp_allocator)
-			bgot, berr := st.stream_read(st.data, sh, pos + 20, body)
-			if berr == .Pending {
-				world_fail(w, "relay redaction: a cold read of stream %x at %d is still pending during the check", id[0], pos + 20)
-			}
-			if berr == .None && i64(bgot) == n {
-				for b in body {
-					if b != 0 {
-						append(zeros_bad, pos)
-						break
-					}
-				}
-			}
-		} else {
-			out[pos] = .Live
-		}
-		pos += n + 24
-	}
-	return true
-}
-
-check_relay_redaction :: proc(w: ^World) {
-	m := &w.model
-	if !w.relay.alive {
-		return
-	}
-	for _, oi in m.objs {
-		if !obj_exists(m, oi) {
-			continue
-		}
-		ob := &m.objs[oi]
-		readers := readers_of(w, oi)
-		per_node := make([]map[Rec_Key]Rec_State, len(w.nodes), context.temp_allocator)
-		devices := make([dynamic]prim.Id, context.temp_allocator)
-		keyer := -1
-		for idx in readers {
-			n := w.nodes[idx]
-			if !n.alive || !n.e_open {
-				continue
-			}
-			per_node[idx] = make(map[Rec_Key]Rec_State, context.temp_allocator)
-			_node_records(w, n, ob, &per_node[idx])
-			for k in per_node[idx] {
-				seen := false
-				for d in devices {
-					seen ||= d == k.device
-				}
-				if !seen {
-					append(&devices, k.device)
-				}
-			}
-			si := space_index(m, ob.o.space)
-			if keyer < 0 && si >= 0 && space_member(&m.spaces[si], idx) {
-				keyer = idx
-			}
-		}
-		if keyer < 0 {
-			continue
-		}
-		kn := w.nodes[keyer]
-		scope: osync.Scope
-		{
-			context = instance_context(&kn.inst)
-			key, kerr := eng.object_key(&kn.e, ob.o)
-			info, _ := eng.space_info(&kn.e, ob.o.space)
-			node_after(kn)
-			if kerr != .None {
-				continue
-			}
-			scope = osync.scope_make(key, info.mode)
-		}
-		name := make([]u8, 1 + prim.ID_HEX_LEN, context.temp_allocator)
-		name[0] = _kind_prefix(ob.kind)
-		hx := prim.id_hex(ob.o.id)
-		copy(name[1:], hx[:])
-		slice.sort_by(devices[:], id_less)
-		for d in devices {
-			sid := osync.stream_id(&scope, d, string(name), 0)
-			relay := make(map[i64]Rec_State, context.temp_allocator)
-			bad := make([dynamic]i64, context.temp_allocator)
-			if !_relay_records(w, ob.o.space, sid, &relay, &bad) {
-				continue
-			}
-			for off in bad {
-				world_fail(w, "relay redaction: record %s@%d of %v %s is marked redacted on the relay but its ciphertext is not zero-filled", id_short(d), off, ob.kind, id_short(ob.o.id))
-			}
-			for idx in readers {
-				if per_node[idx] == nil {
-					continue
-				}
-				keys := make([dynamic]i64, context.temp_allocator)
-				for k in per_node[idx] {
-					if k.device == d {
-						append(&keys, k.off)
-					}
-				}
-				slice.sort(keys[:])
-				for off in keys {
-					ns := per_node[idx][Rec_Key{d, off}]
-					rs, has := relay[off]
-					if !has {
-						continue
-					}
-					if ns == .Redacted && rs != .Redacted {
-						world_fail(w, "relay redaction: relay still holds ciphertext of record %s@%d of %v %s, redacted on %s", id_short(d), off, ob.kind, id_short(ob.o.id), w.nodes[idx].name)
-					} else if ns == .Live && rs == .Redacted {
-						redaction_finding(w, w.nodes[idx], oi, "redaction: %s still holds record %s@%d of %v %s that the relay has redacted", w.nodes[idx].name, id_short(d), off, ob.kind, id_short(ob.o.id))
-					}
-				}
-			}
-		}
-	}
 }
 
 @(private = "file")
@@ -1801,8 +1476,8 @@ STAT_FRESH_PROBED: Stat
 _check_stats :: proc "contextless" () {
 	register_final_check(10, check_fresh_poll)
 	register_final_check(30, check_map_reapply)
-	register_final_check(50, check_redaction)
-	register_final_check(80, check_relay_redaction)
+	register_final_check(50, check_index_rebuild)
+	register_final_check(51, check_search_settles)
 	register_final_check(90, check_relay_plaintext)
 	register_final_check(120, check_uploaded)
 	register_final_check(121, check_own_tails)
@@ -1812,102 +1487,3 @@ _check_stats :: proc "contextless" () {
 	STAT_FRESH_PROBED = register_stat(60, 1, "fresh_probed")
 }
 
-check_own_redactions :: proc(w: ^World, n: ^Node) {
-	rn := &w.relay
-	if !rn.alive || !rn.r_on || !n.alive || !n.e_open {
-		return
-	}
-	m := &w.model
-	for _, oi in m.objs {
-		if !obj_exists(m, oi) {
-			continue
-		}
-		ob := &m.objs[oi]
-		si := space_index(m, ob.o.space)
-		if si < 0 || !space_member(&m.spaces[si], n.idx) {
-			continue
-		}
-		scope: osync.Scope
-		{
-			context = instance_context(&n.inst)
-			key, kerr := eng.object_key(&n.e, ob.o)
-			info, _ := eng.space_info(&n.e, ob.o.space)
-			node_after(n)
-			if kerr != .None {
-				continue
-			}
-			scope = osync.scope_make(key, info.mode)
-		}
-		name := make([]u8, 1 + prim.ID_HEX_LEN, context.temp_allocator)
-		name[0] = _kind_prefix(ob.kind)
-		hx := prim.id_hex(ob.o.id)
-		copy(name[1:], hx[:])
-		sid := osync.stream_id(&scope, n.identity.id, string(name), 0)
-		ranges: [][2]i64
-		{
-			context = instance_context(&rn.inst)
-			ranges = slice.clone(osync.relay_core_redacted(&rn.r, osync.Space_Id(ob.o.space), sid), w.allocator)
-		}
-		defer delete(ranges, w.allocator)
-		if len(ranges) == 0 {
-			continue
-		}
-		recs := make(map[Rec_Key]Rec_State, context.temp_allocator)
-		_node_records(w, n, ob, &recs)
-		for k in prim.sorted_keys(recs) {
-			if k not_in recs {
-				continue
-			}
-			st := recs[k]
-			if k.device != n.identity.id || st != .Live {
-				continue
-			}
-			for x in ranges {
-				if k.off >= x[0] && k.off < x[1] {
-					world_fail(w, "device redaction: %s holds live record %d of its own %v %s inside a redaction the relay recorded", n.name, k.off, ob.kind, id_short(ob.o.id))
-				}
-			}
-		}
-	}
-}
-
-@(init)
-_own_redaction_hooks :: proc "contextless" () {
-	register_restarted(70, check_own_redactions, false)
-}
-
-relay_checkpoint_contains :: proc(w: ^World, needle: []u8) -> (place: string, found: bool) {
-	if len(w.checkpoints) == 0 {
-		return "", false
-	}
-	files := make([dynamic]Disk_File, context.temp_allocator)
-	disk_walk(&w.relay.disk, &files)
-	for &c in w.checkpoints {
-		idx := osync.object_index(&c.scope, c.oid[:])
-		hb: [64]u8
-		head := prim.hex_encode(hb[:], idx[:1])
-		rest := prim.hex_encode(hb[head:], idx[1:])
-		suffix := fmt.tprintf("/o/%s/%s", string(hb[:head]), string(hb[head:][:rest]))
-		for f in files {
-			if !strings.has_suffix(f.path, suffix) {
-				continue
-			}
-			tree: osync.Key_Tree
-			if eng.checkpoint_tree(&c.scope, c.object.id, &tree) != .None {
-				continue
-			}
-			plain, info, err := osync.object_open(&tree, &c.scope, c.oid[:], f.data, context.temp_allocator)
-			osync.keytree_destroy(&tree)
-			if err != .None {
-				continue
-			}
-			if info.layout == .Chunked {
-				return fmt.tprintf("a chunked relay checkpoint of %s this check does not open (%s)", id_short(c.object.id), f.path), true
-			}
-			if disk_index_of(plain, needle) >= 0 {
-				return fmt.tprintf("the relay copy of %s's checkpoint (%s)", id_short(c.object.id), f.path), true
-			}
-		}
-	}
-	return "", false
-}

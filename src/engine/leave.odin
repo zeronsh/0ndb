@@ -8,6 +8,12 @@ import "../search"
 import osync "../sync"
 
 @(private)
+SEAL_KEY :: u8(0xf3)
+
+@(private)
+SEAL_COVER :: u8(0xf4)
+
+@(private)
 LEFT_FILE :: "left"
 @(private)
 LEFT_VERSION :: u8(1)

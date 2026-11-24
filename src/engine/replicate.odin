@@ -402,11 +402,7 @@ _on_repl_event :: proc(user: rawptr, ev: ^osync.Repl_Event) {
 	case .Object_Stored, .Object_Fetched, .Object_Missing, .Object_Failed:
 		_content_on_event(e, sp, ev)
 		return
-	case .Checkpoint, .Checkpoint_Missing:
-		if _search_retired_checkpoint(e, ev) {
-			return
-		}
-	case .Device_Seen, .Dropped, .Object_Shredded:
+	case .Device_Seen, .Dropped, .Object_Shredded, .Redacted, .Local_Redacted:
 		return
 	case .Direct, .Undelivered:
 		if ev.kind == .Direct && u64(ev.length) == CURSOR_TAG {
@@ -512,7 +508,6 @@ _repl_event_apply :: proc(e: ^Engine, sp: ^Space, ev: ^Repl_Ev) {
 		sp.mem.creds.renewal = .None
 		_emit(e, Event{kind = .Connected, space = sp.id})
 		_pending_republish(e, sp)
-		_relay_redact_resend(e, sp)
 		_full_kick(e, sp)
 		_drafts_reconnected(e, sp)
 		_held_follow(e, sp)
@@ -603,10 +598,6 @@ _repl_event_apply :: proc(e: ^Engine, sp: ^Space, ev: ^Repl_Ev) {
 		detail := "the relay holds a different valid copy of this device's own stream: another device is writing under this device id (clone suspected: a restored backup or VM snapshot)" if ev.err == .Conflict else ""
 		_emit(e, Event{kind = .Fatal, space = sp.id, object = obj_id, device = ev.device, err = _serr(ev.err), length = ev.length, detail = detail})
 		_probes_settle(e, sp, obj_id)
-	case .Redacted:
-		_relay_redacted_event(e, sp, ev.stream, ev.from, ev.to)
-	case .Local_Redacted:
-		_local_redacted(e, sp, ev.stream, ev.from, ev.to)
 	case .Relay_Misbehaving:
 		obj_id, _, _ := _object_of_name(ev.name)
 		_emit(e, Event{kind = .Relay_Misbehaving, space = sp.id, object = obj_id, device = ev.device, err = _serr(ev.err)})

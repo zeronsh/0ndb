@@ -4,7 +4,6 @@ import "base:runtime"
 import "core:mem/virtual"
 import "core:sync"
 import "core:thread"
-import "../convo"
 import dl "../dlog"
 import "../fs"
 import "../http"
@@ -97,23 +96,6 @@ Credentials_Source :: struct {
 	produce: proc(data: rawptr, space: prim.Id) -> (osync.Credentials, bool),
 }
 
-Purge_Request :: struct {
-	object:   Object,
-	msg:      Rid,
-	role:     convo.Role,
-	provider: string,
-	native:   string,
-	ids:      []string,
-	texts:    []string,
-	bodies:   []string,
-	claim:    Rid,
-}
-
-Purge_Hook :: struct {
-	data:  rawptr,
-	purge: proc(data: rawptr, e: ^Engine, req: ^Purge_Request),
-}
-
 Event_Kind :: enum u8 {
 	Connected,
 	Disconnected,
@@ -144,9 +126,7 @@ Event_Kind :: enum u8 {
 	Lease_Lapsed,
 	Space_Left,
 	Line_Switched,
-	Replica_Redacted,
 	Rename_Offered,
-	Redact_Unreached,
 	Models_Changed,
 	Authors_Resolved,
 }
@@ -181,7 +161,6 @@ Config :: struct {
 	log:             Log,
 	spawner:         Spawner,
 	embedder:        search.Embedder,
-	purge:           Purge_Hook,
 	events:          Event_Hook,
 	http:            http.Client,
 	write_observer:  fs.Write_Observer,
@@ -395,8 +374,6 @@ Engine :: struct {
 	db:           odb.Odb,
 	db_open:      bool,
 	pack_more:    bool,
-	purged:       [dynamic]Rid,
-	redact_tick:  u64,
 	rlog:         Rlog,
 	dlog:         dl.Log,
 	dlog_open:    bool,
@@ -457,7 +434,6 @@ open :: proc(e: ^Engine, cfg: Config, allocator := context.allocator) -> (err: E
 	e.waiters = make([dynamic]^Waiter, e.allocator)
 	e.space_waits = make([dynamic]Space_Wait, e.allocator)
 	e.held = make([dynamic]^Pending_Cmd, e.allocator)
-	e.purged = make([dynamic]Rid, e.allocator)
 	e.subs = make([dynamic]^Sub, e.allocator)
 	e.posted = make([dynamic]Posted, e.allocator)
 	e.post_swap = make([dynamic]Posted, e.allocator)
@@ -534,7 +510,7 @@ open :: proc(e: ^Engine, cfg: Config, allocator := context.allocator) -> (err: E
 	_spaces_load(e) or_return
 	_unclean_mark_spaces(e) or_return
 	_account_load(e)
-	_redact_recover(e)
+	_rlog_ready(e)
 	_leave_resume(e)
 	if e.account.have {
 		_touch(e)
@@ -967,7 +943,7 @@ _on_settle :: proc(l: ^prim.Loop, data: rawptr) {
 	}
 
 	e.settling = true
-	_redact_settle(e)
+	_rlog_idle(e)
 	_mounts_settle(e)
 	_full_settle(e)
 	_index_settle(e)
@@ -1119,7 +1095,6 @@ _teardown :: proc(e: ^Engine) {
 		_cmd_fail(e, p, .Closed)
 	}
 	delete(e.held)
-	delete(e.purged)
 	delete(e.waiters)
 	for &mw in e.move_waits {
 		_cu_free_reverts(e, &mw)
