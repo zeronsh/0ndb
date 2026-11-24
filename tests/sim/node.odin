@@ -1,6 +1,7 @@
 package sim
 
 import "core:fmt"
+import "core:mem/virtual"
 import eng "../../src/engine"
 import "../../src/pack"
 import "../../src/prim"
@@ -164,17 +165,6 @@ id_less :: proc(a, b: prim.Id) -> bool {
 	return false
 }
 
-code_ref :: proc(p: rawptr) -> string {
-	if p == nil {
-		return "none"
-	}
-	off := i64(uintptr(p)) - i64(uintptr(rawptr(prim.loop_step)))
-	if off < 0 {
-		return fmt.tprintf("prim.loop_step-%#x", -off)
-	}
-	return fmt.tprintf("prim.loop_step+%#x", off)
-}
-
 id_short :: proc(id: prim.Id) -> string {
 	h := prim.id_hex(id)
 	return fmt.tprintf("%s", string(h[24:32]))
@@ -199,6 +189,7 @@ node_kill :: proc(n: ^Node) {
 	n.e_open = false
 	n.key_open = false
 	instance_kill(&n.inst)
+	virtual.arena_destroy(&n.e.temp)
 	n.e = {}
 	n.keyring = {}
 }
@@ -264,11 +255,7 @@ node_drain :: proc(n: ^Node) -> bool {
 			return did
 		}
 		if i > 100_000 {
-			cb: rawptr
-			if len(n.inst.loop.heap) > 0 {
-				cb = rawptr(n.inst.loop.timers[n.inst.loop.heap[0]].cb)
-			}
-			world_fail(w, "%s livelock: its loop kept running at t=%d ms for %d steps without settling; next timer callback %s", n.name, w.now / 1_000_000, i, code_ref(cb))
+			world_fail(w, "%s livelock: its loop kept running at t=%d ms for %d steps without settling; armed timers: %s", n.name, w.now / 1_000_000, i, armed_timers(&n.inst.loop))
 			w.aborted = true
 			return did
 		}

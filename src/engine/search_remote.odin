@@ -235,6 +235,7 @@ Remote_Q :: struct {
 	finished:    bool,
 	ready_now:   bool,
 	awaiting:    bool,
+	woken:       bool,
 	plug:        bool,
 	result:      Search_Result,
 }
@@ -826,6 +827,7 @@ search_everywhere :: proc(e: ^Engine, space: prim.Id, query: string, req: search
 
 @(private)
 _q_start :: proc(e: ^Engine, q: ^Remote_Q, sp: ^Space) {
+	q.woken = false
 	sent, pending := _q_next(e, q, sp)
 	q.awaiting = !sent && pending
 	if sent || pending {
@@ -1220,7 +1222,7 @@ _remote_step :: proc(e: ^Engine) {
 			_q_finish(e, q, .Ok)
 		} else if q.answered {
 			_q_verify(e, q)
-		} else if q.awaiting {
+		} else if q.awaiting && q.woken {
 			if sp, ok := e.spaces[q.space]; ok {
 				_q_start(e, q, sp)
 			}
@@ -1315,6 +1317,7 @@ _q_ready :: proc(data: rawptr, e: ^Engine, err: Error) {
 	if q == nil || q.finished {
 		return
 	}
+	q.woken = true
 	_touch(e)
 }
 

@@ -73,6 +73,7 @@ _Timer_Slot :: struct {
 	gen:       u32,
 	pos:       i32,
 	next_free: u32,
+	owner:     runtime.Source_Code_Location,
 }
 
 @(private)
@@ -292,11 +293,11 @@ child_unwatch :: proc(l: ^Loop, cw: Child_Watch) {
 	_slot_free(l, _handle_index(u64(cw)))
 }
 
-timer :: proc(l: ^Loop, ms: i64, data: rawptr, cb: Timer_Proc) -> Timer {
-	return timer_at(l, loop_now_ns(l) + max(ms, 0) * 1_000_000, data, cb)
+timer :: proc(l: ^Loop, ms: i64, data: rawptr, cb: Timer_Proc, loc := #caller_location) -> Timer {
+	return timer_at(l, loop_now_ns(l) + max(ms, 0) * 1_000_000, data, cb, loc)
 }
 
-timer_at :: proc(l: ^Loop, deadline_ns: i64, data: rawptr, cb: Timer_Proc) -> Timer {
+timer_at :: proc(l: ^Loop, deadline_ns: i64, data: rawptr, cb: Timer_Proc, loc := #caller_location) -> Timer {
 	idx: u32
 	if l.free_timer != NO_SLOT {
 		idx = l.free_timer
@@ -321,6 +322,7 @@ timer_at :: proc(l: ^Loop, deadline_ns: i64, data: rawptr, cb: Timer_Proc) -> Ti
 	l.timer_seq += 1
 	t.data = data
 	t.cb = cb
+	t.owner = loc
 	t.pos = i32(len(l.heap) - 1)
 	_heap_up(l, int(t.pos))
 	return Timer(_handle(idx, t.gen))

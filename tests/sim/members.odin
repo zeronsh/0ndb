@@ -4,6 +4,7 @@ import "core:crypto/blake2b"
 import "core:fmt"
 import "core:os"
 import "core:strconv"
+import "core:sync"
 import "core:testing"
 import "../../src/convo"
 import eng "../../src/engine"
@@ -783,7 +784,7 @@ membership :: proc(t: ^testing.T) {
 	if s, ok := os.lookup_env("SIM_SEED", context.temp_allocator); ok && len(s) > 0 {
 		return
 	}
-	hermetic_env()
+	sync.mutex_guard(&serial)
 	from: u64 = 1
 	count: u64 = 6
 	if s, ok := os.lookup_env("SIM_MEMBER_SEED", context.temp_allocator); ok && len(s) > 0 {
