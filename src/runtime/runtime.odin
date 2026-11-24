@@ -1,5 +1,6 @@
 package rt
 
+import "core:fmt"
 import "base:runtime"
 import "core:crypto/blake2b"
 import "core:mem/virtual"
@@ -789,7 +790,11 @@ _on_tick_hook :: proc(data: rawptr, e: ^eng.Engine) {
 	clear(&r.pending)
 	for o in list {
 		r.stats.evaluations += 1
+		ev_t0 := prim.mono_ns()
 		evaluate(r, o)
+		if d := prim.mono_ns() - ev_t0; d > 2_000_000 {
+			fmt.eprintfln("RT evaluate %.1fms", f64(d) / 1e6)
+		}
 		if r.cfg.hooks.observed != nil {
 			r.cfg.hooks.observed(r.cfg.hooks.data, r, o)
 		}

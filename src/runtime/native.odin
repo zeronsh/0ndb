@@ -1,5 +1,6 @@
 package rt
 
+import "core:fmt"
 import "base:runtime"
 import "core:mem/virtual"
 import "core:strings"
@@ -436,7 +437,9 @@ _native_apply :: proc(n: ^Native, out: ^model.Output) {
 				_native_apply(n, &nested)
 				continue
 			}
+			hs_t0 := prim.mono_ns()
 			id, serr := http.start(c, &req, http.Sink{data = n, head = _native_head, body = _native_body, done = _native_done})
+			fmt.eprintfln("RT http.start %.1fms", f64(prim.mono_ns() - hs_t0) / 1e6)
 			if serr != .None {
 				n.http_id = 0
 				nested := model.output_make()
