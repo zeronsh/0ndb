@@ -350,14 +350,20 @@ _mount_fenced :: proc(m: ^fs.Mount, data: rawptr, err: fs.Error) {
 }
 
 @(private)
-_mounts_sleep_owed :: proc(e: ^Engine) {
-	if !e.plug.reg_on || e.closing || e.in_tick || e.settling || len(e.batches) > 0 || len(e.dirty) > 0 || prim.loop_nested(e.loop) {
+_sleep_owed :: proc(e: ^Engine) {
+	if e.closing || e.in_tick || e.settling || len(e.batches) > 0 || len(e.dirty) > 0 || prim.loop_nested(e.loop) {
 		return
 	}
-	for m in e.plug.reg.mounts {
-		if m != nil && m.awake && m.sleep_owed && len(m.waits) == 0 {
-			fs.mount_hibernate(m)
+	if e.plug.reg_on {
+		for m in e.plug.reg.mounts {
+			if m != nil && m.awake && m.sleep_owed && len(m.waits) == 0 {
+				fs.mount_hibernate(m)
+			}
 		}
+	}
+	if e.sweep_owed && e.settle_timer == 0 {
+		_handles_sweep(e, 0)
+		e.sweep_owed = len(e.lru) > 0
 	}
 }
 

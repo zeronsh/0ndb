@@ -1106,7 +1106,7 @@ check_asleep :: proc(w: ^World, n: ^Node) {
 			held &&= m.awake
 		}
 		if !held && h.pins == 0 {
-			world_fail(w, "idle: %s history of %v %s is awake after settle with no awake mount and no pin", n.name, h.kind, id_short(id))
+			world_fail(w, "idle: %s history of %v %s is awake after settle with no awake mount and no pin (history mark %d durable %d, writer %v, handles %d, settle timer %v)", n.name, h.kind, id_short(id), fs.history_durable_mark(h.hist), h.hist.durable, h.w_open, len(n.e.handles), n.e.settle_timer != 0)
 		}
 	}
 }
