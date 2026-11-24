@@ -442,6 +442,7 @@ Mount :: struct {
 	shadow:      Shadow,
 	ignore:      Ignore,
 	awake:       bool,
+	shown:       map[string][]crdt.Op_Id,
 	synced:      [dynamic]crdt.Op_Id,
 	placed:      [dynamic]crdt.Op_Id,
 	has_placed:  bool,
@@ -966,6 +967,7 @@ mount_close :: proc(m: ^Mount) {
 	}
 	delete(m.open_scopes)
 	delete(m.synced)
+	shown_free(&m.shown, m.allocator)
 	delete(m.placed)
 	for p in m.reverts {
 		delete(p.before)
