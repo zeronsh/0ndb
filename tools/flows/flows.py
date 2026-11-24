@@ -385,9 +385,24 @@ def f_cli_first_token():
                 t0 = now()
                 c.call_async("send", object=obj, text=prompt)
                 ts, _ = c.wait_delta(tag, lambda v: v and any(dl.get("kind") == "status" and dl.get("status") == "running" for dl in v.get("deltas", [])), timeout=20)
-                tf, _ = c.wait_delta(tag, lambda v: v and any(dl.get("kind") in ("block", "chunk") and dl.get("block") == "text" and dl.get("text") and dl.get("text") != prompt for dl in v.get("deltas", [])), timeout=60)
+                failure = []
+
+                def replied(v):
+                    for dl in (v or {}).get("deltas", []):
+                        if dl.get("kind") in ("block", "chunk") and dl.get("block") == "error":
+                            failure.append(dl.get("text") or "")
+                        if dl.get("kind") == "seal" and dl.get("seal") == "failed":
+                            return True
+                        if dl.get("kind") in ("block", "chunk") and dl.get("block") == "text" and dl.get("text") and dl.get("text") != prompt:
+                            return True
+                    return False
+
+                tf, _ = c.wait_delta(tag, replied, timeout=60)
                 if ts:
                     started.append(ts - t0)
+                if failure:
+                    note = "the run failed after %.0f ms: %s" % (((tf or now()) - t0) * 1000, failure[-1][:200])
+                    break
                 if not tf:
                     note = "no reply within 60s" + ("" if ts else ", and the run never started")
                     break
