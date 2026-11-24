@@ -530,6 +530,13 @@ Mount :: struct {
 	holds:       [dynamic]Path_Hold,
 	reload_ms:   i64,
 	reload_owed: bool,
+	step_ms:     i64,
+	step_tries:  int,
+	step_armed:  bool,
+	reload_tries: int,
+	failed:      Error,
+	fail_path:   string,
+	stuck:       [dynamic]string,
 	reshow:      [dynamic]string,
 	branch:      string,
 	home:        string,
@@ -673,6 +680,7 @@ mount_open :: proc(m: ^Mount, reg: ^Registry, h: ^History, db: ^odb.Odb, id: pri
 	m.stale_temps = make([dynamic]string, allocator)
 	m.holds = make([dynamic]Path_Hold, allocator)
 	m.reshow = make([dynamic]string, allocator)
+	m.stuck = make([dynamic]string, allocator)
 	ok := false
 	defer if !ok {
 		mount_close(m)
@@ -749,6 +757,10 @@ mount_open :: proc(m: ^Mount, reg: ^Registry, h: ^History, db: ^odb.Odb, id: pri
 	before := mount_jlen(m)
 	m.sweep_temps = true
 	rerr := mount_open_rest(m, fresh)
+	if rerr == .Corrupt && m.shadow.damaged {
+		mount_heal(m) or_return
+		rerr = mount_open_rest(m, fresh)
+	}
 	if err := rerr; err != .None {
 		if mount_jlen(m) == before {
 			return err
@@ -955,6 +967,11 @@ mount_close :: proc(m: ^Mount) {
 		delete(c, m.allocator)
 	}
 	delete(m.reshow)
+	for c in m.stuck {
+		delete(c, m.allocator)
+	}
+	delete(m.stuck)
+	delete(m.fail_path, m.allocator)
 	for k in m.dirty {
 		delete(k, m.allocator)
 	}
@@ -1007,6 +1024,8 @@ mount_wake :: proc(m: ^Mount) -> Error {
 		} else if err == .None {
 			m.reload_ms = 0
 			m.reload_owed = false
+		m.reload_tries = 0
+			err = mount_heal(m)
 		}
 		return err
 	}
@@ -1014,7 +1033,7 @@ mount_wake :: proc(m: ^Mount) -> Error {
 	format := m.db.format if m.db != nil else odb.Hash_Format.Sha1
 	if !shadow_attached(&m.shadow) {
 		if m.shadow.dir == "" {
-			shadow_open(&m.shadow, m.vfs, sp, format, m.allocator) or_return
+			shadow_open(&m.shadow, m.vfs, sp, format, m.allocator, m.shadow_mark) or_return
 			if m.history != nil {
 				m.shadow.clock = m.history.opts.clock
 			}
@@ -1039,6 +1058,7 @@ mount_wake :: proc(m: ^Mount) -> Error {
 		}
 		m.reload_ms = 0
 		m.reload_owed = false
+		m.reload_tries = 0
 	}
 	m.awake = true
 	if !m.watched {
@@ -1048,7 +1068,7 @@ mount_wake :: proc(m: ^Mount) -> Error {
 		}
 		m.watched = true
 	}
-	return .None
+	return mount_heal(m)
 }
 
 mount_hibernate :: proc(m: ^Mount) -> Error {
@@ -1674,7 +1694,10 @@ mount_closed :: proc(m: ^Mount, rel: string) {
 	if rerr != .None {
 		return
 	}
-	prev, has_prev, _ := shadow_get(&m.shadow, rel)
+	prev, has_prev, perr := shadow_get(&m.shadow, rel)
+	if perr != .None {
+		return
+	}
 	cleaned, cok := eol_clean(m, rel, data, prev.inode, has_prev && prev.kind == .File)
 	if !cok {
 		return
@@ -1738,13 +1761,44 @@ mount_mark_git :: proc(m: ^Mount) {
 
 RELOAD_RETRY_MAX_MS :: 30_000
 
+STEP_RETRY_TRIES :: 10
+
 @(private)
 mount_reload_retry :: proc(m: ^Mount) {
 	if len(m.dirty) == 0 && !m.rescan && !m.reload_owed && len(m.switch_to) == 0 && !mount_absent_ready(m) {
 		return
 	}
+	m.reload_tries += 1
+	if m.reload_tries > STEP_RETRY_TRIES {
+		return
+	}
 	m.reload_ms = max(m.opts.settle_ms, 1) if m.reload_ms == 0 else min(m.reload_ms * 2, RELOAD_RETRY_MAX_MS)
 	mount_schedule(m, m.reload_ms)
+}
+
+mount_failed :: proc(m: ^Mount) -> (path: string, err: Error) {
+	return m.fail_path, m.failed
+}
+
+@(private)
+mount_fail_clear :: proc(m: ^Mount) {
+	delete(m.fail_path, m.allocator)
+	m.fail_path = ""
+	m.failed = .None
+	m.step_ms = 0
+	m.step_tries = 0
+}
+
+@(private = "file")
+mount_step_retry :: proc(m: ^Mount, err: Error) {
+	m.failed = err
+	m.step_tries += 1
+	if m.step_tries > STEP_RETRY_TRIES || m.reg.loop == nil || prim.timer_pending(m.reg.loop, m.timer) {
+		return
+	}
+	m.step_ms = max(m.opts.settle_ms, 1) if m.step_ms == 0 else min(m.step_ms * 2, RELOAD_RETRY_MAX_MS)
+	mount_schedule(m, m.step_ms)
+	m.step_armed = true
 }
 
 mount_schedule :: proc(m: ^Mount, delay_ms: i64) {
@@ -1757,6 +1811,7 @@ mount_schedule :: proc(m: ^Mount, delay_ms: i64) {
 		}
 		prim.timer_cancel(m.reg.loop, m.timer)
 	}
+	m.step_armed = false
 	m.timer = prim.timer(m.reg.loop, delay_ms, m, proc(l: ^prim.Loop, data: rawptr) {
 		mm := (^Mount)(data)
 		if mount_lock_held(mm) {
@@ -1781,6 +1836,11 @@ mount_run :: proc(m: ^Mount, may_park := false) -> Error {
 @(private)
 mount_step :: proc(m: ^Mount) -> Error {
 	m.lock_first = false
+	if !m.step_armed {
+		m.step_ms = 0
+		m.step_tries = 0
+	}
+	m.step_armed = false
 	fence := false
 	for f in m.fences {
 		if fence_ready(f) {
@@ -1797,15 +1857,22 @@ mount_step :: proc(m: ^Mount) -> Error {
 	}
 	if err == .None {
 		err = mount_materialize(m)
-		if err != .None && err != .Reloading {
-			mount_reload_retry(m)
-		}
+	}
+	if err == .None {
+		mount_fail_clear(m)
+	} else if err != .Reloading {
+		mount_step_retry(m, err)
 	}
 	if err == .None && len(m.switch_to) > 0 {
 		mount_switch_step(m)
 	}
 	if err == .Reloading {
 		mount_reload_retry(m)
+	}
+	if err == .Corrupt && m.shadow.damaged && m.step_tries <= 1 {
+		m.rescan = true
+		mount_schedule(m, 0)
+		m.step_armed = true
 	}
 	if fence {
 		i := 0
@@ -2223,6 +2290,18 @@ load_mount_state :: proc(m: ^Mount) -> (fresh: bool, err: Error) {
 		rec_head.commit = prim.read_str(&rd)
 		rec_reflog = prim.read_ivarint(&rd)
 	}
+	if prim.reader_remaining(&rd) > 0 {
+		nh := prim.read_uvarint(&rd)
+		if nh > u64(prim.reader_remaining(&rd)) {
+			return false, .Corrupt
+		}
+		for _ in 0 ..< nh {
+			p := prim.read_str(&rd)
+			if prim.reader_ok(&rd) {
+				mount_stuck_add(m, p)
+			}
+		}
+	}
 	m.jpend = m.jpos
 	if !prim.reader_ok(&rd) {
 		return false, .Corrupt
@@ -2573,6 +2652,10 @@ save_mount_state :: proc(m: ^Mount) -> Error {
 	prim.write_str(&w, rec.head.branch)
 	prim.write_str(&w, rec.head.commit)
 	prim.write_ivarint(&w, rec.reflog_pos)
+	prim.write_uvarint(&w, u64(len(m.stuck)))
+	for p in m.stuck {
+		prim.write_str(&w, p)
+	}
 	sum := xxhash.XXH3_64_with_seed(buf[:], 0) | 1
 	if sum == m.saved {
 		return .None

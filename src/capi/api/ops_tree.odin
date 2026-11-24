@@ -1,5 +1,6 @@
 package api
 
+import "core:fmt"
 import "core:strings"
 import "../../crdt"
 import eng "../../engine"
@@ -134,6 +135,14 @@ op_tree_mounts :: proc(c: ^Call, o: ^Out) -> Status {
 		o_bool(o, "gated", fs.mount_gated(m.mount))
 		o_u64(o, "gate_overruns", fs.mount_gate_overruns(m.mount))
 		o_str(o, "status", "stale .git/index.lock" if fs.mount_lock_stale(m.mount) else "")
+		fpath, ferr := fs.mount_failed(m.mount)
+		o_str(o, "failed", "" if ferr == .None else fmt.tprintf("%s%s%v", fpath, ": " if len(fpath) > 0 else "", ferr))
+		held := fs.mount_stuck(m.mount)
+		o_arr(o, "held", len(held))
+		for p in held {
+			o_str(o, "", p)
+		}
+		o_end(o)
 		o_end(o)
 	}
 	o_end(o)

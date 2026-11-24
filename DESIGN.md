@@ -469,6 +469,28 @@ equal in both directions.
   detaches and its next attach must publish its generation durably before
   it takes a write. An open uses whichever generation `shadow.gen` names,
   and both are valid.
+  Only a missing `shadow.gen` means generation 0; one that cannot be read
+  fails the open. An open that replays records syncs the log before anything
+  can take a mark over them, so a saved mark is never past the durable log.
+  Damage below the mark (a record, a log that ends before it, a missing or
+  short log, a lost pointer, a generation the mark does not name) opens the
+  shadow as damaged: nothing is cut, no index is published over it, and no
+  path reads as untracked. The mount then heals it once, before any pass: it
+  reads the log in order past the damage, keeps every row that agrees with
+  the tree at the saved synced version, replaces the others with rows for
+  that version whose stats match nothing (so the ordinary pass decides what
+  changed on disk), drops rows the synced tree does not hold, and publishes
+  the result as a new generation. It ingests, removes and writes nothing
+  itself. It runs on the engine's loop and holds the daemon while it walks the
+  tree (1.3 to 2.3 s for 50000 files). A path that version may not have shown (absent, reshow, a name
+  that differs only in case), or whose row is at an older version and whose
+  file matches neither, is held: neither side is touched until the file
+  matches one of them. Held paths are saved and show in the mount's status.
+  The log's magic is a 7-byte family and a version byte; every later format
+  keeps the family, and a higher version answers `Newer` and is not healed.
+  A mount step that fails retries with a doubling delay ten times, then arms
+  nothing until an event, an op, a sync or a reopen; its path and error show
+  in the mount's status.
 - **First mount** walks with parallel `getdents64`/`statx` workers that exist
   only for the scan. In a git checkout the index is read once: entries whose
   stat matches take the index oid (the file text is then referenced from
