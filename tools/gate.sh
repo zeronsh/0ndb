@@ -202,16 +202,18 @@ member_lane() {
 }
 
 scenario_lane() {
-	rec_run scenarios 2400 "$OUT/sim.bin"
-	local f n list
+	rec_run scenarios 4800 SIM_TEST_TIMES=1 "$OUT/sim.bin"
+	local f n list times
+	echo "$REC_OUT" | grep -a '^test time ' | sort -t' ' -k4 -g -r | sed 's/^test time //' > "$OUT/scenario-times"
+	times="wall ${REC_WALL:-?}s; slowest: $(head -3 "$OUT/scenario-times" | sed 's/ (waited.*//' | paste -sd, - | sed 's/,/, /g')"
 	f=$(fail_list "$REC_OUT"); n=$(printf '%s\n' "$f" | head -1); list=$(printf '%s\n' "$f" | tail -n +2)
 	if [ "$REC_RC" -ne 0 ] || ! ok_run "$REC_OUT"; then
 		rec_keep scenarios "sim.bin"
 		[ "$n" = 0 ] && { n=1; list=$(rec_msg); }
-		echo "scenarios: $n failed [$list]"
+		echo "scenarios: $n failed [$list] ($times)"
 	else
 		rm -f "$REC_LOG"
-		echo "scenarios: 0 failed"
+		echo "scenarios: 0 failed ($times)"
 	fi
 }
 
