@@ -109,7 +109,7 @@ check_actor_owners :: proc(w: ^World) {
 	for op in w.model.ops {
 		known[op.actor] = true
 	}
-	for a in w.scope_actors {
+	for a in prim.sorted_keys(w.scope_actors) {
 		known[a] = true
 	}
 	for n in w.nodes {
