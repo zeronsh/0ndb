@@ -571,7 +571,7 @@ convo_undos :: proc(e: ^Engine, o: Object, allocator := context.allocator, floor
 	h := _handle_get(e, o, .Conversation) or_return
 	_handle_refresh(h)
 	u, uerr := convo.undos(&h.view, allocator, floor)
-	return u, _oerr(uerr)
+	return u, _damage_busy(e, o.id, _oerr(uerr))
 }
 
 @(private)
@@ -591,11 +591,12 @@ convo_undo_drive :: proc(e: ^Engine, o: Object, undo: prim.Id) -> Error {
 _cu_drive :: proc(e: ^Engine, o: Object, undo: prim.Id, fresh: bool) -> Error {
 	context = context_for(e)
 	err := _cu_drive_once(e, o, undo, fresh)
-	if err == .Missing {
+	damaged := (err == .Corrupt || err == .Busy) && _damage_pending(e, o.id)
+	if err == .Missing || damaged {
 		h := _handle_get(e, o, .Conversation) or_return
 		r := new(Cu_Redrive, e.allocator)
 		r^ = Cu_Redrive{e = e, o = o, move = undo}
-		werr := _wait(e, h, Ready{data = r, call = proc(data: rawptr, e: ^Engine, err: Error) {
+		ready := Ready{data = r, call = proc(data: rawptr, e: ^Engine, err: Error) {
 			r := (^Cu_Redrive)(data)
 			ee, oo, mm := r.e, r.o, r.move
 			free(r, ee.allocator)
@@ -605,7 +606,8 @@ _cu_drive :: proc(e: ^Engine, o: Object, undo: prim.Id, fresh: bool) -> Error {
 					ee.undo_hooks.pending(ee.undo_hooks.data, ee, oo, mm)
 				}
 			}
-		}})
+		}}
+		werr := _damage_read(e, o, .Corrupt, ready) if damaged else _wait(e, h, ready)
 		if werr != .Pending {
 			free(r, e.allocator)
 			return werr
@@ -659,7 +661,7 @@ _cu_undone_of :: proc(e: ^Engine, o: Object, undo: prim.Id) -> (u: convo.Undone_
 	_handle_refresh(h)
 	list, lerr := convo.undones(&h.view, context.temp_allocator)
 	if lerr != .None {
-		return u, _oerr(lerr)
+		return u, _damage_busy(e, o.id, _oerr(lerr))
 	}
 	for x in list {
 		if x.undo == undo {
