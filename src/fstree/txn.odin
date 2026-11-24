@@ -58,14 +58,19 @@ txn_commit :: proc(t: ^Tree) -> Error {
 	if err == nil && t.txn.has_log {
 		err = reserve(&t.log, len(t.log) + 1)
 	}
+	inode_ids: []Inode_Id
+	node_keys: []Node_Key
+	if err == nil {
+		inode_ids, err = prim.try_sorted_keys(t.txn.inodes)
+	}
+	if err == nil {
+		node_keys, err = prim.try_sorted_keys(t.txn.nodes)
+	}
 	if err != nil {
 		txn_abort(t)
 		return err
 	}
-	for id in prim.sorted_keys(t.txn.inodes) {
-		if id not_in t.txn.inodes {
-			continue
-		}
+	for id in inode_ids {
 		n := t.txn.inodes[id]
 		if old, ok := t.inodes[id]; ok && old != n {
 			inode_free(t, old)
@@ -74,10 +79,7 @@ txn_commit :: proc(t: ^Tree) -> Error {
 		t.inodes[id] = n
 		t.dirty_inodes[id] = {}
 	}
-	for key in prim.sorted_keys(t.txn.nodes) {
-		if key not_in t.txn.nodes {
-			continue
-		}
+	for key in node_keys {
 		n := t.txn.nodes[key]
 		if old, ok := t.nodes[key]; ok && old != n {
 			node_free(t, old)

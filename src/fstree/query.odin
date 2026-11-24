@@ -773,7 +773,7 @@ diff :: proc(t: ^Tree, a, b: View, touched: []Inode_Id, allocator := context.all
 		map_insert(&set, id, struct{}{}) or_return
 	}
 	base := make([dynamic]Inode_Id, 0, len(set), context.temp_allocator) or_return
-	for id in prim.sorted_keys(set) {
+	for id in prim.try_sorted_keys(set) or_return {
 		append(&base, id) or_return
 	}
 	for id in base {
@@ -781,7 +781,7 @@ diff :: proc(t: ^Tree, a, b: View, touched: []Inode_Id, allocator := context.all
 		collect_ancestors(&sb, id, &set) or_return
 	}
 	clear(&base)
-	for id in prim.sorted_keys(set) {
+	for id in prim.try_sorted_keys(set) or_return {
 		append(&base, id) or_return
 	}
 	for id in base {
@@ -789,7 +789,7 @@ diff :: proc(t: ^Tree, a, b: View, touched: []Inode_Id, allocator := context.all
 		collect_namesakes(&sb, id, &set) or_return
 	}
 	ids := make([dynamic]Inode_Id, 0, len(set), context.temp_allocator) or_return
-	for id in prim.sorted_keys(set) {
+	for id in prim.try_sorted_keys(set) or_return {
 		append(&ids, id) or_return
 	}
 	slice.sort_by(ids[:], proc(x, y: Inode_Id) -> bool {return id_cmp(x, y) < 0})

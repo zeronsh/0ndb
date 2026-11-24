@@ -1,14 +1,27 @@
 package prim
 
-sorted_keys :: proc(m: $M/map[$K]$V, allocator := context.temp_allocator) -> []K {
-	keys := make([]K, len(m), allocator)
+import "base:runtime"
+
+sorted_keys :: proc(m: $M/map[$K]$V, allocator := context.temp_allocator, loc := #caller_location) -> []K {
+	keys, err := try_sorted_keys(m, allocator)
+	if err != nil {
+		panic("sorted_keys: out of memory", loc)
+	}
+	return keys
+}
+
+try_sorted_keys :: proc(m: $M/map[$K]$V, allocator := context.temp_allocator) -> (keys: []K, err: runtime.Allocator_Error) {
+	keys = make([]K, len(m), allocator) or_return
+	if len(m) > 0 && raw_data(keys) == nil {
+		return nil, .Out_Of_Memory
+	}
 	i := 0
 	for k in m {
 		keys[i] = k
 		i += 1
 	}
 	_keys_heapsort(keys)
-	return keys
+	return keys, nil
 }
 
 unordered :: #force_inline proc "contextless" (m: $M/map[$K]$V) -> M {

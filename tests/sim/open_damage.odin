@@ -131,9 +131,7 @@ _open_damage :: proc(w: ^World, body: bool) {
 	r := new(rt.Runtime, w.allocator)
 	r_on := false
 	defer if r_on && a.alive {
-		context = instance_context(&a.inst)
-		rt.close(r)
-		node_after(a)
+		_runtime_close(a, r)
 	}
 	node_kill(a)
 	disk_crash(&a.disk, .Power, &w.fault_rng)
@@ -177,6 +175,13 @@ _open_damage :: proc(w: ^World, body: bool) {
 	if _, serr := eng.convo_send(&a.e, o, "after the restore"); serr != .None && serr != .Pending {
 		world_fail(w, "open damage: the conversation's writer did not reopen after the restore: %v", serr)
 	}
+}
+
+@(private = "file")
+_runtime_close :: proc(n: ^Node, r: ^rt.Runtime) {
+	context = instance_context(&n.inst)
+	rt.close(r)
+	node_after(n)
 }
 
 @(private = "file")
