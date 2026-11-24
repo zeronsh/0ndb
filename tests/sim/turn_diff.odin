@@ -607,6 +607,13 @@ _td_check :: proc(c: ^Td_Ctx, r: ^rt.Runtime, ti: int, t: ^Td_Turn) {
 }
 
 @(private = "file")
+_td_close :: proc(n: ^Node, r: ^rt.Runtime) {
+	context = instance_context(&n.inst)
+	rt.close(r)
+	node_after(n)
+}
+
+@(private = "file")
 _td_history :: proc(c: ^Td_Ctx, r: ^rt.Runtime) {
 	w := c.w
 	n := c.n
@@ -736,11 +743,7 @@ _td_run :: proc(w: ^World, alloc: runtime.Allocator) -> (turns: int, moves: int,
 			return
 		}
 	}
-	defer {
-		context = instance_context(&n.inst)
-		rt.close(r)
-		node_after(n)
-	}
+	defer _td_close(n, r)
 	for &t, i in c.turns {
 		_td_check(c, r, i, &t)
 		for k, from in t.moved {
