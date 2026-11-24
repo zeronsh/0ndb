@@ -1,5 +1,6 @@
 package engine
 
+import "core:fmt"
 import "core:crypto/blake2b"
 import "core:mem/virtual"
 import "core:slice"
@@ -704,6 +705,8 @@ _index_tree :: proc(e: ^Engine, h: ^Handle, budget: int) -> (used: int, more: bo
 	}
 	h.tree_ix = {}
 	t0 := prim.clock_mono_ns(e.cfg.clock)
+	ix_t0 := prim.mono_ns()
+	defer fmt.eprintfln("IXTREE files=%d start=%d of %d %.1fms clock_elapsed=%.1fms", used, start, len(ids), f64(prim.mono_ns() - ix_t0) / 1e6, f64(prim.clock_mono_ns(e.cfg.clock) - t0) / 1e6)
 	for id, k in ids[start:] {
 		if k >= TREE_INDEX_FILES || (k > 0 && prim.clock_mono_ns(e.cfg.clock) - t0 >= INDEX_SLICE_NS) {
 			h.tree_ix = {pos, to, start + k}

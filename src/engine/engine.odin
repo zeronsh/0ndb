@@ -1,5 +1,6 @@
 package engine
 
+import "core:fmt"
 import "base:runtime"
 import "core:mem/virtual"
 import "core:sync"
@@ -876,24 +877,132 @@ _tick_end :: proc(e: ^Engine) {
 	e.tick += 1
 	e.stats.ticks += 1
 	e.tick_wanted = false
-	_repl_events_process(e)
-	_approvals_step(e)
-	_space_waits_run(e)
-	_content_events_process(e)
-	_waiters_run(e)
-	_move_waits_run(e)
-	_remote_step(e)
-	_catalog_reconcile(e)
-	_catalog_flush(e)
-	_budget_flush(e)
-	_moves_settle_step(e)
-	_mounts_commit(e)
-	_handles_commit(e)
-	_mounts_changed(e)
-	_buffers_tick(e)
-	_deliver_hook(e)
-	_subs_deliver(e)
-	_deliver_hook(e)
+	{
+		tick_t0 := prim.mono_ns()
+		_repl_events_process(e)
+		if tick_d := prim.mono_ns() - tick_t0; tick_d > 2_000_000 {
+			fmt.eprintfln("TICK _repl_events_process %.1fms", f64(tick_d) / 1e6)
+		}
+	}
+	{
+		tick_t0 := prim.mono_ns()
+		_approvals_step(e)
+		if tick_d := prim.mono_ns() - tick_t0; tick_d > 2_000_000 {
+			fmt.eprintfln("TICK _approvals_step %.1fms", f64(tick_d) / 1e6)
+		}
+	}
+	{
+		tick_t0 := prim.mono_ns()
+		_space_waits_run(e)
+		if tick_d := prim.mono_ns() - tick_t0; tick_d > 2_000_000 {
+			fmt.eprintfln("TICK _space_waits_run %.1fms", f64(tick_d) / 1e6)
+		}
+	}
+	{
+		tick_t0 := prim.mono_ns()
+		_content_events_process(e)
+		if tick_d := prim.mono_ns() - tick_t0; tick_d > 2_000_000 {
+			fmt.eprintfln("TICK _content_events_process %.1fms", f64(tick_d) / 1e6)
+		}
+	}
+	{
+		tick_t0 := prim.mono_ns()
+		_waiters_run(e)
+		if tick_d := prim.mono_ns() - tick_t0; tick_d > 2_000_000 {
+			fmt.eprintfln("TICK _waiters_run %.1fms", f64(tick_d) / 1e6)
+		}
+	}
+	{
+		tick_t0 := prim.mono_ns()
+		_move_waits_run(e)
+		if tick_d := prim.mono_ns() - tick_t0; tick_d > 2_000_000 {
+			fmt.eprintfln("TICK _move_waits_run %.1fms", f64(tick_d) / 1e6)
+		}
+	}
+	{
+		tick_t0 := prim.mono_ns()
+		_remote_step(e)
+		if tick_d := prim.mono_ns() - tick_t0; tick_d > 2_000_000 {
+			fmt.eprintfln("TICK _remote_step %.1fms", f64(tick_d) / 1e6)
+		}
+	}
+	{
+		tick_t0 := prim.mono_ns()
+		_catalog_reconcile(e)
+		if tick_d := prim.mono_ns() - tick_t0; tick_d > 2_000_000 {
+			fmt.eprintfln("TICK _catalog_reconcile %.1fms", f64(tick_d) / 1e6)
+		}
+	}
+	{
+		tick_t0 := prim.mono_ns()
+		_catalog_flush(e)
+		if tick_d := prim.mono_ns() - tick_t0; tick_d > 2_000_000 {
+			fmt.eprintfln("TICK _catalog_flush %.1fms", f64(tick_d) / 1e6)
+		}
+	}
+	{
+		tick_t0 := prim.mono_ns()
+		_budget_flush(e)
+		if tick_d := prim.mono_ns() - tick_t0; tick_d > 2_000_000 {
+			fmt.eprintfln("TICK _budget_flush %.1fms", f64(tick_d) / 1e6)
+		}
+	}
+	{
+		tick_t0 := prim.mono_ns()
+		_moves_settle_step(e)
+		if tick_d := prim.mono_ns() - tick_t0; tick_d > 2_000_000 {
+			fmt.eprintfln("TICK _moves_settle_step %.1fms", f64(tick_d) / 1e6)
+		}
+	}
+	{
+		tick_t0 := prim.mono_ns()
+		_mounts_commit(e)
+		if tick_d := prim.mono_ns() - tick_t0; tick_d > 2_000_000 {
+			fmt.eprintfln("TICK _mounts_commit %.1fms", f64(tick_d) / 1e6)
+		}
+	}
+	{
+		tick_t0 := prim.mono_ns()
+		_handles_commit(e)
+		if tick_d := prim.mono_ns() - tick_t0; tick_d > 2_000_000 {
+			fmt.eprintfln("TICK _handles_commit %.1fms", f64(tick_d) / 1e6)
+		}
+	}
+	{
+		tick_t0 := prim.mono_ns()
+		_mounts_changed(e)
+		if tick_d := prim.mono_ns() - tick_t0; tick_d > 2_000_000 {
+			fmt.eprintfln("TICK _mounts_changed %.1fms", f64(tick_d) / 1e6)
+		}
+	}
+	{
+		tick_t0 := prim.mono_ns()
+		_buffers_tick(e)
+		if tick_d := prim.mono_ns() - tick_t0; tick_d > 2_000_000 {
+			fmt.eprintfln("TICK _buffers_tick %.1fms", f64(tick_d) / 1e6)
+		}
+	}
+	{
+		tick_t0 := prim.mono_ns()
+		_deliver_hook(e)
+		if tick_d := prim.mono_ns() - tick_t0; tick_d > 2_000_000 {
+			fmt.eprintfln("TICK _deliver_hook %.1fms", f64(tick_d) / 1e6)
+		}
+	}
+	{
+		tick_t0 := prim.mono_ns()
+		_subs_deliver(e)
+		if tick_d := prim.mono_ns() - tick_t0; tick_d > 2_000_000 {
+			fmt.eprintfln("TICK _subs_deliver %.1fms", f64(tick_d) / 1e6)
+		}
+	}
+	{
+		tick_t0 := prim.mono_ns()
+		_deliver_hook(e)
+		if tick_d := prim.mono_ns() - tick_t0; tick_d > 2_000_000 {
+			fmt.eprintfln("TICK _deliver_hook %.1fms", f64(tick_d) / 1e6)
+		}
+	}
 	if e.tick_hook.call != nil {
 		hook := e.tick_hook
 		{
@@ -901,20 +1010,86 @@ _tick_end :: proc(e: ^Engine) {
 			hook.call(hook.data, e)
 		}
 	}
-	_full_step(e)
-	_index_step(e)
-	_damage_step(e)
-	_handles_commit(e)
-	_index_durable_advanced(e)
-	_handles_sweep(e, e.cfg.handle_cache)
-	_git_flush(e)
-	_durable_begin(e)
-	_leave_step(e)
-	_refused_step(e)
+	{
+		tick_t0 := prim.mono_ns()
+		_full_step(e)
+		if tick_d := prim.mono_ns() - tick_t0; tick_d > 2_000_000 {
+			fmt.eprintfln("TICK _full_step %.1fms", f64(tick_d) / 1e6)
+		}
+	}
+	{
+		tick_t0 := prim.mono_ns()
+		_index_step(e)
+		if tick_d := prim.mono_ns() - tick_t0; tick_d > 2_000_000 {
+			fmt.eprintfln("TICK _index_step %.1fms", f64(tick_d) / 1e6)
+		}
+	}
+	{
+		tick_t0 := prim.mono_ns()
+		_damage_step(e)
+		if tick_d := prim.mono_ns() - tick_t0; tick_d > 2_000_000 {
+			fmt.eprintfln("TICK _damage_step %.1fms", f64(tick_d) / 1e6)
+		}
+	}
+	{
+		tick_t0 := prim.mono_ns()
+		_handles_commit(e)
+		if tick_d := prim.mono_ns() - tick_t0; tick_d > 2_000_000 {
+			fmt.eprintfln("TICK _handles_commit %.1fms", f64(tick_d) / 1e6)
+		}
+	}
+	{
+		tick_t0 := prim.mono_ns()
+		_index_durable_advanced(e)
+		if tick_d := prim.mono_ns() - tick_t0; tick_d > 2_000_000 {
+			fmt.eprintfln("TICK _index_durable_advanced %.1fms", f64(tick_d) / 1e6)
+		}
+	}
+	{
+		tick_t0 := prim.mono_ns()
+		_handles_sweep(e, e.cfg.handle_cache)
+		if tick_d := prim.mono_ns() - tick_t0; tick_d > 2_000_000 {
+			fmt.eprintfln("TICK _handles_sweep %.1fms", f64(tick_d) / 1e6)
+		}
+	}
+	{
+		tick_t0 := prim.mono_ns()
+		_git_flush(e)
+		if tick_d := prim.mono_ns() - tick_t0; tick_d > 2_000_000 {
+			fmt.eprintfln("TICK _git_flush %.1fms", f64(tick_d) / 1e6)
+		}
+	}
+	{
+		tick_t0 := prim.mono_ns()
+		_durable_begin(e)
+		if tick_d := prim.mono_ns() - tick_t0; tick_d > 2_000_000 {
+			fmt.eprintfln("TICK _durable_begin %.1fms", f64(tick_d) / 1e6)
+		}
+	}
+	{
+		tick_t0 := prim.mono_ns()
+		_leave_step(e)
+		if tick_d := prim.mono_ns() - tick_t0; tick_d > 2_000_000 {
+			fmt.eprintfln("TICK _leave_step %.1fms", f64(tick_d) / 1e6)
+		}
+	}
+	{
+		tick_t0 := prim.mono_ns()
+		_refused_step(e)
+		if tick_d := prim.mono_ns() - tick_t0; tick_d > 2_000_000 {
+			fmt.eprintfln("TICK _refused_step %.1fms", f64(tick_d) / 1e6)
+		}
+	}
 	if e.fatal == .None && (e.pk_open && e.pk.poisoned || e.reg.open && e.reg.db.poisoned) {
 		_fatal(e, .Io)
 	}
-	_settle_arm(e)
+	{
+		tick_t0 := prim.mono_ns()
+		_settle_arm(e)
+		if tick_d := prim.mono_ns() - tick_t0; tick_d > 2_000_000 {
+			fmt.eprintfln("TICK _settle_arm %.1fms", f64(tick_d) / 1e6)
+		}
+	}
 	if (!_tick_pending(e) || pack.pressure(&e.pk)) && e.tick_timer != 0 {
 		prim.timer_cancel(e.loop, e.tick_timer)
 		e.tick_timer = 0

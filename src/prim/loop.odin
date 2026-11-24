@@ -1,6 +1,7 @@
 #+build linux, darwin, windows
 package prim
 
+import "core:fmt"
 import "base:intrinsics"
 import "base:runtime"
 
@@ -467,7 +468,11 @@ _dispatch :: proc(l: ^Loop, h: u64, events: Events) {
 	#partial switch s.kind {
 	case .Fd:
 		if s.watch_cb != nil {
+			t0 := mono_ns()
 			s.watch_cb(l, s.fd, events, s.data)
+			if d := mono_ns() - t0; d > 3_000_000 {
+				fmt.eprintfln("TURN watch fd=%v %.1fms", s.fd, f64(d) / 1e6)
+			}
 		}
 	case .Child:
 		_child_exited(l, idx)
@@ -516,10 +521,15 @@ _run_timers :: proc(l: ^Loop) {
 		}
 		cb := t.cb
 		data := t.data
+		site := t.owner
 		_heap_remove(l, 0)
 		_timer_free(l, idx)
 		if cb != nil {
+			t0 := mono_ns()
 			cb(l, data)
+			if d := mono_ns() - t0; d > 3_000_000 {
+				fmt.eprintfln("TURN timer %s:%d %.1fms", site.procedure, site.line, f64(d) / 1e6)
+			}
 		}
 	}
 }
