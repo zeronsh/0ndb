@@ -18,6 +18,7 @@ Run_Result :: struct {
 	fault_events: int,
 	failures: [dynamic]string,
 	trace:    u64,
+	marks:    [dynamic]Ev_Mark,
 	stats:    World_Stats,
 	sim_ns:   i64,
 	wall_ns:  i64,
@@ -132,9 +133,11 @@ run_until :: proc(w: ^World, limit: i64, stop_when_idle: bool) -> (idle: bool) {
 					fmt.eprintf("evbytes %d node=%s %x\n", w.stats.events, ev.conn.node.name if ev.conn != nil else "-", ev.bytes)
 				}
 			}
+			mark := mark_begin(w, &ev)
 			handle_event(w, &ev)
 			delete(ev.bytes, w.allocator)
 			drain_all(w)
+			mark_end(w, &mark)
 			if w.phase == .Workload && len(w.failures) >= 20 {
 				return false
 			}
@@ -298,6 +301,7 @@ run_seed :: proc(seed: u64, verbose := false, images: ^Disk_Images = nil, label 
 	cfg.verbose = verbose
 	cfg.quiet = quiet
 	cfg.disabled = env_disabled()
+	cfg.marks = images != nil
 	leak_sites = env_u64("SIM_LEAK_SITES", 0) != 0
 	trace_events = env_u64("SIM_TRACE_EVENTS", 0) != 0
 	trace_bytes_at = env_u64("SIM_TRACE_BYTES_AT", 0)
@@ -366,6 +370,8 @@ run_seed :: proc(seed: u64, verbose := false, images: ^Disk_Images = nil, label 
 		finish(w)
 	}
 	res.trace = w.trace
+	res.marks = w.marks
+	w.marks = {}
 	res.stats = w.stats
 	res.op_events = w.op_index
 	res.fault_events = w.fault_index
@@ -568,6 +574,8 @@ free_result :: proc(res: ^Run_Result) {
 		delete(f, runtime.heap_allocator())
 	}
 	delete(res.failures)
+	delete(res.marks)
+	res.marks = {}
 }
 
 @(test)
@@ -604,6 +612,7 @@ simulate :: proc(t: ^testing.T) {
 				for d, k in diffs {
 					inject_at(&a.failures, k + 1, d)
 				}
+				marks_report(seed, a.marks[:], b.marks[:])
 				ok1 = false
 			} else {
 				for d in diffs {
