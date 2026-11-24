@@ -1,4 +1,5 @@
 package omap
+import "core:fmt"
 
 import "base:runtime"
 import "core:hash/xxhash"
@@ -408,12 +409,14 @@ txn_commit :: proc(t: ^Txn) -> Error {
 		}
 		if err := prim.write_at(db.vfs, db.fd, buf, i64(start) * PAGE); err != .None {
 			txn_abort(t)
+			fmt.eprintln("DBGP", #location(), err, db.fd, start, written)
 			db.poisoned = true
 			return obj.perr(err)
 		}
 		if !db.lazy {
 			if err := prim.barrier(db.vfs, db.fd); err != .None {
 				txn_abort(t)
+				fmt.eprintln("DBGP", #location())
 				db.poisoned = true
 				return obj.perr(err)
 			}
@@ -436,6 +439,7 @@ txn_commit :: proc(t: ^Txn) -> Error {
 	}
 	if err := _meta_write(db.vfs, db.fd, &m); err != .None {
 		txn_abort(t)
+		fmt.eprintln("DBGP", #location())
 		db.poisoned = true
 		return err
 	}
@@ -488,10 +492,12 @@ db_publish :: proc(db: ^Db, durable: u64) -> Error {
 		}
 		db.npend = rest
 		if err := _meta_write(db.vfs, db.fd, &m); err != .None {
+			fmt.eprintln("DBGP", #location())
 			db.poisoned = true
 			return err
 		}
 		if err := prim.datasync(db.vfs, db.fd); err != .None {
+			fmt.eprintln("DBGP", #location())
 			db.poisoned = true
 			return obj.perr(err)
 		}
@@ -519,6 +525,7 @@ db_flush :: proc(db: ^Db) -> Error {
 	err := _publish_locked(db, &m)
 	sync.mutex_unlock(&db.mu)
 	if err != .None {
+		fmt.eprintln("DBGP", #location())
 		db.poisoned = true
 		return err
 	}
@@ -556,6 +563,7 @@ db_publish_done :: proc(db: ^Db, ok: bool) {
 		db.pub_wait -= 1
 	}
 	if !ok {
+		fmt.eprintln("DBGP", #location())
 		db.poisoned = true
 	}
 }
@@ -638,18 +646,21 @@ db_compact :: proc(db: ^Db) -> Error {
 	}
 	ok = true
 	if err := _zero_file(db.vfs, db.fd); err != .None {
+		fmt.eprintln("DBGP", #location())
 		db.poisoned = true
 		return err
 	}
 	prim.close_file(db.vfs, db.fd)
 	db.fd = fd
 	if err := prim.rename(db.vfs, tmp, db.path); err != .None {
+		fmt.eprintln("DBGP", #location())
 		db.poisoned = true
 		return obj.perr(err)
 	}
 	db.meta = m
 	db.cache_no = {}
 	if err := prim.sync_dir(db.vfs, prim.dir_name(db.path)); err != .None {
+		fmt.eprintln("DBGP", #location())
 		db.poisoned = true
 		return obj.perr(err)
 	}
@@ -1482,6 +1493,7 @@ builder_commit :: proc(b: ^Builder) -> Error {
 	db.meta = m
 	db.cache_no = {}
 	if err := prim.sync_dir(db.vfs, prim.dir_name(db.path)); err != .None {
+		fmt.eprintln("DBGP", #location())
 		db.poisoned = true
 		return obj.perr(err)
 	}

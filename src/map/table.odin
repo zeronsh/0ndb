@@ -1,4 +1,5 @@
 package omap
+import "core:fmt"
 
 import "base:runtime"
 import "core:slice"
@@ -98,6 +99,8 @@ table_poisoned :: proc "contextless" (t: ^Table) -> bool {
 @(private)
 _fault :: proc(t: ^Table, err: Error) -> Error {
 	if err == .Io || err == .Corrupt || err == .No_Space {
+		fmt.eprintfln("DBGM fault %v", err)
+		fmt.eprintln("DBGT", #location())
 		t.poisoned = true
 	}
 	return err
@@ -172,6 +175,7 @@ table_prepare :: proc(t: ^Table, sources: []Source) -> Error {
 		return .None
 	}
 	if e := table_reset(t); e != .None {
+		fmt.eprintln("DBGT", #location())
 		t.poisoned = true
 		return e
 	}
@@ -180,10 +184,13 @@ table_prepare :: proc(t: ^Table, sources: []Source) -> Error {
 
 table_apply :: proc(t: ^Table, seg: prim.Id, r: ^journal.Reader) -> (pos: i64, err: Error) {
 	if table_poisoned(t) {
+		fmt.eprintfln("DBGM already poisoned seg=%x", seg)
 		return 0, .Io
 	}
 	if cur, ce := table_consumed(t, seg); ce == .None && cur > durable_end(r) {
+		fmt.eprintln("DBGT", #location())
 		t.poisoned = true
+		fmt.eprintfln("DBGM poison: consumed %d > durable end %d seg=%x own=%v", cur, durable_end(r), seg, r.journal != nil)
 		return 0, .Io
 	}
 	pos, err = _table_apply(t, seg, r)
@@ -379,6 +386,7 @@ cursor_destroy :: proc(c: ^Cursor) {
 table_rebuild :: proc(t: ^Table, sources: []Source) -> Error {
 	if table_poisoned(t) {
 		if e := table_reset(t); e != .None {
+			fmt.eprintln("DBGT", #location())
 			t.poisoned = true
 			return e
 		}

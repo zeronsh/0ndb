@@ -1,4 +1,5 @@
 package engine
+import "core:fmt"
 
 import "base:runtime"
 import "core:mem/virtual"
@@ -1001,7 +1002,8 @@ _on_settle :: proc(l: ^prim.Loop, data: rawptr) {
 }
 
 @(private)
-_fatal :: proc(e: ^Engine, err: Error) {
+_fatal :: proc(e: ^Engine, err: Error, loc := #caller_location) {
+	fmt.eprintfln("DBGF fatal %v from %v", err, loc)
 	if e.fatal == .None {
 		e.fatal = err
 	}
