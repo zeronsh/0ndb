@@ -63,7 +63,8 @@ Spec :: struct {
 	keepalive:         bool,
 }
 
-ANTHROPIC_URL :: "https://api.anthropic.com/v1/messages"
+TEST_URL :: #config(ONDB_TEST_MODEL_URL, "")
+ANTHROPIC_URL :: "https://api.anthropic.com/v1/messages" when TEST_URL == "" else TEST_URL
 ANTHROPIC_VERSION :: "2026-10-21"
 ANTHROPIC_VERSION_HEADER :: "anthropic-version"
 ANTHROPIC_KEY_HEADER :: "x-api-key"
@@ -101,8 +102,8 @@ ANTHROPIC_DELTA_SIGNATURE :: "signature_delta"
 ANTHROPIC_DELTA_CITATIONS :: "citations_delta"
 RESUME_PROMPT :: "Your previous response was interrupted by a network failure and ended with the text above. Continue from exactly where you left off without repeating anything."
 
-OPENAI_RESPONSES_URL :: "https://api.openai.com/v1/responses"
-OPENAI_CHAT_URL :: "https://api.openai.com/v1/chat/completions"
+OPENAI_RESPONSES_URL :: "https://api.openai.com/v1/responses" when TEST_URL == "" else TEST_URL
+OPENAI_CHAT_URL :: "https://api.openai.com/v1/chat/completions" when TEST_URL == "" else TEST_URL
 OPENAI_AUTH_HEADER :: "authorization"
 BEARER_PREFIX :: "Bearer "
 OPENAI_INCLUDE_REASONING :: `"include":["reasoning.encrypted_content"]`
