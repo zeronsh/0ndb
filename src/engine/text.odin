@@ -1090,20 +1090,24 @@ tree_blame :: proc(e: ^Engine, o: Object, path: string, allocator := context.all
 		spans = crdt.text_spans(&view.text, &h.hist.g, allocator)
 	}
 	if owners != nil {
-		devices := make([dynamic]prim.Id, context.temp_allocator)
-		if ms, merr := space_members(e, o.space, context.temp_allocator); merr == .None {
-			for x in ms {
-				append(&devices, x.device)
-			}
-		}
 		oerr: fs.Error
-		spans, owners^, oerr = fs.history_span_owners(h.hist, spans, devices[:], allocator)
+		spans, owners^, oerr = fs.history_span_owners(h.hist, spans, space_devices(e, o.space, context.temp_allocator), allocator)
 		if oerr != .None {
 			return nil, nil, _ferr(oerr)
 		}
 	}
 	fs.history_present_spans(h.hist, spans)
 	return data, spans, .None
+}
+
+space_devices :: proc(e: ^Engine, space: prim.Id, allocator := context.allocator) -> []prim.Id {
+	devices := make([dynamic]prim.Id, allocator)
+	if ms, err := space_members(e, space, context.temp_allocator); err == .None {
+		for x in ms {
+			append(&devices, x.device)
+		}
+	}
+	return devices[:]
 }
 
 @(private)

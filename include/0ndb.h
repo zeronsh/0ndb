@@ -375,9 +375,9 @@
  *                 status: str (added, removed, modified, moved),
  *                 binary: bool, added: uvarint, removed: uvarint,
  *                 patch: str, clipped: bool, blame: [ {line_lo: uvarint,
- *                 line_hi: uvarint, actor: id, owner: id (the
- *                 conversation whose turn wrote the lines, zero for a
- *                 person), device: id} ]} ]
+ *                 line_hi: uvarint, actor: id, owner: enum owner,
+ *                 conversation: id (the conversation whose turn wrote the
+ *                 lines, zero for a person), scope: id, device: id} ]} ]
  *   Schedule   := id: str, owner: object, prompt: str, cron: str, at: ivarint,
  *                 tz: str, conversation: id, fresh: bool, next: ivarint,
  *                 last: ivarint, creator: id, agent: id

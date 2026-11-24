@@ -581,8 +581,9 @@ _td_check :: proc(c: ^Td_Ctx, r: ^rt.Runtime, ti: int, t: ^Td_Turn) {
 				c.lines += 1
 				tok := cur[li - 1]
 				owner := c.owners[tok] or_else {}
-				if b.owner != owner || (!t.open && owner == c.conv.id && b.actor != c.agent) {
-					world_fail(w, "turn diff: turn %d: %s line %d %s blames owner %v actor %v, its owner is %v", ti, f.path, li, tok, b.owner, b.actor, owner)
+				kind := fs.Owner_Kind.Person if owner == {} else .Agent
+				if b.conversation != owner || b.owner != kind || (!t.open && owner == c.conv.id && b.actor != c.agent) {
+					world_fail(w, "turn diff: turn %d: %s line %d %s blames %v of %v actor %v, its owner is %v", ti, f.path, li, tok, b.owner, b.conversation, b.actor, owner)
 				}
 			}
 			covered = b.line_hi - 1
