@@ -527,6 +527,7 @@ Mount :: struct {
 	absent_set:  map[string]bool,
 	sweep_temps: bool,
 	stale_temps: [dynamic]string,
+	late_dirs: [dynamic]string,
 	holds:       [dynamic]Path_Hold,
 	reload_ms:   i64,
 	reload_owed: bool,
@@ -671,6 +672,7 @@ mount_open :: proc(m: ^Mount, reg: ^Registry, h: ^History, db: ^odb.Odb, id: pri
 	m.absent = make([dynamic]string, allocator)
 	m.absent_set = make(map[string]bool, allocator)
 	m.stale_temps = make([dynamic]string, allocator)
+	m.late_dirs = make([dynamic]string, allocator)
 	m.holds = make([dynamic]Path_Hold, allocator)
 	m.reshow = make([dynamic]string, allocator)
 	ok := false
@@ -946,6 +948,10 @@ mount_close :: proc(m: ^Mount) {
 		delete(t, m.allocator)
 	}
 	delete(m.stale_temps)
+	for d in m.late_dirs {
+		delete(d, m.allocator)
+	}
+	delete(m.late_dirs)
 	for x in m.holds {
 		delete(x.path, m.allocator)
 	}

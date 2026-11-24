@@ -332,6 +332,11 @@ materialize_to :: proc(m: ^Mount, target: Version, merge: bool) -> Error {
 		mat_roll_forward(m, items[:], sl[:], target)
 		return berr
 	}
+	if lerr := mat_late_dirs(m); lerr != .None {
+		mat_owe(m, &ms)
+		mat_roll_forward(m, items[:], sl[:], target)
+		return lerr
+	}
 	mat_owed_clear(m)
 	if ms.raced && !merge && !m.restoring && m.mat_retries < MAT_RACE_RETRIES {
 		m.mat = nil
@@ -578,6 +583,40 @@ mat_raced :: proc(m: ^Mount) {
 	if m.mat != nil {
 		m.mat.raced = true
 	}
+}
+
+@(private)
+mat_late_dirs :: proc(m: ^Mount) -> Error {
+	if len(m.late_dirs) == 0 || m.restoring {
+		return .None
+	}
+	slice.sort_by(m.late_dirs[:], proc(a, b: string) -> bool {
+		return count_depth(a) > count_depth(b) || count_depth(a) == count_depth(b) && a < b
+	})
+	ms := Mat_Sync {
+		dirs = make(map[string]bool, context.temp_allocator),
+	}
+	was := m.mat
+	m.mat = &ms
+	defer m.mat = was
+	for rel in m.late_dirs {
+		if _, tracked := shadow_get(&m.shadow, rel) or_return; tracked {
+			continue
+		}
+		abuf: prim.Path_Buf
+		abs := abs_path(m, rel, abuf[:])
+		if e := prim.remove_dir(m.vfs, abs); e == .None {
+			mat_dir(m, path_parent_abs(abs))
+		} else if e != .Not_Found && e != .Not_Empty {
+			return from_prim(e)
+		}
+	}
+	mat_barrier(m, &ms) or_return
+	for rel in m.late_dirs {
+		delete(rel, m.allocator)
+	}
+	clear(&m.late_dirs)
+	return .None
 }
 
 @(private)
@@ -1069,7 +1108,13 @@ materialize_inner :: proc(m: ^Mount, it: ^Mat_Item, tl: []crdt.Lv) -> Error {
 		}
 		abs := abs_path(m, it.old, abuf[:])
 		if it.entry.kind == .Dir {
-			if e := prim.remove_dir(m.vfs, abs); e != .None && e != .Not_Found && e != .Not_Empty {
+			if e := prim.remove_dir(m.vfs, abs); e == .Not_Empty && !m.restoring {
+				late, lerr := clone_string(it.old, m.allocator)
+				if lerr != nil {
+					return .No_Memory
+				}
+				append(&m.late_dirs, late)
+			} else if e != .None && e != .Not_Found && e != .Not_Empty {
 				return from_prim(e)
 			}
 		} else if e := prim.remove(m.vfs, abs); e != .None && e != .Not_Found {

@@ -832,7 +832,13 @@ equal in both directions.
   durable before its name points at it: after any crash a written path holds
   its old content or its complete new content, and only directories are owed
   until that barrier. A structural item (a directory, a move or a removal)
-  first commits the files staged before it, so the pass keeps its order. A
+  first commits the files staged before it, so the pass keeps its order.
+  Removals come before moves, so a directory the target does not hold can
+  still hold entries the pass moves out: it is removed after the directory
+  barrier made those moves durable, deepest first, and its parents are synced
+  before `synced` advances. One tracked again by then, or holding untracked
+  content, stays. So a directory that exists only because of a turn goes
+  with its undo, and one the target holds stays, empty or not. A
   pass that fails partway after its structural items rolls forward: `synced`
   becomes its target in memory (persisted only by the image saved after the
   owed barrier), and every file whose entry the pass left untouched (same

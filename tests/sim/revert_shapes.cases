@@ -1,0 +1,57 @@
+# Revert and rebuild shapes: one case per line.
+# fields: name | setup (tree before the turn) | turn ops | notes
+# ops: write P TEXT | write_bin P N | write_big P BYTES | mkdir P | rm P | rmdir P | rmtree P
+#      mv A B | chmod_x P | chmod_nx P | ln_s TARGET P | person P TEXT (an API write by a person, interleaved)
+# Exact means: the set of paths including every directory (empty ones too), each path's type
+# (file, dir, symlink), a file's bytes and exec bit, a symlink's target; mtimes are not compared;
+# no 0ndb internal names (.0ndb-*) and no collision copies (*~*) anywhere under the root.
+# Every case runs: turn; undo (pre-turn tree); redo (post-turn tree); switch away and back (post-turn
+# tree); then, separately, the undo with a crash at every disk op, and after recovery the tree is
+# either the pre-turn tree or the post-turn tree (never a mix), and a retried undo reaches pre-turn.
+# Text values: \n inside a value is a newline, and one is appended. Trailing person ops run after the turn ends.
+# The note may hold undo:P=TEXT (the file's text after the undo, - for absent) and offer:P (the undo offers base back).
+# Person rule: a line the turn changed that someone else has edited or deleted since stays as it is, with base
+# offered; every other line goes back; a file the turn created keeps only the lines someone else touched, and is
+# removed if they only deleted.
+# known:revert marks a case whose undo, redo or switch fails today and known:crash one that fails only when the
+# undo crashes; they run with SHAPES_ALL=1. A fix removes the mark.
+# Empty-directory cases first (coordinator ruling: directories that exist only because of a turn
+# go with its undo; pre-existing empty ones stay).
+mkdir_empty     | a.txt=x                 | mkdir e
+rmdir_empty     | a.txt=x e/=             | rmdir e
+move_new_dir    | a.txt=x                 | mkdir b; mv a.txt b/a.txt
+move_across     | a/x.txt=1 b/=           | mv a/x.txt b/x.txt
+rmtree          | d/f.txt=1 d/g/h.txt=2   | rmtree d
+dir_rename      | d/f.txt=1 d/g/h.txt=2   | mv d e
+nested_new_dir  | a.txt=x                 | mkdir b; mkdir b/c; write b/c/f.txt 1           | dirs that exist only because of the turn go with its undo
+keep_empty      | a.txt=x e/=             | write e/f.txt 1; rm e/f.txt                       | a pre-existing empty dir stays after undo and redo
+empty_dir_moved | e/=                     | mv e f                                            | an empty directory renamed
+create          | a.txt=x                 | write b.txt hello
+delete          | a.txt=x b.txt=y         | rm b.txt
+recreate        | a.txt=x                 | rm a.txt; write a.txt again
+recreate_other  | a.txt=x                 | rm a.txt; mkdir a.txt; write a.txt/in.txt z     | file replaced by a directory known:revert
+dir_to_file     | d/=  d/f.txt=x          | rmtree d; write d dfile                          | directory replaced by a file known:revert
+rename          | a.txt=x                 | mv a.txt b.txt
+case_rename     | a.txt=x                 | mv a.txt A.txt                                    | case-only
+binary          | a.txt=x                 | write_bin b.bin 4096                              | bytes 0..255 incl. NUL
+empty_file      | a.txt=x                 | write e.txt ""
+empty_to_text   | e.txt=""                | write e.txt now
+big_promote     | a.txt=x                 | write_big big.dat 300000                          | >256 KiB pack promotion
+big_1m          | a.txt=x                 | write_big big.dat 1200000                         | >1 MiB
+big_edit        | big.dat=1200000         | write_big big.dat 1200001                         | one byte appended
+exec_set        | s.sh=echo               | chmod_x s.sh
+exec_clear      | s.sh=echo+x             | chmod_nx s.sh
+exec_new        | a.txt=x                 | write s.sh echo; chmod_x s.sh
+symlink_new     | a.txt=x                 | ln_s a.txt l
+symlink_retarget| a.txt=x b.txt=y l->a.txt| rm l; ln_s b.txt l
+symlink_delete  | a.txt=x l->a.txt        | rm l | known:crash
+symlink_dangling| a.txt=x                 | ln_s missing.txt l
+person_between  | a.txt=x                 | write b.txt agent; person c.txt person; write b.txt agent2 | undo keeps c.txt
+person_same     | a.txt=x                 | write a.txt agent; person a.txt person-after      | undo:a.txt=person-after offer:a.txt known:revert
+person_changed  | a.txt=1\n2\n3       | write a.txt A\n2\n3; person a.txt B\n2\n3               | undo:a.txt=B\n2\n3 offer:a.txt known:revert
+person_adjacent | a.txt=1\n2\n3       | write a.txt A\n2\n3; person a.txt A\nP\n3               | undo:a.txt=1\nP\n3 known:revert
+person_far      | a.txt=1\n2\n3\n4\n5 | write a.txt A\n2\n3\n4\n5; person a.txt A\n2\n3\n4\nP   | undo:a.txt=1\n2\n3\n4\nP
+person_deleted  | a.txt=1\n2\n3       | write a.txt A\n2\n3; person a.txt 2\n3                  | undo:a.txt=2\n3 offer:a.txt known:revert
+person_new_edit | k.txt=x               | write n.txt A\nB\nC; person n.txt A\nP\nC               | undo:n.txt=P known:revert
+person_new_add  | k.txt=x               | write n.txt A\nB; person n.txt A\nP\nB                  | undo:n.txt=P known:revert
+person_new_del  | k.txt=x               | write n.txt A\nB\nC; person n.txt A\nC                  | undo:n.txt=-
