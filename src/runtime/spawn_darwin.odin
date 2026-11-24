@@ -73,23 +73,6 @@ _libproc_decide :: proc(data: rawptr, m: ^fs.Mount, w: ^observe.Write) -> (^fs.S
 			}
 			continue
 		}
-		if !w.window || len(calls) == 0 {
-			continue
-		}
-		k, ambiguous := observe.attribute_window(calls, w)
-		if k >= 0 && !ambiguous {
-			if s := _run_scope(run, m, idx[k]); s != nil {
-				r.stats.inexact += 1
-				return s, true
-			}
-			continue
-		}
-		if ambiguous {
-			if s := _run_scope(run, m, -1); s != nil {
-				r.stats.inexact += 1
-				return s, true
-			}
-		}
 	}
 	if w.exact {
 		if s := observe.scope_of(m.reg if m != nil else nil, w.lineage); s != nil && s.mount == m {
