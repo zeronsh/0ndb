@@ -1061,21 +1061,16 @@ ROOT_OWNED :: 7
 @(private)
 _owned_add :: proc(e: ^Engine, sp: ^Space, id: prim.Id, kind: Kind) {
 	k := _pending_key(sp.id, id)
-	v := [1]u8{u8(kind)}
 	if old, found, gerr := omap.db_get(&e.reg.db, ROOT_OWNED, k[:], context.temp_allocator); gerr == .None && found && len(old) > 0 && old[0] == u8(kind) {
 		return
 	}
-	t, terr := omap.txn_begin(&e.reg.db)
-	if terr != .None {
-		_reg_fail(e, _oerr(terr))
-		return
+	for o in e.reg.owned {
+		if o.key == k {
+			return
+		}
 	}
-	if omap.txn_put(t, ROOT_OWNED, k[:], v[:]) != .None {
-		omap.txn_abort(t)
-		_reg_fail(e, .Io)
-		return
-	}
-	_reg_commit(e, t)
+	append(&e.reg.owned, Owned_Pend{key = k, kind = kind, seq = 0})
+	_touch(e)
 }
 
 @(private)
