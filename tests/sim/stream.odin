@@ -327,7 +327,7 @@ check_streams :: proc(w: ^World) {
 			context = instance_context(&n.inst)
 			msg, merr := eng.convo_message(&n.e, o, convo.Position{msg = a.rid}, context.temp_allocator, ready)
 			if merr != .None || msg.redacted {
-				if a.drafted > 0 && merr != .None && merr != .Pending && !_stream_redacted(m, a.by, a.msg) {
+				if a.drafted > 0 && merr != .None && merr != .Pending {
 					world_fail(w, "draft: %s saw %d draft bytes of %s:%d, which has no durable message (%v)", n.name, a.drafted, id_short(a.by), a.msg, merr)
 				}
 				continue
@@ -360,7 +360,7 @@ check_streams :: proc(w: ^World) {
 			continue
 		}
 		op := m.ops[st.op]
-		if op.status == .Lost || _stream_redacted(m, st.msg.seg, st.msg.off) {
+		if op.status == .Lost {
 			continue
 		}
 		context = instance_context(&n.inst)
@@ -405,20 +405,6 @@ check_streams :: proc(w: ^World) {
 		}
 		node_after(n)
 	}
-}
-
-@(private = "file")
-_stream_redacted :: proc(m: ^Model, by: prim.Id, msg: i64) -> bool {
-	for op in m.ops {
-		if op.kind != .Redact_Msg || op.target < 0 || op.status == .Failed {
-			continue
-		}
-		t := m.ops[op.target]
-		if t.rid.seg == by && t.rid.off == msg {
-			return true
-		}
-	}
-	return false
 }
 
 @(private = "file")
