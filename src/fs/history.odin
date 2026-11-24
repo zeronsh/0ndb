@@ -74,18 +74,11 @@ History_Options :: struct {
 	random:        prim.Random,
 	hold:          Hold,
 	fault:         Persist_Fault,
-	redacted:      Redacted_Hook,
-}
-
-Redacted_Hook :: struct {
-	data: rawptr,
-	call: proc(data: rawptr, unreached: []odb.Unreached),
 }
 
 Persist_Fault :: struct {
 	data:   rawptr,
 	fail:   proc(data: rawptr) -> bool,
-	zeroed: proc(data: rawptr),
 }
 
 @(private)
