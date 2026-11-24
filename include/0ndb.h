@@ -120,7 +120,7 @@
  *                 22 runner_enrolled, 23 runner_anomaly, 24 approval_requested,
  *                 25 login_done, 26 login_failed, 27 lease_lapsed, 28 space_left,
  *                 29 line_switched, 30 replica_redacted, 31 rename_offered,
- *                 32 redact_unreached
+ *                 32 redact_unreached, 33 models_changed
  *   member_kind   0 device, 1 account, 2 recovery, 3 custodian, 4 pool,
  *                 5 runner, 6 guest, 7 directory
  *   member_role   0 owner, 1 admin, 2 member, 3 reader

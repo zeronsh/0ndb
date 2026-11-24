@@ -299,6 +299,7 @@ cmd_models :: proc(a: ^Args) -> int {
 	}
 	r := req_begin("models")
 	req_bool(&r, "refresh", flag_bool(a, "refresh"))
+	req_bool(&r, "wait", true)
 	v := must(s, req_end(&r), "cannot list models")
 	if a.json {
 		print_json(v)
