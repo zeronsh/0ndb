@@ -655,8 +655,8 @@ _ur_case :: proc(w: ^World, redo: bool, k: u64, arena: ^virtual.Arena) -> (pre, 
 		} else {
 			_ur_check_undo(c, p, at, post, "reference")
 			_ur_leaf_check(c, p, post, "reference")
-			if c.hooks.held == 0 || c.hooks.released == 0 || c.hooks.rewound == 0 {
-				world_fail(w, "undo reference: the runtime hooks ran hold %d, rewind %d, release %d times", c.hooks.held, c.hooks.rewound, c.hooks.released)
+			if c.hooks.held != 0 || c.hooks.released != 0 || c.hooks.rewound == 0 {
+				world_fail(w, "undo reference: with no run in the tree the runtime hooks ran hold %d, rewind %d, release %d times, not rewind alone", c.hooks.held, c.hooks.rewound, c.hooks.released)
 			}
 		}
 	}

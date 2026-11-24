@@ -8,6 +8,7 @@ import "core:slice"
 import "core:strings"
 import "core:testing"
 import "../../src/convo"
+import "../../src/crdt"
 import eng "../../src/engine"
 import "../../src/fs"
 import "../../src/obj"
@@ -401,6 +402,51 @@ _br_switch :: proc(c: ^Br_Ctx, to: obj.Rid) -> eng.Error {
 }
 
 @(private = "file")
+Br_Answer :: struct {
+	set: bool,
+	ops: u64,
+	n:   ^Node,
+}
+
+@(private = "file")
+_br_answer: Br_Answer
+
+@(private = "file")
+_br_watch :: proc(c: ^Br_Ctx) {
+	n := c.n
+	context = instance_context(&n.inst)
+	defer node_after(n)
+	_br_answer = Br_Answer{n = n}
+	list, lerr := eng.convo_undos(&n.e, c.conv, context.temp_allocator)
+	if lerr != .None || len(list) == 0 {
+		return
+	}
+	ready := eng.Ready {
+		call = proc(data: rawptr, e: ^eng.Engine, err: eng.Error) {
+			if err == .None && _br_answer.n != nil {
+				_br_answer.set = true
+				_br_answer.ops = _br_answer.n.disk.stats.ops
+			}
+		},
+	}
+	if eng.convo_move_on_disk(&n.e, c.conv, list[len(list) - 1].id, ready) == .None {
+		_br_answer.set = true
+		_br_answer.ops = n.disk.stats.ops
+	}
+}
+
+@(private = "file")
+_br_person_ops :: proc(c: ^Br_Ctx) -> u64 {
+	m := _br_mount(c)
+	if m == nil || m.history == nil {
+		return 0
+	}
+	context = instance_context(&c.n.inst)
+	defer node_after(c.n)
+	return crdt.graph_known(&m.history.g, m.actor)
+}
+
+@(private = "file")
 _br_resume :: proc(c: ^Br_Ctx, to: obj.Rid, moves: int) -> eng.Error {
 	n := c.n
 	context = instance_context(&n.inst)
@@ -427,7 +473,7 @@ _br_resume :: proc(c: ^Br_Ctx, to: obj.Rid, moves: int) -> eng.Error {
 }
 
 @(private = "file")
-_br_case :: proc(w: ^World, crash_switch: int, k: u64, arena: ^virtual.Arena, want: ^[BR_SWITCHES]map[string]string, record: bool) -> (crashed: bool, ok: bool) {
+_br_case :: proc(w: ^World, crash_switch: int, k: u64, arena: ^virtual.Arena, want: ^[BR_SWITCHES]map[string]string, record: bool) -> (crashed: bool, answered: bool, ok: bool) {
 	if virtual.arena_init_growing(arena, 1 << 20) != nil {
 		return
 	}
@@ -460,15 +506,18 @@ _br_case :: proc(w: ^World, crash_switch: int, k: u64, arena: ^virtual.Arena, wa
 			run_until(w, w.now + 2_000_000_000, true)
 		}
 		crashes := w.stats.crashes
+		person := _br_person_ops(c)
 		if s == crash_switch && k > 0 {
 			n.disk.crash_at = n.disk.stats.ops + k
 		}
 		moves += 1
 		_br_switch(c, to)
+		_br_watch(c)
 		run_until(w, w.now + 20_000_000_000, true)
 		n.disk.crash_at = 0
 		if w.stats.crashes > crashes {
 			crashed = true
+			answered = _br_answer.set
 			run_until(w, w.now + 20_000_000_000, true)
 			if !n.alive {
 				world_fail(w, "branch: node did not come back")
@@ -478,6 +527,9 @@ _br_case :: proc(w: ^World, crash_switch: int, k: u64, arena: ^virtual.Arena, wa
 				world_fail(w, "branch: resume after the crash: %v", rerr)
 			}
 			run_until(w, w.now + 10_000_000_000, true)
+		}
+		if after := _br_person_ops(c); after != person {
+			world_fail(w, "branch: after switch %d (crash at disk op %d of switch %d, answered %v) the mount wrote %d ops of its own: the materialized disk was ingested as a person's edit", s, k, crash_switch, _br_answer.set, after - person)
 		}
 		st := _br_state(c) or_return
 		if record {
@@ -520,7 +572,7 @@ _br_case :: proc(w: ^World, crash_switch: int, k: u64, arena: ^virtual.Arena, wa
 			}
 		}
 	}
-	return crashed, true
+	return crashed, answered, true
 }
 
 @(private = "file")
@@ -561,7 +613,7 @@ branch_crash :: proc(t: ^testing.T) {
 	{
 		rw := _br_world(seed)
 		ra: virtual.Arena
-		_, rok := _br_case(rw, -1, 0, &ra, &want, true)
+		_, _, rok := _br_case(rw, -1, 0, &ra, &want, true)
 		if rok {
 			_br_expect(rw, &want)
 		}
@@ -576,6 +628,7 @@ branch_crash :: proc(t: ^testing.T) {
 		virtual.arena_destroy(&ra)
 	}
 	points := 0
+	after_answer := 0
 	only_s := int(env_u64("BR_CRASH_SWITCH", 0)) - 1
 	only_k := env_u64("BR_CRASH_K", 0)
 	if bad == 0 {
@@ -589,7 +642,10 @@ branch_crash :: proc(t: ^testing.T) {
 				}
 				w := _br_world(seed)
 				ca: virtual.Arena
-				crashed, cok := _br_case(w, s, k, &ca, &want, false)
+				crashed, answered, cok := _br_case(w, s, k, &ca, &want, false)
+				if crashed && answered {
+					after_answer += 1
+				}
 				if !cok && len(w.failures) == 0 {
 					world_fail(w, "the case did not run after a crash at disk op %d of switch %d", k, s)
 				}
@@ -618,7 +674,11 @@ branch_crash :: proc(t: ^testing.T) {
 		}
 		delete(want[s])
 	}
-	fmt.eprintf("branch_crash: %d crash points over %d switches, %d failed\n", points, BR_SWITCHES, bad)
+	fmt.eprintf("branch_crash: %d crash points over %d switches, %d after the switch answered, %d failed\n", points, BR_SWITCHES, after_answer, bad)
+	if only_s < 0 && only_k == 0 && bad == 0 && after_answer == 0 {
+		bad += 1
+		fmt.eprintf("branch_crash: no crash point fell between a switch's answer and its flush\n")
+	}
 	testing.expect(t, bad == 0, fmt.tprintf("branch_crash: %d failures", bad))
 }
 

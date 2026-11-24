@@ -110,6 +110,10 @@ _mount_materialize :: proc(m: ^Mount) -> (done: bool, err: Error) {
 materialize_to :: proc(m: ^Mount, target: Version, merge: bool) -> Error {
 	attr_begin(m)
 	defer attr_end(m)
+	defer if m.has_placed {
+		m.has_placed = false
+		clear(&m.placed)
+	}
 	h := m.history
 	tl := make([dynamic]crdt.Lv, context.temp_allocator)
 	sl := make([dynamic]crdt.Lv, context.temp_allocator)
@@ -315,6 +319,12 @@ materialize_to :: proc(m: ^Mount, target: Version, merge: bool) -> Error {
 		mat_owe(m, &ms)
 		mat_roll_forward(m, items[:], sl[:], target)
 		return err
+	}
+	if !ms.raced && !m.restoring && !merge {
+		clear(&m.placed)
+		append(&m.placed, ..target)
+		m.has_placed = true
+		_mat_fire(m)
 	}
 	if berr := mat_barrier(m, &ms); berr != .None {
 		mat_owe(m, &ms)

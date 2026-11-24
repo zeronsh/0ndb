@@ -108,7 +108,7 @@ _cu_on_disk :: proc(e: ^Engine, o: Object, move: prim.Id) -> (done: bool, err: E
 			if m.history == nil {
 				continue
 			}
-			has, herr := fs.history_version_has(m.history, fs.mount_synced(m), r.revert)
+			has, herr := fs.history_version_has(m.history, fs.mount_placed(m), r.revert)
 			if herr == .Not_Found {
 				return false, .None
 			} else if herr != .None {
@@ -274,6 +274,22 @@ convo_left :: proc(e: ^Engine, o: Object, allocator := context.allocator) -> (ou
 		}
 	}
 	return res[:], .None
+}
+
+convo_move_pending :: proc(e: ^Engine, o: Object) -> bool {
+	context = context_for(e)
+	now := hlc_now(e)
+	floor := prim.hlc_make(max(prim.hlc_ms(now) - MOVE_SETTLE_WINDOW_MS, 0), 0)
+	list, err := convo_undos(e, o, context.temp_allocator, floor)
+	if err != .None {
+		return false
+	}
+	for u in list {
+		if u.phase != .Released {
+			return true
+		}
+	}
+	return false
 }
 
 convo_regenerating :: proc(e: ^Engine, o: Object) -> (user: Rid, err: Error) {
@@ -451,7 +467,7 @@ convo_undos :: proc(e: ^Engine, o: Object, allocator := context.allocator, floor
 
 @(private)
 _cu_drive_new :: proc(e: ^Engine, o: Object, move: prim.Id) -> Error {
-	err := convo_undo_drive(e, o, move)
+	err := _cu_drive(e, o, move, true)
 	if err == .Pending && e.undo_hooks.pending != nil {
 		e.undo_hooks.pending(e.undo_hooks.data, e, o, move)
 	}
@@ -459,6 +475,11 @@ _cu_drive_new :: proc(e: ^Engine, o: Object, move: prim.Id) -> Error {
 }
 
 convo_undo_drive :: proc(e: ^Engine, o: Object, undo: prim.Id) -> Error {
+	return _cu_drive(e, o, undo, false)
+}
+
+@(private)
+_cu_drive :: proc(e: ^Engine, o: Object, undo: prim.Id, fresh: bool) -> Error {
 	context = context_for(e)
 	st, found := _cu_undo_state(e, o, undo) or_return
 	if !found {
@@ -473,7 +494,7 @@ convo_undo_drive :: proc(e: ^Engine, o: Object, undo: prim.Id) -> Error {
 		if convs == nil {
 			convs = _cu_move_tree(e, o, &st) or_return
 		}
-		_cu_undo_step(e, o, &st, convs, &idle) or_return
+		_cu_undo_step(e, o, &st, convs, &idle, fresh) or_return
 	}
 	return .None
 }
@@ -585,7 +606,7 @@ _cu_descends :: proc(e: ^Engine, o: Object, at, of: Rid) -> (yes: bool, err: Err
 }
 
 @(private)
-_cu_undo_step :: proc(e: ^Engine, o: Object, st: ^convo.Undo_State, convs: []Undo_Conv, idle: ^bool) -> Error {
+_cu_undo_step :: proc(e: ^Engine, o: Object, st: ^convo.Undo_State, convs: []Undo_Conv, idle: ^bool, fresh: bool) -> Error {
 	visible := make([dynamic]Object, context.temp_allocator)
 	for c in convs {
 		if !c.hidden {
@@ -595,15 +616,18 @@ _cu_undo_step :: proc(e: ^Engine, o: Object, st: ^convo.Undo_State, convs: []Und
 	hk := e.undo_hooks
 	switch st.phase {
 	case .Staged:
-		if hk.hold != nil {
-			hk.hold(hk.data, e, visible[:], st.id) or_return
-		}
-		idle^ = true
+		idle^ = fresh
 		for c in convs {
+			if !idle^ {
+				break
+			}
 			cs := convo_status(e, c.o) or_return
 			if cs.running {
 				idle^ = false
 			}
+		}
+		if !idle^ && hk.hold != nil {
+			hk.hold(hk.data, e, visible[:], st.id) or_return
 		}
 		return _cu_advance(e, o, st, .Held, nil)
 	case .Held:
@@ -643,7 +667,7 @@ _cu_undo_step :: proc(e: ^Engine, o: Object, st: ^convo.Undo_State, convs: []Und
 		}
 		return _cu_advance(e, o, st, .Rewound, nil)
 	case .Rewound:
-		if hk.release != nil {
+		if !idle^ && hk.release != nil {
 			hk.release(hk.data, e, visible[:], st.id) or_return
 		}
 		return _cu_advance(e, o, st, .Released, nil)
