@@ -1317,7 +1317,7 @@ _bk_run :: proc(w: ^World, arena: ^virtual.Arena, k: Bk_Case, api, between: bool
 			}
 			run_until(w, w.now + 2_000_000_000, true)
 		}
-		{
+		k1: {
 			context = instance_context(&n.inst)
 			_, err = eng.convo_redo(&n.e, c.conv, undo)
 			node_after(n)
