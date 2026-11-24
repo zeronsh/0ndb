@@ -43,7 +43,7 @@ history_record_oids :: proc(h: ^History, stream: prim.Id, body: []u8, out: ^[dyn
 			if prim.reader_ok(&r) {
 				content_ref_add(out, o, n, true, size)
 			}
-		case .Insert, .Delete, .Delete_Back, .Insert_Copy:
+		case .Insert, .Delete, .Delete_Back, .Insert_Copy, .Insert_Carry:
 		}
 	}
 	return .None

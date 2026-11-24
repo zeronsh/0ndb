@@ -455,7 +455,7 @@ heads_within :: proc(g: ^Graph, heads: []Lv, ps: []Lv) -> bool {
 @(private)
 effect :: proc "contextless" (kind: Op_Kind, pos: i64, n: i64, size: i64) -> (at: i64, s: i64, cnt: i64) {
 	switch kind {
-	case .Insert, .Insert_Ref, .Insert_Copy:
+	case .Insert, .Insert_Ref, .Insert_Copy, .Insert_Carry:
 		return clamp(pos, 0, size), 0, n
 	case .Delete:
 		if pos < 0 || pos >= size {
@@ -572,7 +572,7 @@ walk_piece :: proc(m: ^Merge, tr: ^Tracker, heads: ^[dynamic]Lv, p: Piece, side:
 			tr_delete(tr, at, cnt, p.lv, false, 0, i64(side), out)
 		case .Delete_Back:
 			tr_delete(tr, at, cnt, 0, true, p.lv + Lv(s + cnt - 1), i64(side), out)
-		case .Opaque:
+		case .Opaque, .Insert_Carry:
 		}
 	}
 	last := p.lv + p.len - 1
@@ -900,7 +900,7 @@ text_length_at :: proc(t: ^Text, g: ^Graph, log: ^Text_Log, v: []Lv) -> (int, Er
 @(private)
 run_valid :: proc "contextless" (r: Op_Run, size: int) -> int {
 	switch r.kind {
-	case .Insert, .Insert_Ref, .Insert_Copy:
+	case .Insert, .Insert_Ref, .Insert_Copy, .Insert_Carry:
 		return r.len if r.pos >= 0 && r.pos <= size else 0
 	case .Delete:
 		return clamp(size - r.pos, 0, r.len) if r.pos >= 0 else 0

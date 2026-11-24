@@ -177,9 +177,13 @@ log_find :: proc "contextless" (log: ^Text_Log, lv: Lv) -> int {
 	return lo
 }
 
-log_push :: proc(log: ^Text_Log, g: ^Graph, lv: Lv, run: Op_Run) -> Error {
-	if run.kind == .Opaque || run.len <= 0 || lv < log.floor {
+log_push :: proc(log: ^Text_Log, g: ^Graph, lv: Lv, carried: Op_Run) -> Error {
+	if carried.kind == .Opaque || carried.len <= 0 || lv < log.floor {
 		return .None
+	}
+	run := carried
+	if run.kind == .Insert_Carry {
+		run.kind = .Insert
 	}
 	n := len(log.entries)
 	if n > 0 && lv < log.entries[n - 1].lv + log.entries[n - 1].len {
@@ -220,7 +224,7 @@ log_push :: proc(log: ^Text_Log, g: ^Graph, lv: Lv, run: Op_Run) -> Error {
 					last.len += run.len
 					return .None
 				}
-			case .Opaque, .Insert_Copy:
+			case .Opaque, .Insert_Copy, .Insert_Carry:
 			}
 		}
 	}
@@ -382,6 +386,10 @@ run_tail :: proc "contextless" (op: Op_Run, k: int) -> Op_Run {
 	case .Insert_Copy:
 		r.pos = op.pos + k
 		r.src.seq = op.src.seq + u64(k)
+	case .Insert_Carry:
+		r.pos = op.pos + k
+		r.src.seq = op.src.seq + u64(k)
+		r.content = op.content[k:]
 	case .Delete:
 	case .Delete_Back:
 		r.pos = op.pos - k
@@ -394,7 +402,7 @@ run_tail :: proc "contextless" (op: Op_Run, k: int) -> Op_Run {
 run_head :: proc "contextless" (op: Op_Run, k: int) -> Op_Run {
 	r := op
 	r.len = k
-	if op.kind == .Insert {
+	if op.kind == .Insert || op.kind == .Insert_Carry {
 		r.content = op.content[:k]
 	}
 	return r
@@ -499,7 +507,7 @@ log_read_lv :: proc(log: ^Text_Log, g: ^Graph, lv: Lv, dst: []u8, authors: ^[dyn
 			} else if src.read == nil || !src.read(src.data, ref.oid, ref.offset + k, out) {
 				return done
 			}
-		case .Delete, .Delete_Back, .Opaque:
+		case .Delete, .Delete_Back, .Opaque, .Insert_Carry:
 		}
 		if e.kind == .Insert_Copy {
 			off := 0

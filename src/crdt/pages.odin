@@ -692,7 +692,7 @@ copy_first :: proc "contextless" (g: ^Graph, src: u32) -> int {
 }
 
 @(private)
-copy_register :: proc(g: ^Graph, c: Copy_Rec) {
+copy_register :: proc(g: ^Graph, c: Copy_Rec, added: ^[dynamic]Op_Span = nil) {
 	c_ := g.copies[:]
 	lo, hi := 0, len(c_)
 	for lo < hi {
@@ -712,7 +712,7 @@ copy_register :: proc(g: ^Graph, c: Copy_Rec) {
 	defer delete(parts)
 	append(&parts, ..g.red[:])
 	for r in parts {
-		redact_closure(g, c.own, c.own_seq + (r.seq - c.src_seq), r.len, nil)
+		redact_closure(g, c.own, c.own_seq + (r.seq - c.src_seq), r.len, added)
 	}
 }
 

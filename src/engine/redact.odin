@@ -5,6 +5,7 @@ import "core:fmt"
 import "../convo"
 import "../crdt"
 import "../fs"
+import "../fstree"
 import "../journal"
 import omap "../map"
 import "../obj"
@@ -69,6 +70,58 @@ text_redact :: proc(e: ^Engine, o: Object, pos: int, n: int) -> Error {
 	_object_changed(e, o.space, o.id, .Redacted)
 	_index_purge_object(e, h)
 	_index_item_add(e, o.space, o.id, .Text)
+	return .None
+}
+
+tree_redact :: proc(e: ^Engine, o: Object, path: string, from: int, to: int, line := "") -> Error {
+	context = context_for(e)
+	if from < 0 || to <= from {
+		return .Invalid
+	}
+	h := _handle_get(e, o, .File_Tree) or_return
+	_handle_create_writer(h) or_return
+	_hist_ready(e, h) or_return
+	_hist_catch_up(e, h)
+	at := _tree_at(e, h, line, nil) or_return
+	id, ok, lerr := fstree.lookup(&at.snap, path)
+	if lerr != nil {
+		return .Corrupt
+	}
+	if !ok {
+		return .Not_Found
+	}
+	spans: []crdt.Author_Span
+	if at.head {
+		f := _hist_file(e, h, id) or_return
+		spans = crdt.text_spans(&f.text, &h.hist.g, context.temp_allocator)
+	} else {
+		view := _ferr2(fs.history_view_open(h.hist, id, at.version)) or_return
+		defer fs.history_view_close(h.hist, view)
+		spans = crdt.text_spans(&view.text, &h.hist.g, context.temp_allocator)
+	}
+	ops := make([dynamic]crdt.Op_Span, context.temp_allocator)
+	pos := 0
+	for s in spans {
+		lo := max(pos, from)
+		hi := min(pos + s.len, to)
+		if lo < hi && !s.redacted {
+			append(&ops, crdt.Op_Span{id = crdt.Op_Id{s.id.actor, s.id.seq + u64(lo - pos)}, len = hi - lo})
+		}
+		pos += s.len
+	}
+	if len(ops) == 0 {
+		return .None
+	}
+	ctx := Text_Plan{e = e, h = h}
+	res, rerr := fs.history_redact(h.hist, ops[:], context.temp_allocator, _text_plan(&ctx))
+	for r in res.ranges {
+		_own_redacted(e, h, r.from, r.to)
+	}
+	_ferr(rerr) or_return
+	_handle_mark(h)
+	_object_changed(e, o.space, o.id, .Redacted)
+	_index_purge_object(e, h)
+	_index_item_add(e, o.space, o.id, .File_Tree)
 	return .None
 }
 
@@ -1256,6 +1309,7 @@ _hist_admit_redacted :: proc(e: ^Engine, h: ^Handle, s: ^Seg, off: i64) -> fs.Er
 	if _, err := fs.history_admit(h.hist, s.device, off, synth); err == .Not_Found {
 		return .Not_Found
 	}
+	_hist_redact_own(e, h, false)
 	return .None
 }
 

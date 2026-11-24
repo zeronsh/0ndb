@@ -24,6 +24,50 @@ Builder :: struct {
 	git:     bool,
 	local:   bool,
 	scope:   []u8,
+	carry:   ^Carry_Sink,
+	shift:   map[fstree.Inode_Id]int,
+	parents: []crdt.Lv,
+}
+
+@(private)
+Carried :: struct {
+	inode:   fstree.Inode_Id,
+	pos:     int,
+	content: []u8,
+	src:     crdt.Op_Id,
+	base:    prim.Id,
+}
+
+@(private)
+Carry_Sink :: struct {
+	runs:      [dynamic]Carried,
+	allocator: runtime.Allocator,
+}
+
+@(private)
+bpos :: proc(b: ^Builder, inode: fstree.Inode_Id, pos: int) -> int {
+	if b.shift == nil {
+		return pos
+	}
+	return pos - b.shift[inode]
+}
+
+@(private)
+builder_in_line :: proc(b: ^Builder, src: crdt.Op_Id, n: int) -> bool {
+	lv, ok := crdt.graph_lv(&b.h.g, crdt.Op_Id{src.actor, src.seq + u64(n) - 1})
+	return ok && crdt.graph_contains(&b.h.g, b.parents, lv)
+}
+
+@(private)
+builder_defer :: proc(b: ^Builder, inode: fstree.Inode_Id, pos: int, text: []u8, src: crdt.Op_Id, author: prim.Id) {
+	s := b.carry
+	c := make([]u8, len(text), s.allocator)
+	copy(c, text)
+	append(&s.runs, Carried{inode = inode, pos = pos, content = c, src = src, base = history_line_base(b.h, author)})
+	if b.shift == nil {
+		b.shift = make(map[fstree.Inode_Id]int, context.temp_allocator)
+	}
+	b.shift[inode] += len(text)
 }
 
 @(private)
@@ -82,7 +126,7 @@ builder_insert :: proc(b: ^Builder, inode: fstree.Inode_Id, pos: int, data: []u8
 	}
 	c := make([]u8, len(data), context.temp_allocator)
 	copy(c, data)
-	append(&b.ops, crdt.Op_Run{target = target_id(b, inode), kind = .Insert, pos = pos, len = len(data), content = c})
+	append(&b.ops, crdt.Op_Run{target = target_id(b, inode), kind = .Insert, pos = bpos(b, inode, pos), len = len(data), content = c})
 	b.n += len(data)
 }
 
@@ -91,7 +135,7 @@ builder_insert_ref :: proc(b: ^Builder, inode: fstree.Inode_Id, pos: int, oid: o
 	ref: crdt.Content_Ref
 	ref.oid = crdt_oid(oid, b.h.db.format if b.h.db != nil else .Sha1)
 	first = crdt.Op_Id{b.actor, b.seq0 + u64(b.n)}
-	append(&b.ops, crdt.Op_Run{target = target_id(b, inode), kind = .Insert_Ref, pos = pos, len = n, ref = ref})
+	append(&b.ops, crdt.Op_Run{target = target_id(b, inode), kind = .Insert_Ref, pos = bpos(b, inode, pos), len = n, ref = ref})
 	b.n += n
 	last = crdt.Op_Id{b.actor, b.seq0 + u64(b.n) - 1}
 	return
@@ -102,14 +146,14 @@ builder_copy :: proc(b: ^Builder, inode: fstree.Inode_Id, pos: int, src: crdt.Op
 	if n <= 0 {
 		return
 	}
-	r := crdt.Op_Run{target = target_id(b, inode), kind = .Insert_Copy, pos = pos, len = n}
+	r := crdt.Op_Run{target = target_id(b, inode), kind = .Insert_Copy, pos = bpos(b, inode, pos), len = n}
 	r.src = src
 	append(&b.ops, r)
 	b.n += n
 }
 
 @(private)
-builder_copy_spans :: proc(b: ^Builder, inode: fstree.Inode_Id, pos: int, spans: []crdt.Author_Span, start: int, n: int) {
+builder_copy_spans :: proc(b: ^Builder, inode: fstree.Inode_Id, pos: int, spans: []crdt.Author_Span, start: int, n: int, text: []u8) {
 	from := start
 	at := 0
 	p := pos
@@ -125,7 +169,15 @@ builder_copy_spans :: proc(b: ^Builder, inode: fstree.Inode_Id, pos: int, spans:
 		}
 		k := max(from - at, 0)
 		take := min(s.len - k, left)
-		builder_copy(b, inode, p, crdt.Op_Id{s.op.actor, s.op.seq + u64(k)}, take)
+		src := crdt.Op_Id{s.op.actor, s.op.seq + u64(k)}
+		piece := text[p - pos:][:take]
+		if builder_in_line(b, src, take) {
+			builder_copy(b, inode, p, src, take)
+		} else if b.carry == nil || s.redacted {
+			builder_insert(b, inode, p, piece)
+		} else {
+			builder_defer(b, inode, p, piece, src, s.id.actor)
+		}
 		p += take
 		left -= take
 		from += take
@@ -147,7 +199,7 @@ builder_delete :: proc(b: ^Builder, inode: fstree.Inode_Id, pos: int, n: int) {
 	if n <= 0 {
 		return
 	}
-	append(&b.ops, crdt.Op_Run{target = target_id(b, inode), kind = .Delete, pos = pos, len = n})
+	append(&b.ops, crdt.Op_Run{target = target_id(b, inode), kind = .Delete, pos = bpos(b, inode, pos), len = n})
 	b.n += n
 }
 
@@ -1306,6 +1358,19 @@ commit_bounded :: proc(p: ^Pass, actor: prim.Id, indices: []int, marker: []u8 = 
 @(private)
 commit_group :: proc(p: ^Pass, b: ^Builder, indices: []int) -> Error {
 	m := p.m
+	sink := Carry_Sink{runs = make([dynamic]Carried, context.temp_allocator), allocator = context.temp_allocator}
+	if m.history != nil {
+		lvs := make([dynamic]crdt.Lv, context.temp_allocator)
+		if crdt.graph_version_lvs(&m.history.g, m.synced[:], &lvs) != .None {
+			return .Corrupt
+		}
+		b.parents = lvs[:]
+		b.carry = &sink
+	}
+	defer {
+		b.carry = nil
+		b.shift = nil
+	}
 	shadow_txn_begin(&m.shadow)
 	err: Error
 	for i in indices {
@@ -1314,6 +1379,9 @@ commit_group :: proc(p: ^Pass, b: ^Builder, indices: []int) -> Error {
 		}
 	}
 	if err == .None {
+		if len(sink.runs) > 0 {
+			m.hold_line = true
+		}
 		err = builder_commit(m, b)
 	}
 	if err != .None && err != .Reloading {
@@ -1321,7 +1389,132 @@ commit_group :: proc(p: ^Pass, b: ^Builder, indices: []int) -> Error {
 		return err
 	}
 	shadow_txn_end(&m.shadow)
+	if len(sink.runs) == 0 {
+		return err
+	}
+	if err == .None {
+		err = carry_flush(m, &sink)
+	}
+	if err != .None {
+		carry_owe(m, &sink)
+	}
 	return err
+}
+
+@(private)
+carry_flush :: proc(m: ^Mount, s: ^Carry_Sink) -> Error {
+	h := m.history
+	slice.sort_by(s.runs[:], proc(a, b: Carried) -> bool {
+		if a.inode != b.inode {
+			return a.inode.actor < b.inode.actor || a.inode.actor == b.inode.actor && a.inode.seq < b.inode.seq
+		}
+		return a.pos < b.pos
+	})
+	bases := make([dynamic]prim.Id, context.temp_allocator)
+	for r in s.runs {
+		if !slice.contains(bases[:], r.base) {
+			append(&bases, r.base)
+		}
+	}
+	slice.sort_by(bases[:], proc(a, b: prim.Id) -> bool {
+		x, y := a, b
+		return string(x[:]) < string(y[:])
+	})
+	done := make([]bool, len(s.runs), context.temp_allocator)
+	for base in bases {
+		b: Builder
+		builder_init(&b, h, scope_line_actor(m, base))
+		for r, i in s.runs {
+			if r.base != base {
+				continue
+			}
+			pos := r.pos
+			for q, j in s.runs {
+				if !done[j] && j != i && q.inode == r.inode && q.pos < r.pos {
+					pos -= len(q.content)
+				}
+			}
+			op := crdt.Op_Run{target = target_id(&b, r.inode), kind = .Insert_Carry, pos = pos, len = len(r.content), content = r.content}
+			op.src = r.src
+			append(&b.ops, op)
+			b.n += len(r.content)
+			done[i] = true
+		}
+		builder_commit(m, &b) or_return
+	}
+	return .None
+}
+
+@(private)
+carry_owe :: proc(m: ^Mount, s: ^Carry_Sink) {
+	for r in s.runs {
+		path, e, found, err := shadow_by_inode(&m.shadow, r.inode, context.temp_allocator)
+		if err != .None || !found {
+			continue
+		}
+		e.stat = {}
+		shadow_put(&m.shadow, path, e)
+		mount_mark(m, path)
+	}
+}
+
+@(private)
+copy_map_of :: proc(text: []u8, spans: []crdt.Author_Span, data: []u8) -> ^Copy_Map {
+	la, aerr := textdiff.split_lines(text, context.temp_allocator)
+	lb, berr := textdiff.split_lines(data, context.temp_allocator)
+	if aerr != nil || berr != nil {
+		return nil
+	}
+	hunks, herr := textdiff.diff_lines(la, lb, textdiff.DEFAULT_DIFF, context.temp_allocator)
+	if herr != nil {
+		return nil
+	}
+	cm := new(Copy_Map, context.temp_allocator)
+	cm.data = data
+	cm.spans = spans
+	cm.src = make([]int, len(data), context.temp_allocator)
+	for &x in cm.src {
+		x = -1
+	}
+	same :: proc(cm: ^Copy_Map, la, lb: textdiff.Lines, a0, a1, b0: int) {
+		ao := int(la.offs[a0])
+		bo := int(lb.offs[b0])
+		for k in 0 ..< int(la.offs[a1]) - ao {
+			cm.src[bo + k] = ao + k
+		}
+	}
+	ai, bi := 0, 0
+	for hk in hunks {
+		same(cm, la, lb, ai, int(hk.a_start), bi)
+		ai = int(hk.a_start + hk.a_len)
+		bi = int(hk.b_start + hk.b_len)
+	}
+	same(cm, la, lb, ai, len(la.offs) - 1, bi)
+	return cm
+}
+
+@(private)
+carry_begin :: proc(m: ^Mount, path: string, data: []u8) -> Error {
+	h := m.history
+	if h == nil || len(m.carry_from) == 0 || len(data) == 0 || m.copy != nil {
+		return .None
+	}
+	lvs := make([dynamic]crdt.Lv, context.temp_allocator)
+	if crdt.graph_version_lvs(&h.g, m.carry_from[:], &lvs) != .None {
+		return .None
+	}
+	snap := version_snapshot(h, lvs[:]) or_return
+	defer fstree.snapshot_destroy(&snap)
+	ino, found, lerr := fstree.lookup(&snap, path)
+	if lerr != nil || !found {
+		return .None
+	}
+	text, spans, terr := history_text_spans_at(h, ino, lvs[:], context.temp_allocator)
+	if terr != .None || len(text) == 0 {
+		return .None
+	}
+	m.copy = copy_map_of(text, spans, data)
+	return .None
 }
 
 @(private)
@@ -1661,6 +1854,9 @@ mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> (err: Error) {
 		m.hold_line = false
 		set_line(m) or_return
 	}
+	if len(m.carry_from) > 0 && p.full && len(p.young) == 0 && len(p.holding) == 0 && len(p.held) == 0 {
+		clear(&m.carry_from)
+	}
 	for y in p.young {
 		if v, ok := &m.dirty[y]; ok {
 			v^ = p.scope_of[y]
@@ -1731,6 +1927,7 @@ line_follow :: proc(m: ^Mount, key: string) -> Error {
 	h := m.history
 	v, found := history_line(h, key, context.temp_allocator) or_return
 	if !found || len(v) == 0 {
+		clear(&m.carry_from)
 		history_set_line(h, key, m.synced[:]) or_return
 	} else {
 		line_retarget(m, v) or_return
@@ -1748,7 +1945,9 @@ line_retarget :: proc(m: ^Mount, target: Version) -> Error {
 	if crdt.graph_version_lvs(&h.g, m.synced[:], &sl) != .None || crdt.graph_version_lvs(&h.g, target, &tl) != .None {
 		return .Corrupt
 	}
+	clear(&m.carry_from)
 	if !crdt.frontier_eq(sl[:], tl[:]) {
+		append(&m.carry_from, ..m.synced[:])
 		only_a := make([dynamic]crdt.Lv_Span, context.temp_allocator)
 		only_b := make([dynamic]crdt.Lv_Span, context.temp_allocator)
 		crdt.graph_diff(&h.g, sl[:], tl[:], &only_a, &only_b)
@@ -1951,11 +2150,7 @@ collect_alias_sources :: proc(m: ^Mount, p: ^Pass) {
 			}
 		}
 	}
-	sl := make([dynamic]crdt.Lv, context.temp_allocator)
-	if crdt.graph_version_lvs(&h.g, m.synced[:], &sl) != .None {
-		return
-	}
-	outer: for c in p.alias_commits {
+	for c in p.alias_commits {
 		key := strings.concatenate({"cv:", c}, context.temp_allocator)
 		data, found, err := kv_get(&h.kv, transmute([]u8)key, context.temp_allocator)
 		if err != .None || !found {
@@ -1968,11 +2163,6 @@ collect_alias_sources :: proc(m: ^Mount, p: ^Pass) {
 		al := make([dynamic]crdt.Lv, context.temp_allocator)
 		if crdt.graph_version_lvs(&h.g, v, &al) != .None {
 			continue
-		}
-		for lv in al {
-			if !crdt.graph_contains(&h.g, sl[:], lv) {
-				continue outer
-			}
 		}
 		append(&m.alias, v)
 	}
@@ -3100,8 +3290,14 @@ emit_create :: proc(p: ^Pass, b: ^Builder, c: ^Change, parent: fstree.Inode_Id) 
 			store_blob(m, data) or_return
 		}
 		inode := builder_tree(b, fstree.Op_Create{parent = parent, name = name, kind = .File, flags = flags})
+		if !binary {
+			carry_begin(m, c.path, data) or_return
+		}
+		defer m.copy = nil
 		if binary {
 			builder_content(b, inode, oid, blob_size(m, data, oid, c.stat.size))
+		} else if m.copy != nil {
+			emit_text_edits(m, b, inode, c.path, nil, data) or_return
 		} else if len(m.alias) > 0 && len(data) >= MOVE_MIN {
 			emit_text_edits(m, b, inode, c.path, nil, data) or_return
 		} else if len(data) > m.opts.inline_limit {
@@ -3322,6 +3518,7 @@ emit_modify :: proc(p: ^Pass, b: ^Builder, c: ^Change, e: Entry) -> Error {
 		builder_tree(b, fstree.Op_Set_Flags{inode = e.inode, mask = {.Opaque}, value = {}})
 	}
 	copy_begin(m, c, data) or_return
+	carry_begin(m, path, data) or_return
 	defer m.copy = nil
 	emit_text_edits(m, b, e.inode, path, old, data) or_return
 	return shadow_put(&m.shadow, path, ne)
@@ -3356,37 +3553,7 @@ copy_begin :: proc(m: ^Mount, c: ^Change, data: []u8) -> Error {
 	if terr != .None || len(text) == 0 {
 		return .None
 	}
-	la, aerr := textdiff.split_lines(text, context.temp_allocator)
-	lb, berr := textdiff.split_lines(data, context.temp_allocator)
-	if aerr != nil || berr != nil {
-		return .None
-	}
-	hunks, herr := textdiff.diff_lines(la, lb, textdiff.DEFAULT_DIFF, context.temp_allocator)
-	if herr != nil {
-		return .None
-	}
-	cm := new(Copy_Map, context.temp_allocator)
-	cm.data = data
-	cm.spans = spans
-	cm.src = make([]int, len(data), context.temp_allocator)
-	for &x in cm.src {
-		x = -1
-	}
-	same :: proc(cm: ^Copy_Map, la, lb: textdiff.Lines, a0, a1, b0: int) {
-		ao := int(la.offs[a0])
-		bo := int(lb.offs[b0])
-		for k in 0 ..< int(la.offs[a1]) - ao {
-			cm.src[bo + k] = ao + k
-		}
-	}
-	ai, bi := 0, 0
-	for hk in hunks {
-		same(cm, la, lb, ai, int(hk.a_start), bi)
-		ai = int(hk.a_start + hk.a_len)
-		bi = int(hk.b_start + hk.b_len)
-	}
-	same(cm, la, lb, ai, len(la.offs) - 1, bi)
-	m.copy = cm
+	m.copy = copy_map_of(text, spans, data)
 	return .None
 }
 
@@ -3567,7 +3734,7 @@ emit_text_edits :: proc(m: ^Mount, b: ^Builder, inode: fstree.Inode_Id, path: st
 			}
 			spans := old_spans if w.src < 0 else alias_texts[w.src].spans
 			emit_insert(m, b, inode, pre + r.b0, data[r.b0:w.w0]) or_return
-			builder_copy_spans(b, inode, pre + w.w0, spans, w.q, w.w1 - w.w0)
+			builder_copy_spans(b, inode, pre + w.w0, spans, w.q, w.w1 - w.w0, data[w.w0:w.w1])
 			emit_insert(m, b, inode, pre + w.w1, data[w.w1:r.b1]) or_return
 			continue
 		}
@@ -3601,7 +3768,7 @@ emit_insert :: proc(m: ^Mount, b: ^Builder, inode: fstree.Inode_Id, pos: int, in
 					for j < len(ins) && cm.src[off + j] == s + (j - i) {
 						j += 1
 					}
-					builder_copy_spans(b, inode, pos + i, cm.spans, s, j - i)
+					builder_copy_spans(b, inode, pos + i, cm.spans, s, j - i, ins[i:j])
 				} else {
 					for j < len(ins) && cm.src[off + j] < 0 {
 						j += 1

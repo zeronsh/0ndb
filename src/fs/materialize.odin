@@ -1611,6 +1611,11 @@ mat_snapshot_dirty :: proc(m: ^Mount, items: []Mat_Item, target: Version) -> (he
 	}
 	b: Builder
 	builder_init(&b, h, actor)
+	pl := make([dynamic]crdt.Lv, context.temp_allocator)
+	if crdt.graph_version_lvs(&h.g, parents[:], &pl) != .None {
+		return {}, false, .Corrupt
+	}
+	b.parents = pl[:]
 	snapped := make([dynamic]int, context.temp_allocator)
 	ours := make([dynamic]Stat, context.temp_allocator)
 	oids := make([dynamic]odb.Oid, context.temp_allocator)

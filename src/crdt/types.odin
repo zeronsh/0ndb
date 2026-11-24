@@ -29,6 +29,7 @@ Op_Kind :: enum u8 {
 	Opaque,
 	Insert_Ref,
 	Insert_Copy,
+	Insert_Carry,
 }
 
 Oid :: struct {
@@ -138,7 +139,7 @@ when size_of(int) == 8 {
 }
 
 is_insert :: #force_inline proc "contextless" (k: Op_Kind) -> bool {
-	return k == .Insert || k == .Insert_Ref || k == .Insert_Copy
+	return k == .Insert || k == .Insert_Ref || k == .Insert_Copy || k == .Insert_Carry
 }
 
 batch_len :: proc "contextless" (b: ^Batch) -> int {

@@ -35,6 +35,7 @@ line_from_commit :: proc(m: ^Mount, line: string, base: Version, commit_hex: str
 	actor := line_actor(m, line) or_return
 	b: Builder
 	builder_init(&b, h, actor)
+	b.parents = bl[:]
 	gbuf := make([dynamic]u8, context.temp_allocator)
 	encode_git_op(&gbuf, "checkout", ref, commit_hex)
 	builder_opaque(&b, gbuf[:])

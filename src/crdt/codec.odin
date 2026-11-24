@@ -67,14 +67,14 @@ batch_encode :: proc(b: ^Batch, buf: ^[dynamic]u8, dict: ^Actor_Dict = nil) -> E
 		if op.len <= 0 || op.len > MAX_RUN || op.pos < -MAX_RUN || op.pos > MAX_POS {
 			return .Invalid
 		}
-		if op.kind == .Insert && len(op.content) != op.len {
+		if (op.kind == .Insert || op.kind == .Insert_Carry) && len(op.content) != op.len {
 			return .Invalid
 		}
 		if op.kind == .Insert_Ref && (op.ref.offset < 0 || op.ref.offset > MAX_POS) {
 			return .Invalid
 		}
 		actor_slot(&table, op.target.actor)
-		if op.kind == .Insert_Copy {
+		if op.kind == .Insert_Copy || op.kind == .Insert_Carry {
 			actor_slot(&table, op.src.actor)
 		}
 		if op.kind == .Insert_Ref && op.ref.oid.len != 20 && op.ref.oid.len != 32 {
@@ -130,6 +130,11 @@ batch_encode :: proc(b: ^Batch, buf: ^[dynamic]u8, dict: ^Actor_Dict = nil) -> E
 		case .Insert_Copy:
 			prim.write_uvarint(&w, actor_slot(&table, op.src.actor))
 			prim.write_uvarint(&w, op.src.seq)
+			pred = op.pos + op.len
+		case .Insert_Carry:
+			prim.write_uvarint(&w, actor_slot(&table, op.src.actor))
+			prim.write_uvarint(&w, op.src.seq)
+			prim.write_raw(&w, op.content)
 			pred = op.pos + op.len
 		case .Delete:
 			pred = op.pos
@@ -270,13 +275,16 @@ decode :: proc(d: ^Decoder, data: []u8, dict: ^Actor_Dict = nil) -> (b: Batch, e
 			}
 			op.ref.offset = int(off)
 			pred = op.pos + op.len
-		case .Insert_Copy:
+		case .Insert_Copy, .Insert_Carry:
 			ix := prim.read_uvarint(&r)
 			sq := prim.read_uvarint(&r)
 			if ix >= u64(len(actors)) || sq >= MAX_COUNTER - u64(op.len) {
 				return {}, .Corrupt
 			}
 			op.src = Op_Id{actors[ix], sq}
+			if kind == .Insert_Carry {
+				op.content = prim.read_raw(&r, op.len)
+			}
 			pred = op.pos + op.len
 		case .Delete:
 			pred = op.pos

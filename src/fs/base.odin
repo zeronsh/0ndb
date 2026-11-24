@@ -670,6 +670,11 @@ rebase_commit :: proc(p: ^Pass, c: ^Change, v: []crdt.Op_Id, inode: fstree.Inode
 	old := history_text_at(h, inode, v, context.temp_allocator) or_return
 	b: Builder
 	builder_init(&b, h, actor)
+	vl := make([dynamic]crdt.Lv, context.temp_allocator)
+	if crdt.graph_version_lvs(&h.g, v, &vl) != .None {
+		return false, .Corrupt
+	}
+	b.parents = vl[:]
 	if c.scope != nil && c.scope.actor == actor {
 		b.scope = scope_marker(actor, c.scope.id)
 	} else if c.scope_id != {} {

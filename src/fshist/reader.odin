@@ -602,9 +602,15 @@ apply_batch :: proc(r: ^Reader, si: u32, off: u64, body: []u8) -> (n: int, err: 
 	if skip >= total {
 		return 0, .None
 	}
-	first, gskip, aerr := crdt.graph_add(&r.g, &b)
+	cascade := make([dynamic]crdt.Op_Span, context.temp_allocator)
+	first, gskip, aerr := crdt.graph_add(&r.g, &b, &cascade)
 	if aerr != .None {
 		return 0, .Corrupt
+	}
+	if len(cascade) > 0 {
+		for _, f in r.files {
+			text_drop(&f.st)
+		}
 	}
 	append(&r.lvidx, Lv_Entry{first, total - gskip, si, off})
 	import_batch := body[0] == REC_IMPORT
@@ -919,7 +925,7 @@ copy_depth :: proc(r: ^Reader, src: crdt.Op_Id, dst: []u8, authors: ^[dynamic]cr
 			k := rel - pos
 			avail := min(op.len - k, len(dst) - got)
 			#partial switch op.kind {
-			case .Insert:
+			case .Insert, .Insert_Carry:
 				copy(dst[got:got + avail], op.content[k:k + avail])
 				append(authors, crdt.Author_Span{id = id, op = id, len = avail})
 			case .Insert_Ref:

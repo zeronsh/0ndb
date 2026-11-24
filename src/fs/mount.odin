@@ -520,6 +520,7 @@ Mount :: struct {
 	adopt_pending: bool,
 	hold_line:   bool,
 	alias:       [dynamic]Version,
+	carry_from:  [dynamic]crdt.Op_Id,
 	unwatched:   [dynamic]string,
 	attrs:       ^Attr_Ctx,
 	collided:    [dynamic]string,
@@ -660,6 +661,7 @@ mount_open :: proc(m: ^Mount, reg: ^Registry, h: ^History, db: ^odb.Odb, id: pri
 	m.dir, _ = clone_string(state_dir, allocator)
 	m.line, _ = clone_string(opts.line, allocator)
 	m.synced = make([dynamic]crdt.Op_Id, allocator)
+	m.carry_from = make([dynamic]crdt.Op_Id, allocator)
 	m.dirty = make(map[string]^Scope, allocator)
 	m.dirty_at = make(map[string]i64, allocator)
 	m.closed = make(map[string]i64, allocator)
@@ -978,6 +980,7 @@ mount_close :: proc(m: ^Mount) {
 		delete(p.after)
 	}
 	delete(m.reverts)
+	delete(m.carry_from)
 	delete(m.saved_synced)
 	git_head_destroy(&m.head, m.allocator)
 	if m.has_git {
@@ -2221,6 +2224,11 @@ load_mount_state :: proc(m: ^Mount) -> (fresh: bool, err: Error) {
 		rec_head.commit = prim.read_str(&rd)
 		rec_reflog = prim.read_ivarint(&rd)
 	}
+	if prim.reader_remaining(&rd) > 0 {
+		cv := decode_version(prim.read_bytes(&rd), context.temp_allocator) or_return
+		clear(&m.carry_from)
+		append(&m.carry_from, ..cv)
+	}
 	m.jpend = m.jpos
 	if !prim.reader_ok(&rd) {
 		return false, .Corrupt
@@ -2289,6 +2297,7 @@ Mount_Image :: struct {
 	chained:    bool,
 	line:       string,
 	absent:     [dynamic]string,
+	carry_from: [dynamic]crdt.Op_Id,
 }
 
 Mount_Wait :: struct {
@@ -2333,6 +2342,8 @@ image_take :: proc(m: ^Mount, img: ^Mount_Image) {
 		c, _ := clone_string(a, m.allocator)
 		append(&img.absent, c)
 	}
+	img.carry_from = make([dynamic]crdt.Op_Id, m.allocator)
+	append(&img.carry_from, ..m.carry_from[:])
 }
 
 @(private)
@@ -2349,6 +2360,7 @@ image_free :: proc(m: ^Mount, img: ^Mount_Image) {
 		delete(a, m.allocator)
 	}
 	delete(img.absent)
+	delete(img.carry_from)
 	img^ = {}
 }
 
@@ -2571,6 +2583,9 @@ save_mount_state :: proc(m: ^Mount) -> Error {
 	prim.write_str(&w, rec.head.branch)
 	prim.write_str(&w, rec.head.commit)
 	prim.write_ivarint(&w, rec.reflog_pos)
+	cb := make([dynamic]u8, context.temp_allocator)
+	encode_version(&cb, img.carry_from[:])
+	prim.write_bytes(&w, cb[:])
 	sum := xxhash.XXH3_64_with_seed(buf[:], 0) | 1
 	if sum == m.saved {
 		return .None
