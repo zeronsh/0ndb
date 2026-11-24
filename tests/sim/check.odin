@@ -6,6 +6,7 @@ import "core:strings"
 import "../../src/convo"
 import "../../src/crdt"
 import "../../src/fs"
+import "../../src/fstree"
 import "../../src/journal"
 import eng "../../src/engine"
 import omap "../../src/map"
@@ -1910,4 +1911,129 @@ relay_checkpoint_contains :: proc(w: ^World, needle: []u8) -> (place: string, fo
 		}
 	}
 	return "", false
+}
+
+@(private = "file")
+_loss_explained :: proc(m: ^Model, oi: int, line: string, op: ^M_Op, tok: string) -> bool {
+	if _reclaimed(m, oi, line, tok, op.idx) {
+		return true
+	}
+	for d in m.ops {
+		if d.obj != oi || d.line != line {
+			continue
+		}
+		if d.kind == .Tree_Remove && op_maybe(d) && same_file(m, oi, d.path, op.path) {
+			return true
+		}
+		for x in d.deletes {
+			if x == tok && !_readded(m, oi, line, tok, d.idx) && (op_happened(d) || d.status == .Uncertain) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+check_acked_files :: proc(w: ^World, n: ^Node) {
+	m := &w.model
+	if !n.alive || !n.e_open || n.disk.dead {
+		return
+	}
+	context = instance_context(&n.inst)
+	n.disk.probe += 1
+	defer n.disk.probe -= 1
+	for sm in n.mounts {
+		if sm.m == nil || sm.m.history == nil || !sm.m.history.awake || m.objs[sm.oi].kind != .Tree {
+			continue
+		}
+		if _, switching := fs.mount_switch_pending(sm.m); switching {
+			continue
+		}
+		h := sm.m.history
+		line := line_norm(sm.m.line)
+		v, found, lerr := fs.history_line(h, sm.m.line, context.temp_allocator)
+		if lerr != .None || !found {
+			continue
+		}
+		lvs := make([dynamic]crdt.Lv, context.temp_allocator)
+		if crdt.graph_version_lvs(&h.g, v, &lvs) != .None {
+			continue
+		}
+		snap, serr := fs.version_snapshot(h, lvs[:])
+		if serr != .None {
+			continue
+		}
+		defer fstree.snapshot_destroy(&snap)
+		texts := make([dynamic]string, context.temp_allocator)
+		if !_files_text(h, &snap, v, fstree.ROOT, &texts) {
+			continue
+		}
+		files := make([dynamic]Disk_File, context.temp_allocator)
+		disk_walk(&n.disk, &files)
+		prefix := strings.concatenate({sm.root, "/"}, context.temp_allocator)
+		for f in files {
+			if strings.has_prefix(f.path, prefix) && !strings.has_prefix(f.path[len(prefix):], ".git/") {
+				append(&texts, string(f.data))
+			}
+		}
+		merged := merged_files(w, sm.oi)
+		for op in m.ops {
+			if op.obj != sm.oi || op.node != n.idx || op.line != line || op.status != .Acked || !(op.kind == .Disk_Agent || op.kind == .Disk_Person || op.kind == .Tree_Write) || merged_has(m, sm.oi, merged, op.path) {
+				continue
+			}
+			stat_add(w, STAT_ACKED_FILES)
+			tokens: for tok in op.tokens {
+				for t in texts {
+					if token_in(t, tok) {
+						continue tokens
+					}
+				}
+				if _loss_explained(m, sm.oi, line, op, tok) {
+					continue
+				}
+				world_fail(w, "durability: %s lost token %s (op %d, %v, tick %d, Acked) of %s/%s after a restart: neither its history at line %q nor its disk has it in any file", n.name, tok, op.idx, op.kind, op.tick, id_short(m.objs[sm.oi].o.id), op.path, sm.m.line)
+			}
+		}
+	}
+}
+
+@(private = "file")
+_files_text :: proc(h: ^fs.History, snap: ^fstree.Snapshot, v: fs.Version, dir: fstree.Inode_Id, out: ^[dynamic]string) -> bool {
+	kids, kerr := fstree.children(snap, dir, nil, 0, context.temp_allocator)
+	if kerr != nil {
+		return false
+	}
+	for k in kids {
+		info, ok, ierr := fstree.info(snap, k.inode, context.temp_allocator)
+		if ierr != nil {
+			return false
+		}
+		if !ok || !info.present {
+			continue
+		}
+		if info.kind == .Dir {
+			if !_files_text(h, snap, v, k.inode, out) {
+				return false
+			}
+			continue
+		}
+		if info.kind != .File {
+			continue
+		}
+		text, terr := fs.history_text_at(h, k.inode, v, context.temp_allocator)
+		if terr != .None {
+			return false
+		}
+		append(out, string(text))
+	}
+	return true
+}
+
+STAT_ACKED_FILES: Stat
+
+@(init)
+_acked_files_init :: proc "contextless" () {
+	register_restarted(21, check_acked_files)
+	register_stat_line(95, "acked_files")
+	STAT_ACKED_FILES = register_stat(95, 0, "checked")
 }
