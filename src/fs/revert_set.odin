@@ -223,15 +223,38 @@ history_mount_actors :: proc(h: ^History, mounts: []prim.Id, lines: []string, al
 		}
 	}
 	list := make([dynamic]prim.Id, allocator)
+	Line_Actor :: struct {
+		actor: prim.Id,
+		base:  prim.Id,
+	}
+	others := make([dynamic]Line_Actor, context.temp_allocator)
+	own := make(map[prim.Id]bool, context.temp_allocator)
 	for a in h.g.actors {
 		owner, ok := history_actor_owner(h, a)
 		if !ok {
 			continue
 		}
+		mine := false
 		for id in ids {
 			if fshist.ingestion_actor(owner, id) == a {
-				append(&list, a)
+				mine = true
 				break
+			}
+		}
+		if mine {
+			own[a] = true
+			append(&list, a)
+		} else {
+			append(&others, Line_Actor{a, owner})
+		}
+	}
+	for grew := true; grew; {
+		grew = false
+		for x in others {
+			if own[x.base] && !own[x.actor] {
+				own[x.actor] = true
+				append(&list, x.actor)
+				grew = true
 			}
 		}
 	}
