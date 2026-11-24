@@ -535,6 +535,31 @@ text_merge :: proc(t: ^Text, g: ^Graph, log: ^Text_Log, v: []Lv, conflicts: ^[dy
 	return m.err
 }
 
+text_ready :: proc(t: ^Text, g: ^Graph, log: ^Text_Log, v: []Lv) -> Error {
+	if !graph_valid(g, v) || !graph_valid(g, t.version[:]) {
+		return .Unknown
+	}
+	graph_diff(g, t.version[:], v, &g.only_a, &g.only_b)
+	clear(&g.pieces)
+	log_pieces(log, g.only_b[:], &g.pieces) or_return
+	buf: [4096]u8
+	for p in g.pieces {
+		e := log.entries[p.entry]
+		if e.kind != .Insert_Ref || e.red {
+			continue
+		}
+		ref := log.refs[e.at]
+		for done := 0; done < p.len; {
+			c := min(len(buf), p.len - done)
+			if log.content.read == nil || !log.content.read(log.content.data, ref.oid, ref.offset + int(p.lv - e.lv) + done, buf[:c]) {
+				return .Missing_Content
+			}
+			done += c
+		}
+	}
+	return .None
+}
+
 text_checkout :: proc(base: ^Text, g: ^Graph, log: ^Text_Log, v: []Lv, allocator := context.allocator) -> (out: Text, err: Error) {
 	if !graph_valid(g, v) || !graph_valid(g, base.version[:]) {
 		return {}, .Unknown

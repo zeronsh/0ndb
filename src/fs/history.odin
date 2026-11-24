@@ -118,6 +118,7 @@ History :: struct {
 	moves_count: u64,
 	awake:      bool,
 	io:         [dynamic]u8,
+	unread:     Maybe(Content_Ref),
 	blob_cache: odb.Oid,
 	blob_data:  []u8,
 	touched:    [dynamic]fstree.Inode_Id,
@@ -2337,8 +2338,11 @@ copy_read_depth :: proc(h: ^History, src: crdt.Op_Id, dst: []u8, authors: ^[dyna
 }
 
 @(private)
-content_read :: proc(data: rawptr, oid: crdt.Oid, offset: int, dst: []u8) -> bool {
+content_read :: proc(data: rawptr, oid: crdt.Oid, offset: int, dst: []u8) -> (ok: bool) {
 	h := (^History)(data)
+	defer if !ok {
+		h.unread = Content_Ref{oid = odb_oid(oid), len = int(oid.len)}
+	}
 	if h.db == nil {
 		return false
 	}

@@ -15,6 +15,7 @@ Text_View :: struct {
 	cp:       [dynamic]crdt.Op_Id,
 	prev:     [dynamic]crdt.Author_Span,
 	has_prev: bool,
+	missing:  Maybe(Content_Ref),
 }
 
 history_view_open :: proc(h: ^History, inode: fstree.Inode_Id, v: Version) -> (view: ^Text_View, err: Error) {
@@ -205,6 +206,11 @@ history_view_advance :: proc(h: ^History, view: ^Text_View, target: Version, sin
 }
 
 history_view_advance_ex :: proc(h: ^History, view: ^Text_View, target: Version, sink: crdt.Text_Sink) -> (reloaded: bool, err: Error) {
+	h.unread = nil
+	view.missing = nil
+	defer if err != .None {
+		view.missing = h.unread
+	}
 	lvs := make([dynamic]crdt.Lv, context.temp_allocator)
 	if crdt.graph_version_lvs(&h.g, target, &lvs) != .None {
 		return false, .Not_Found
@@ -214,9 +220,15 @@ history_view_advance_ex :: proc(h: ^History, view: ^Text_View, target: Version, 
 			return false, .None
 		}
 		if crdt.graph_contains_all(&h.g, lvs[:], view.text.version[:]) {
+			if crdt.text_ready(&view.text, &h.g, &view.log, lvs[:]) == .Missing_Content {
+				return false, .Not_Found
+			}
 			merr := crdt.text_merge(&view.text, &h.g, &view.log, lvs[:], nil, sink)
-			if merr == .None || merr == .Missing_Content {
+			if merr == .None {
 				return false, .None
+			}
+			if merr == .Missing_Content {
+				return false, .Corrupt
 			}
 		}
 	}
