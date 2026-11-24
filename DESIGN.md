@@ -1972,7 +1972,17 @@ running on it is a record in it.
     its target whatever was sent meanwhile and records that position as a leaf
     even at the tip, so a later switch back to the branch lands where the move
     left it, and a send under a message from the root position
-    is a switch to it first. A turn starts from its
+    is a switch to it first. A send is a move to its own branch: when a send
+    and another device's move are concurrent, the newer by hlc wins the
+    position and the files follow it. If the move is newer, the sent message
+    stays on the left branch (listed by `convo.undone`), no run starts from it
+    while the move is unsettled, and it never writes onto another branch's
+    files; switching to it brings back its branch with its files. If the send
+    is newer, the device whose send won writes one `rebase` move that cancels
+    the move's reverts (transformed through anything written since), so every
+    device ends on the send's branch with that branch's files. A rebase whose
+    reverts the device has not received yet waits on the tree, after reading
+    the tree's newest data. A turn starts from its
     conversation line's head, so landing is a fast-forward unless another
     writer moved the line meanwhile, and the union then only merges those
     writers.
