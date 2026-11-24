@@ -2,6 +2,7 @@ package sim
 
 import "core:fmt"
 import "core:os"
+import "core:strings"
 import "core:testing"
 import eng "../../src/engine"
 import omap "../../src/map"
@@ -48,7 +49,7 @@ _skew_value :: proc(w: ^World, n: ^Node, mo: eng.Object) -> (string, bool) {
 		return "", false
 	}
 	v, ok := omap.entry_register(&en, SKEW_TAG)
-	return string(v), ok
+	return strings.clone(string(v), w.allocator), ok
 }
 
 @(private = "file")
@@ -59,7 +60,7 @@ _skew_title :: proc(w: ^World, n: ^Node, co: eng.Object) -> (string, bool) {
 	if err != .None || !found {
 		return "", false
 	}
-	return c.title, true
+	return strings.clone(c.title, w.allocator), true
 }
 
 @(private = "file")

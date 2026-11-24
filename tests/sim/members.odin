@@ -458,7 +458,7 @@ _roster :: proc(w: ^World, idx: int, space: prim.Id) -> string {
 	defer node_after(n)
 	list, err := eng.space_members(&n.e, space, context.temp_allocator)
 	if err != .None {
-		return fmt.tprintf("error %v", err)
+		return fmt.aprintf("error %v", err, allocator = n.w.allocator)
 	}
 	ids := make([dynamic]prim.Id, context.temp_allocator)
 	out := ""
