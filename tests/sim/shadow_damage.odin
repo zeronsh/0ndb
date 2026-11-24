@@ -204,8 +204,11 @@ _sd_damage :: proc(w: ^World, n: ^Node, name: string, hurt: Sd_Hurt) -> bool {
 }
 
 @(private = "file")
-_sd_run :: proc(w: ^World, op: Sd_Op, hurt: Sd_Hurt) {
+_sd_run :: proc(w: ^World, op: Sd_Op, hurt: Sd_Hurt, k: u64 = 0, process := false) -> (crashed: bool) {
 	what := fmt.aprintf("%v, %v", op, hurt, allocator = w.allocator)
+	if k > 0 {
+		what = fmt.aprintf("%v, %v, crash at disk op %d of the remount (process %v)", op, hurt, k, process, allocator = w.allocator)
+	}
 	n := w.nodes[0]
 	if !node_start(n) {
 		world_fail(w, "%s: node start", what)
@@ -367,12 +370,28 @@ _sd_run :: proc(w: ^World, op: Sd_Op, hurt: Sd_Hurt) {
 		node_after(n)
 	}
 	run_until(w, w.now + 5_000_000_000, true)
-	if n.alive && _sd_mount(n) == nil {
-		if err := node_mount(w, n, len(m.objs) - 1, SD_ROOT); err != .None {
-			world_fail(w, "%s: REMOUNT: %v", what, err)
-			return
-		}
+	if k > 0 && n.alive {
+		n.disk.force_process = process
+		n.disk.crash_at = n.disk.stats.ops + k
 	}
+	inc := n.incarnation
+	for _ in 0 ..< 3 {
+		if n.alive && _sd_mount(n) == nil {
+			err := node_mount(w, n, len(m.objs) - 1, SD_ROOT)
+			if err != .None && n.alive && n.incarnation == inc {
+				world_fail(w, "%s: REMOUNT: %v", what, err)
+				return
+			}
+		}
+		run_until(w, w.now + 10_000_000_000, true)
+		if n.incarnation != inc {
+			crashed = true
+			inc = n.incarnation
+			continue
+		}
+		break
+	}
+	n.disk.crash_at = 0
 	run_until(w, w.now + 60_000_000_000, true)
 	if !n.alive || !n.e_open || _sd_mount(n) == nil {
 		world_fail(w, "%s: DOWN: alive %v engine %v mounted %v", what, n.alive, n.e_open, _sd_mount(n) != nil)
@@ -421,6 +440,7 @@ _sd_run :: proc(w: ^World, op: Sd_Op, hurt: Sd_Hurt) {
 	want[last] = "written after\n"
 	run_until(w, w.now + 30_000_000_000, true)
 	_sd_check(w, n, tree, want, ids, fmt.tprintf("%s, after one more write", what))
+	return
 }
 
 @(private = "file")
@@ -471,6 +491,21 @@ _sd_check :: proc(w: ^World, n: ^Node, tree: eng.Object, want: map[string]string
 	}
 }
 
+@(private = "file")
+_sd_config :: proc() -> Config {
+	cfg := default_config(1)
+	cfg.nodes = 1
+	cfg.spaces = 0
+	cfg.ops = 0
+	cfg.crash_rate = 0
+	cfg.fault_rate = 0
+	cfg.io_rate = 0
+	cfg.byzantine = false
+	cfg.bulk = false
+	cfg.mem_max = 1500
+	return cfg
+}
+
 @(test)
 shadow_damage :: proc(t: ^testing.T) {
 	if s, ok := os.lookup_env("SIM_SEED", context.temp_allocator); ok && len(s) > 0 {
@@ -480,18 +515,8 @@ shadow_damage :: proc(t: ^testing.T) {
 	defer test_end(t)
 	for op in Sd_Op {
 		for hurt in Sd_Hurt {
-			cfg := default_config(1)
-			cfg.nodes = 1
-			cfg.spaces = 0
-			cfg.ops = 0
-			cfg.crash_rate = 0
-			cfg.fault_rate = 0
-			cfg.io_rate = 0
-			cfg.byzantine = false
-			cfg.bulk = false
-			cfg.mem_max = 1500
 			w := new(World)
-			world_init(w, cfg)
+			world_init(w, _sd_config())
 			_sd_run(w, op, hurt)
 			for f, i in w.failures {
 				if i < int(env_u64("SD_MAX", 4)) {
@@ -507,4 +532,39 @@ shadow_damage :: proc(t: ^testing.T) {
 			free(w)
 		}
 	}
+}
+
+@(test)
+shadow_damage_crash :: proc(t: ^testing.T) {
+	if s, ok := os.lookup_env("SIM_SEED", context.temp_allocator); ok && len(s) > 0 {
+		return
+	}
+	test_begin(t)
+	defer test_end(t)
+	points, bad := 0, 0
+	for op in ([]Sd_Op{.Edited, .Deleted, .Renamed, .Never_Shown}) {
+		for hurt in ([]Sd_Hurt{.Record_No_Index, .No_Log, .Gen_Pointer}) {
+			for process in ([]bool{false, true}) {
+				for k in 1 ..= u64(env_u64("SD_CRASH_MAX", 2000)) {
+					w := new(World)
+					world_init(w, _sd_config())
+					hit := _sd_run(w, op, hurt, k, process)
+					for f, i in w.failures {
+						if bad < 8 && i < 3 {
+							fmt.eprintf("shadow_damage_crash: %s\n", f)
+						}
+					}
+					bad += int(len(w.failures) > 0)
+					world_destroy(w)
+					free(w)
+					if !hit {
+						break
+					}
+					points += 1
+				}
+			}
+		}
+	}
+	fmt.eprintf("shadow_damage_crash: %d crash points, %d failed\n", points, bad)
+	testing.expect(t, bad == 0 && points > 0, "shadow_damage_crash failed")
 }

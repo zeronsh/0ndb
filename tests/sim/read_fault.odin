@@ -330,7 +330,7 @@ read_fault :: proc(t: ^testing.T) {
 				if len(w.failures) > 0 {
 					bad += 1
 					for f in w.failures {
-						if bad <= 6 {
+						if bad <= int(env_u64("RF_PRINT", 6)) {
 							fmt.eprintf("read_fault: %s\n", f)
 						}
 					}

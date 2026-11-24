@@ -530,6 +530,7 @@ Mount :: struct {
 	holds:       [dynamic]Path_Hold,
 	reload_ms:   i64,
 	reload_owed: bool,
+	step_ms:     i64,
 	stuck:       [dynamic]string,
 	reshow:      [dynamic]string,
 	branch:      string,
@@ -1807,9 +1808,12 @@ mount_step :: proc(m: ^Mount) -> Error {
 	}
 	if err == .None {
 		err = mount_materialize(m)
-		if err != .None && err != .Reloading {
-			mount_reload_retry(m)
-		}
+	}
+	if err == .None {
+		m.step_ms = 0
+	} else if err != .Reloading {
+		m.step_ms = max(m.opts.settle_ms, 1) if m.step_ms == 0 else min(m.step_ms * 2, RELOAD_RETRY_MAX_MS)
+		mount_schedule(m, m.step_ms)
 	}
 	if err == .None && len(m.switch_to) > 0 {
 		mount_switch_step(m)
