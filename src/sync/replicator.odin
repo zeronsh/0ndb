@@ -204,6 +204,8 @@ Remote :: struct {
 	tamper_hold: bool,
 	tamper_retried: bool,
 	relay_bad: bool,
+	relay_peer: bool,
+	relay_reported: bool,
 	plain:     bool,
 	skey:      journal.Key,
 	reaping:   bool,
@@ -1935,8 +1937,11 @@ _want_add :: proc(rm: ^Remote, g: journal.Range) {
 @(private)
 _fetch_gap :: proc(r: ^Replicator, rm: ^Remote, gap: journal.Range) {
 	if rm.relay_bad && r.phase == .Ready && !rm.keys_wait && !rm.retry_hold && !_covered_inflight(rm, gap) {
-		_pull_range(r, rm, gap.from, min(gap.to, gap.from + STAGE_MAX))
-		return
+		if _, ok := _pick_holder(r, rm); ok {
+			rm.relay_peer = true
+			_pull_range(r, rm, gap.from, min(gap.to, gap.from + STAGE_MAX))
+			return
+		}
 	}
 	if r.phase != .Ready || rm.keys_wait || rm.tamper_hold || rm.retry_hold || _covered_inflight(rm, gap) {
 		return
@@ -2100,6 +2105,7 @@ _remote_settle :: proc(r: ^Replicator, rm: ^Remote) {
 				continue
 			}
 			ordered_remove(&rm.wants, i)
+			_relay_proven(r, rm)
 			if rm.is_head {
 				_keys_head_seen(r, rm)
 				continue
@@ -2300,10 +2306,26 @@ _tamper :: proc(r: ^Replicator, rm: ^Remote) {
 	rm.relay_bad = true
 	r.tamper_run += 1
 	if r.tamper_run == TAMPER_REPORT {
-		_emit(r, Repl_Event{kind = .Relay_Misbehaving, err = .Corrupt, device = rm.device, name = rm.name, epoch = rm.epoch, stream = rm.id})
+		_relay_report(r, rm)
 	}
 	rm.tamper_hold = true
 	clear(&rm.inflight)
+}
+
+@(private)
+_relay_report :: proc(r: ^Replicator, rm: ^Remote) {
+	if rm.relay_reported {
+		return
+	}
+	rm.relay_reported = true
+	_emit(r, Repl_Event{kind = .Relay_Misbehaving, err = .Corrupt, device = rm.device, name = rm.name, epoch = rm.epoch, stream = rm.id})
+}
+
+@(private)
+_relay_proven :: proc(r: ^Replicator, rm: ^Remote) {
+	if rm.relay_bad && rm.relay_peer {
+		_relay_report(r, rm)
+	}
 }
 
 @(private)
@@ -2454,6 +2476,9 @@ _on_data :: proc(r: ^Replicator, ev: ^Event) {
 		v, vlo, vhi := _verdict(r, rm, r.rx_start, r.rx_at)
 		switch v {
 		case .Accept:
+			if r.rx_holder != {} {
+				_relay_proven(r, rm)
+			}
 			from := min(r.rx_start, vlo) if vhi > vlo else r.rx_start
 			_emit(r, Repl_Event{kind = .Grew, device = rm.device, name = rm.name, epoch = rm.epoch, stream = rm.id, from = from, to = r.rx_at, length = rm.relay_len})
 		case .Hold:
@@ -2820,6 +2845,8 @@ _repl_reset_state :: proc(r: ^Replicator) {
 		rm.tamper_hold = false
 		rm.tamper_retried = false
 		rm.relay_bad = false
+		rm.relay_peer = false
+		rm.relay_reported = false
 		clear(&rm.inflight)
 		clear(&rm.pulls)
 		clear(&rm.refused)
