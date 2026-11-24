@@ -347,9 +347,11 @@ event_undo :: proc(t: ^testing.T) {
 	}
 	test_begin(t)
 	defer test_end(t)
-	plain: [4]string
-	defer for x in plain {
-		delete(x)
+	plain: [4][21]string
+	defer for row in plain {
+		for x in row {
+			delete(x)
+		}
 	}
 	for bits in 0 ..< 8 {
 		arm := Event_Undo_Arm{person = bits & 1 != 0, outside = bits & 2 != 0, blocked = bits & 4 != 0}
@@ -365,11 +367,11 @@ event_undo :: proc(t: ^testing.T) {
 			bad += 1 if len(failures) > 0 else 0
 			named += 1 if res.named else 0
 			events += 1 if res.events > 0 else 0
-			if seed == 1 && !arm.blocked {
-				plain[bits & 3] = strings.clone(res.undone)
+			if !arm.blocked {
+				plain[bits & 3][seed] = strings.clone(res.undone)
 			}
-			if arm.blocked && res.undone != plain[bits & 3] {
-				fmt.eprintf("event_undo seed %d: %v: the undo of an event actor's batch left %q, a plain one %q\n", seed, arm, res.undone, plain[bits & 3])
+			if arm.blocked && res.undone != plain[bits & 3][seed] {
+				fmt.eprintf("event_undo seed %d: %v: the undo of an event actor's batch left %q, a plain one %q\n", seed, arm, res.undone, plain[bits & 3][seed])
 				testing.expect(t, false, "event_undo: an event actor's batch is undone like a plain one")
 			}
 			if seed == 1 {
