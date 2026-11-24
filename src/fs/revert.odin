@@ -369,6 +369,8 @@ event_actor :: proc(m: ^Mount, base: prim.Id, parents: []crdt.Op_Id, digest: [32
 	blake2b.update(&ctx, transmute([]u8)tag)
 	b := base
 	blake2b.update(&ctx, b[:])
+	mid := m.id
+	blake2b.update(&ctx, mid[:])
 	n: [8]u8
 	prim.put_u64le(n[:], u64(len(m.line)))
 	blake2b.update(&ctx, n[:])
