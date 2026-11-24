@@ -2,6 +2,7 @@ package arc
 
 import "base:runtime"
 import "core:c"
+import "core:slice"
 import "core:crypto/blake2b"
 import "core:crypto/chacha20poly1305"
 import "../journal"
@@ -13,6 +14,8 @@ SEAL_KIND :: 2
 RESTORE_KIND :: 3
 RESTORE_PREFIX :: "rst/"
 VERSION :: 1
+GROUP_VERSION :: 2
+BLOCK_BITS_MAX :: 62
 GROUP_RAW :: 1024 * 1024
 LEVEL :: 19
 RECORD_LEVEL :: 3
@@ -66,6 +69,7 @@ Group :: struct {
 	shift:       u8,
 	salt:        [SALT]u8,
 	holes:       []Cells,
+	blocks:      []Block,
 	header:      []u8,
 	payload:     []u8,
 }
@@ -90,6 +94,11 @@ Cells :: struct {
 	to:   i64,
 }
 
+Block :: struct {
+	cell: i64,
+	bits: u8,
+}
+
 Seal_Entry :: struct {
 	first:   i64,
 	end:     i64,
@@ -108,7 +117,7 @@ Seal :: struct {
 }
 
 @(private)
-KEY_DOMAIN :: "0ndb-arc-group-v1"
+KEY_DOMAIN :: "0ndb-arc-group-v2"
 @(private)
 AEAD_DOMAIN :: "0ndb-arc-aead-v1"
 
@@ -291,7 +300,7 @@ builder_finish :: proc(b: ^Builder, out: ^[dynamic]u8, mode: Mode, keys: journal
 	start := len(out)
 	w := prim.writer(out)
 	prim.write_u8(&w, GROUP_KIND)
-	prim.write_u8(&w, VERSION)
+	prim.write_u8(&w, GROUP_VERSION)
 	prim.write_uvarint(&w, u64(b.first))
 	prim.write_uvarint(&w, u64(b.pos))
 	prim.write_uvarint(&w, u64(b.count))
@@ -299,13 +308,19 @@ builder_finish :: proc(b: ^Builder, out: ^[dynamic]u8, mode: Mode, keys: journal
 	prim.write_raw(&w, b.head[:])
 	prim.write_u8(&w, u8(mode))
 	s := salt
-	holes: []Cells
+	blocks: []Block
 	if mode == .Sealed {
-		if keys.key == nil || shift > 30 {
+		if shift > 30 {
 			resize(out, start)
 			return .No_Key
 		}
-		holes = cell_holes(keys, b.first, b.pos, shift, exclude)
+		holes: []Cells
+		cerr: Error
+		blocks, holes, cerr = group_cover(keys, b.first, b.pos, shift, exclude)
+		if cerr != .None {
+			resize(out, start)
+			return cerr
+		}
 		prim.write_u8(&w, shift)
 		prim.write_raw(&w, s[:])
 		prim.write_uvarint(&w, u64(len(holes)))
@@ -314,6 +329,13 @@ builder_finish :: proc(b: ^Builder, out: ^[dynamic]u8, mode: Mode, keys: journal
 			prim.write_uvarint(&w, u64(h.from - prev))
 			prim.write_uvarint(&w, u64(h.to - h.from))
 			prev = h.to
+		}
+		prim.write_uvarint(&w, u64(len(blocks)))
+		bprev := b.first >> shift
+		for bl in blocks {
+			prim.write_uvarint(&w, u64(bl.cell - bprev))
+			prim.write_u8(&w, bl.bits)
+			bprev = bl.cell + (i64(1) << bl.bits)
 		}
 	}
 	if w.err != .None {
@@ -351,7 +373,7 @@ builder_finish :: proc(b: ^Builder, out: ^[dynamic]u8, mode: Mode, keys: journal
 		resize(out, start + header_len + n)
 		return .None
 	}
-	k, kerr := group_key(keys, b.first, b.pos, shift, s, holes)
+	k, kerr := group_key(keys, b.first, b.pos, shift, s, blocks)
 	if kerr != .None {
 		resize(out, start)
 		return kerr
@@ -369,36 +391,96 @@ builder_finish :: proc(b: ^Builder, out: ^[dynamic]u8, mode: Mode, keys: journal
 	return .None
 }
 
-cell_holes :: proc(keys: journal.Key_Provider, first, end: i64, shift: u8, exclude: []journal.Range = nil, allocator := context.temp_allocator) -> []Cells {
-	out := make([dynamic]Cells, allocator)
+group_cover :: proc(keys: journal.Key_Provider, first, end: i64, shift: u8, exclude: []journal.Range = nil, allocator := context.temp_allocator) -> (blocks: []Block, holes: []Cells, err: Error) {
+	if keys.cover == nil || keys.block == nil || end <= first || shift > 30 {
+		return nil, nil, .No_Key
+	}
 	lo := first >> shift
-	hi := (end - 1) >> shift
-	for c := lo; c <= hi; c += 1 {
-		gone := false
-		for x in exclude {
-			if c >= x.from >> shift && c <= (x.to - 1) >> shift {
-				gone = true
-			}
+	top := ((end - 1) >> shift) + 1
+	runs := make([dynamic]journal.Cell_Run, context.temp_allocator)
+	if !keys.cover(keys.data, u64(lo), u64(top), &runs) {
+		return nil, nil, .No_Key
+	}
+	ex := make([dynamic]Cells, context.temp_allocator)
+	for x in exclude {
+		if x.to <= x.from {
+			continue
 		}
-		if !gone {
-			rk: journal.Key
-			ok := keys.key(keys.data, c << shift, &rk)
-			_wipe(rk[:])
-			if ok {
-				continue
-			}
-		}
-		if len(out) > 0 && out[len(out) - 1].to == c {
-			out[len(out) - 1].to = c + 1
-		} else {
-			append(&out, Cells{c, c + 1})
+		c := Cells{max(x.from >> shift, lo), min(((x.to - 1) >> shift) + 1, top)}
+		if c.to > c.from {
+			append(&ex, c)
 		}
 	}
-	return out[:]
+	slice.sort_by(ex[:], proc(a, b: Cells) -> bool {
+		return a.from < b.from
+	})
+	bl := make([dynamic]Block, allocator)
+	hs := make([dynamic]Cells, allocator)
+	pos := lo
+	for run in runs {
+		a, b := i64(run.from), i64(run.to)
+		if a < pos || b > top || b <= a {
+			return nil, nil, .Corrupt
+		}
+		for a < b {
+			cut := b
+			skip := a
+			for x in ex {
+				if x.to <= a || x.from >= b {
+					continue
+				}
+				if x.from <= a {
+					skip = max(skip, x.to)
+				} else {
+					cut = min(cut, x.from)
+				}
+			}
+			if skip > a {
+				a = min(skip, b)
+				continue
+			}
+			if a > pos {
+				_hole_add(&hs, pos, a)
+			}
+			_dyadic(&bl, a, cut)
+			pos = cut
+			a = cut
+		}
+	}
+	if pos < top {
+		_hole_add(&hs, pos, top)
+	}
+	return bl[:], hs[:], .None
 }
 
-group_key :: proc(keys: journal.Key_Provider, first, end: i64, shift: u8, salt: [SALT]u8, holes: []Cells) -> (k: journal.Key, err: Error) {
-	if keys.key == nil || shift > 30 || end <= first {
+@(private)
+_hole_add :: proc(hs: ^[dynamic]Cells, from, to: i64) {
+	if len(hs) > 0 && hs[len(hs) - 1].to == from {
+		hs[len(hs) - 1].to = to
+		return
+	}
+	append(hs, Cells{from, to})
+}
+
+@(private)
+_dyadic :: proc(bl: ^[dynamic]Block, from, to: i64) {
+	a := from
+	for a < to {
+		bits: u8
+		for bits < BLOCK_BITS_MAX {
+			size := i64(1) << (bits + 1)
+			if a & (size - 1) != 0 || a + size > to {
+				break
+			}
+			bits += 1
+		}
+		append(bl, Block{a, bits})
+		a += i64(1) << bits
+	}
+}
+
+group_key :: proc(keys: journal.Key_Provider, first, end: i64, shift: u8, salt: [SALT]u8, blocks: []Block) -> (k: journal.Key, err: Error) {
+	if keys.block == nil || shift > 30 || end <= first {
 		return {}, .No_Key
 	}
 	ctx: blake2b.Context
@@ -408,22 +490,18 @@ group_key :: proc(keys: journal.Key_Provider, first, end: i64, shift: u8, salt: 
 	prim.put_u64le(b[0:8], u64(first))
 	prim.put_u64le(b[8:16], u64(end))
 	blake2b.update(&ctx, b[:])
-	hi := 0
-	for c := first >> shift; c <= (end - 1) >> shift; c += 1 {
-		for hi < len(holes) && holes[hi].to <= c {
-			hi += 1
-		}
-		if hi < len(holes) && holes[hi].from <= c {
-			continue
-		}
-		off := c << shift
+	for bl in blocks {
 		rk: journal.Key
-		if !keys.key(keys.data, off, &rk) {
+		if !keys.block(keys.data, u64(bl.cell), bl.bits, &rk) {
 			_wipe(rk[:])
 			blake2b.final(&ctx, k[:])
 			_wipe(k[:])
 			return {}, .No_Key
 		}
+		at: [9]u8
+		prim.put_u64le(at[0:8], u64(bl.cell))
+		at[8] = bl.bits
+		blake2b.update(&ctx, at[:])
 		blake2b.update(&ctx, rk[:])
 		_wipe(rk[:])
 	}
@@ -439,9 +517,34 @@ group_key :: proc(keys: journal.Key_Provider, first, end: i64, shift: u8, salt: 
 	return k, .None
 }
 
+@(private)
+_tiles :: proc(lo, top: i64, holes: []Cells, blocks: []Block) -> bool {
+	pos := lo
+	i, j := 0, 0
+	for pos < top {
+		if i < len(holes) && holes[i].from == pos {
+			pos = holes[i].to
+			i += 1
+			continue
+		}
+		if j < len(blocks) && blocks[j].cell == pos {
+			bl := blocks[j]
+			size := i64(1) << bl.bits
+			if bl.bits > BLOCK_BITS_MAX || pos & (size - 1) != 0 || size > top - pos {
+				return false
+			}
+			pos += size
+			j += 1
+			continue
+		}
+		return false
+	}
+	return pos == top && i == len(holes) && j == len(blocks)
+}
+
 group_parse :: proc(body: []u8, arc_off: i64) -> (g: Group, err: Error) {
 	r := prim.reader(body)
-	if prim.read_u8(&r) != GROUP_KIND || prim.read_u8(&r) != VERSION {
+	if prim.read_u8(&r) != GROUP_KIND || prim.read_u8(&r) != GROUP_VERSION {
 		return {}, .Corrupt
 	}
 	g.arc_off = arc_off
@@ -480,7 +583,23 @@ group_parse :: proc(body: []u8, arc_off: i64) -> (g: Group, err: Error) {
 			prev = holes[i].to
 		}
 		g.holes = holes
-		if prim.reader_remaining(&r) < TAG {
+		nb := prim.read_uvarint(&r)
+		if r.err != .None || nb > u64(prim.reader_remaining(&r) / 2) {
+			return {}, .Corrupt
+		}
+		blocks := make([]Block, int(nb), context.temp_allocator)
+		bprev := lo
+		for i in 0 ..< int(nb) {
+			gap := prim.read_uvarint(&r)
+			bits := prim.read_u8(&r)
+			if r.err != .None || gap > u64(top - bprev) || bits > BLOCK_BITS_MAX {
+				return {}, .Corrupt
+			}
+			blocks[i] = Block{bprev + i64(gap), bits}
+			bprev = blocks[i].cell + (i64(1) << bits)
+		}
+		g.blocks = blocks
+		if !_tiles(lo, top, holes, blocks) || prim.reader_remaining(&r) < TAG {
 			return {}, .Corrupt
 		}
 	}
@@ -493,7 +612,7 @@ group_open :: proc(g: ^Group, keys: journal.Key_Provider, allocator := context.t
 	plain := g.payload
 	if g.mode == .Sealed {
 		frame := g.payload[:len(g.payload) - TAG]
-		k := group_key(keys, g.first, g.end, g.shift, g.salt, g.holes) or_return
+		k := group_key(keys, g.first, g.end, g.shift, g.salt, g.blocks) or_return
 		buf, aerr := make([]u8, len(frame), context.temp_allocator)
 		if aerr != nil {
 			_wipe(k[:])
@@ -629,6 +748,15 @@ cursor_next :: proc(cur: ^Cursor, e: ^Entry) -> (ok: bool, err: Error) {
 }
 
 group_verify :: proc(g: ^Group, raw: []u8, chain: ^journal.Chain) -> Error {
+	return _group_walk(g, raw, chain, {}, false, nil)
+}
+
+group_records :: proc(g: ^Group, raw: []u8, chain: ^journal.Chain, keys: journal.Key_Provider, sealed: bool, out: ^[dynamic]u8) -> Error {
+	return _group_walk(g, raw, chain, keys, sealed, out)
+}
+
+@(private)
+_group_walk :: proc(g: ^Group, raw: []u8, chain: ^journal.Chain, keys: journal.Key_Provider, sealed: bool, out: ^[dynamic]u8) -> Error {
 	cur: Cursor
 	cursor_init(&cur, g, raw)
 	defer cursor_destroy(&cur)
@@ -648,7 +776,6 @@ group_verify :: proc(g: ^Group, raw: []u8, chain: ^journal.Chain) -> Error {
 		}
 		switch e.kind {
 		case .Sig:
-			continue
 		case .Gone:
 			pending = true
 		case .Gone_Head:
@@ -665,6 +792,13 @@ group_verify :: proc(g: ^Group, raw: []u8, chain: ^journal.Chain) -> Error {
 				return .No_Key
 			}
 			head = journal.chain_fold(head, e.off, journal.Link{len = u32(e.len), commit = cm})
+		}
+		if out != nil {
+			at := len(out)
+			if resize(out, at + int(journal.record_size(e.len))) != nil {
+				return .No_Memory
+			}
+			entry_record(&e, out[at:], keys, sealed) or_return
 		}
 	}
 	if pending || head != g.head_after {
