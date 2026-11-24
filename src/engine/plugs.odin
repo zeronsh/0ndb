@@ -363,7 +363,7 @@ _sleep_owed :: proc(e: ^Engine) {
 	}
 	if e.sweep_owed && e.settle_timer == 0 {
 		_handles_sweep(e, 0)
-		e.sweep_owed = len(e.lru) > 0
+		e.sweep_owed = _hists_sleep(e) || len(e.lru) > 0
 	}
 }
 

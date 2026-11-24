@@ -1088,25 +1088,25 @@ check_asleep :: proc(w: ^World, n: ^Node) {
 			}
 		}
 	}
-	ids := make([dynamic]prim.Id, context.temp_allocator)
-	for id in n.e.handles {
-		append(&ids, id)
-	}
-	slice.sort_by(ids[:], proc(a, b: prim.Id) -> bool {
-		x, y := a, b
-		return string(x[:]) < string(y[:])
-	})
-	for id in ids {
+	for id in prim.sorted_keys(n.e.handles) {
 		h := n.e.handles[id]
 		if h == nil || h.hist == nil || !h.hist.awake {
 			continue
 		}
-		held := len(h.hist.mounts) > 0
+		awake := 0
 		for m in h.hist.mounts {
-			held &&= m.awake
+			if m.awake {
+				awake += 1
+			}
 		}
-		if !held && h.pins == 0 {
-			world_fail(w, "idle: %s history of %v %s is awake after settle with no awake mount and no pin (history mark %d durable %d, writer %v, handles %d, settle timer %v)", n.name, h.kind, id_short(id), fs.history_durable_mark(h.hist), h.hist.durable, h.w_open, len(n.e.handles), n.e.settle_timer != 0)
+		buffers := 0
+		for b in n.e.buffers {
+			if b.object.id == id {
+				buffers += 1
+			}
+		}
+		if awake == 0 && buffers == 0 {
+			world_fail(w, "idle: %s history of %v %s is awake after settle with no awake mount and no open buffer (%d mounts, %d pins, mark %d durable %d)", n.name, h.kind, id_short(id), len(h.hist.mounts), h.pins, fs.history_durable_mark(h.hist), h.hist.durable)
 		}
 	}
 }
