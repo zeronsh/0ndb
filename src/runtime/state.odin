@@ -372,7 +372,7 @@ runner_live :: proc(r: ^Runtime, space: prim.Id, device: prim.Id, provider: stri
 		return false
 	}
 	if device == r.self {
-		return r.cfg.runner && !r.closing && (len(provider) == 0 || _list_has(_providers_local(r), provider))
+		return r.cfg.runner && !r.closing && (len(provider) == 0 || _provider_installed(r, provider))
 	}
 	if !runner_present(r, space, device) {
 		return false
@@ -478,13 +478,41 @@ _providers_local :: proc(r: ^Runtime) -> string {
 	ids := make([dynamic]string, context.temp_allocator)
 	append(&ids, PROVIDER_NATIVE)
 	for d in r.registry.list {
-		desc, ok := _descriptor(r, d.id)
-		if ok && len(desc.argv) > 0 && _exe_found(r, desc.argv[0]) {
+		if _provider_installed(r, d.id) {
 			append(&ids, d.id)
 		}
 	}
 	slice.sort(ids[:])
 	return strings.join(ids[:], "\n", context.temp_allocator)
+}
+
+INSTALLED_TTL_NS :: i64(30_000_000_000)
+
+Installed_Probe :: struct {
+	found: bool,
+	at:    i64,
+}
+
+@(private)
+_provider_installed :: proc(r: ^Runtime, id: string) -> bool {
+	if id == PROVIDER_NATIVE {
+		return true
+	}
+	now := mono_ns(r)
+	if p, ok := r.installed[id]; ok && now - p.at < INSTALLED_TTL_NS {
+		return p.found
+	}
+	desc, dok := _descriptor(r, id)
+	found := dok && len(desc.argv) > 0 && _exe_found(r, desc.argv[0])
+	if r.installed == nil {
+		r.installed = make(map[string]Installed_Probe, r.allocator)
+	}
+	if p, ok := &r.installed[id]; ok {
+		p^ = {found, now}
+	} else {
+		r.installed[strings.clone(id, r.allocator)] = {found, now}
+	}
+	return found
 }
 
 @(private)
