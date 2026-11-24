@@ -1,5 +1,7 @@
 package engine
 
+import "core:fmt"
+
 import "base:runtime"
 import "core:slice"
 import "core:strings"
@@ -263,11 +265,19 @@ convo_move :: proc(e: ^Engine, o: Object, cause: convo.Move_Cause, to: Rid, of: 
 	if obj.rid_none(to) {
 		return {}, .Invalid
 	}
-	from := _cu_position(e, o) or_return
+	from, perr := _cu_position(e, o)
+	if perr != .None {
+		fmt.eprintf("DBGM position %v pending %v\n", perr, _damage_pending(e, o.id))
+		return {}, perr
+	}
 	if from == to && cause != .Rebase {
 		return {}, .None
 	}
-	p := _cu_paths(e, o, from, to) or_return
+	p, aerr := _cu_paths(e, o, from, to)
+	if aerr != .None {
+		fmt.eprintf("DBGM paths %v pending %v\n", aerr, _damage_pending(e, o.id))
+		return {}, aerr
+	}
 	msg := to
 	if len(p.old_only) > 0 {
 		msg = p.old_only[len(p.old_only) - 1]
@@ -275,8 +285,16 @@ convo_move :: proc(e: ^Engine, o: Object, cause: convo.Move_Cause, to: Rid, of: 
 		msg = p.new_only[len(p.new_only) - 1]
 	}
 	move = new_id(e)
-	_cu_undo_write(e, o, move, msg, .Staged, nil, of, {cause = cause, from = from, to = to}) or_return
-	return move, _cu_drive_new(e, o, move)
+	werr := _cu_undo_write(e, o, move, msg, .Staged, nil, of, {cause = cause, from = from, to = to})
+	if werr != .None {
+		fmt.eprintf("DBGM write %v pending %v\n", werr, _damage_pending(e, o.id))
+		return {}, werr
+	}
+	drerr := _cu_drive_new(e, o, move)
+	if drerr != .None && drerr != .Pending {
+		fmt.eprintf("DBGM drive %v pending %v\n", drerr, _damage_pending(e, o.id))
+	}
+	return move, drerr
 }
 
 convo_regenerate :: proc(e: ^Engine, o: Object, msg: Rid) -> (move: prim.Id, err: Error) {
@@ -671,8 +689,13 @@ _cu_undone_of :: proc(e: ^Engine, o: Object, undo: prim.Id) -> (u: convo.Undone_
 
 @(private)
 _cu_undo_write :: proc(e: ^Engine, o: Object, undo: prim.Id, msg: Rid, phase: convo.Undo_Phase, set: []convo.Undo_Line, redo: prim.Id, move: convo.Move_Spec = {}) -> Error {
-	h := _convo_writable(e, o) or_return
+	h, cerr := _convo_writable(e, o)
+	if cerr != .None {
+		fmt.eprintf("DBGM writable %v pending %v\n", cerr, _damage_pending(e, o.id))
+		return cerr
+	}
 	if _, x := convo.writer_undo(&h.cw, undo, msg, phase, set, redo, move); x != .None {
+		fmt.eprintf("DBGM writer_undo %v damaged %v pending %v w_open %v\n", x, h.damaged, _damage_pending(e, o.id), h.w_open)
 		return _oerr(x)
 	}
 	return _cu_durable(e, h)
