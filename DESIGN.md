@@ -508,7 +508,12 @@ equal in both directions.
   it, is a display-time diff against the line's previous version that is
   never stored, so it cannot fabricate history. Background passes
   defer files younger than a settle delay; scope ends, fences and shutdown
-  ingest everything. A rename onto an existing name (the target's inode
+  ingest everything. The moves one pass detects reach the shadow in any
+  order: a move takes its source's entries only while they still name the
+  moved inode, and a move onto a path whose entry belongs to an inode that
+  also moves away in the pass first sets that entry and its subtree aside
+  for that inode's own move, so a chain or a swap of moves never drops or
+  mixes entries. A rename onto an existing name (the target's inode
   number becomes the one a removed path had) is a content change of the
   replaced file plus a remove of the source, never a move: the runs of the
   new content that a line diff against the source's current text keeps

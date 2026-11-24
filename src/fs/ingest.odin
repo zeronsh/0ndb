@@ -1230,6 +1230,7 @@ Pass :: struct {
 	deferred:   map[u64]bool,
 	holding:    [dynamic]string,
 	rebased:    [dynamic]crdt.Op_Id,
+	stash:      map[fstree.Inode_Id][dynamic]Stashed,
 	restored:   bool,
 	scope_of:   map[string]^Scope,
 	cutoff:     i64,
@@ -1578,6 +1579,7 @@ mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> (err: Error) {
 	p.deferred = make(map[u64]bool, p.long)
 	p.holding = make([dynamic]string, p.long)
 	p.rebased = make([dynamic]crdt.Op_Id, p.long)
+	p.stash = make(map[fstree.Inode_Id][dynamic]Stashed, p.long)
 	p.scope_of = make(map[string]^Scope, p.long)
 	p.settle = settle && !p.git_wrote
 	p.now = history_wall_ns(m.history)
@@ -2907,14 +2909,31 @@ emit_change_inner :: proc(p: ^Pass, b: ^Builder, c: ^Change) -> Error {
 			mount_mark(m, c.path)
 			if c.moved != "" {
 				mount_mark(m, c.moved)
+				if list, stashed := p.stash[c.old.inode]; stashed {
+					shadow_put(&m.shadow, c.moved, list[0].entry) or_return
+					for x in list[1:] {
+						np, _ := path_join(c.moved, x.rel, context.temp_allocator)
+						shadow_put(&m.shadow, np, x.entry) or_return
+					}
+					delete_key(&p.stash, c.old.inode)
+				}
 			}
 			return .None
 		}
 		if c.moved != "" {
 			builder_tree(b, fstree.Op_Move{inode = c.old.inode, parent = parent, name = path_name(c.path)})
+			stash_moving(p, c.path, c.old.inode) or_return
 			if c.old.kind == .Dir {
 				watch_dir(m.reg, m, c.path, -1)
-				move_shadow_tree(m, c.moved, c.path) or_return
+				if list, stashed := p.stash[c.old.inode]; stashed {
+					for x in list[1:] {
+						np, _ := path_join(c.path, x.rel, context.temp_allocator)
+						shadow_put(&m.shadow, np, x.entry) or_return
+					}
+					delete_key(&p.stash, c.old.inode)
+				} else if holds_inode(m, c.moved, c.old.inode) or_return {
+					move_shadow_tree(m, c.moved, c.path) or_return
+				}
 				e := c.old
 				e.stat = c.stat
 				shadow_put(&m.shadow, c.path, e) or_return
@@ -2923,7 +2942,10 @@ emit_change_inner :: proc(p: ^Pass, b: ^Builder, c: ^Change) -> Error {
 				}
 				return .None
 			}
-			shadow_remove(&m.shadow, c.moved) or_return
+			if holds_inode(m, c.moved, c.old.inode) or_return {
+				shadow_remove(&m.shadow, c.moved) or_return
+			}
+			delete_key(&p.stash, c.old.inode)
 			e := c.old
 			shadow_put(&m.shadow, c.path, e) or_return
 			if shadow_has_losers(m, c.moved) or_return {
@@ -2950,6 +2972,59 @@ emit_change_inner :: proc(p: ^Pass, b: ^Builder, c: ^Change) -> Error {
 			}
 		}
 		return emit_modify(p, b, c, c.old)
+	}
+	return .None
+}
+
+@(private)
+Stashed :: struct {
+	rel:   string,
+	entry: Entry,
+}
+
+@(private)
+holds_inode :: proc(m: ^Mount, path: string, inode: fstree.Inode_Id) -> (held: bool, err: Error) {
+	e, found := shadow_get(&m.shadow, path) or_return
+	return found && e.inode == inode, .None
+}
+
+@(private)
+stash_moving :: proc(p: ^Pass, path: string, inode: fstree.Inode_Id) -> Error {
+	m := p.m
+	e, found := shadow_get(&m.shadow, path) or_return
+	if !found || e.inode == inode {
+		return .None
+	}
+	leaving := false
+	for c in p.changes {
+		leaving ||= c.kind == .Create && c.moved == path && c.old.inode == e.inode
+	}
+	if !leaving {
+		return .None
+	}
+	list := make([dynamic]Stashed, p.long)
+	append(&list, Stashed{entry = e})
+	if e.kind == .Dir {
+		stash_tree(p, path, "", &list) or_return
+	}
+	shadow_remove(&m.shadow, path) or_return
+	p.stash[e.inode] = list
+	return .None
+}
+
+@(private)
+stash_tree :: proc(p: ^Pass, from: string, rel: string, out: ^[dynamic]Stashed) -> Error {
+	m := p.m
+	kids := make([dynamic]Shadow_Child, context.temp_allocator)
+	shadow_children(&m.shadow, from, &kids, context.temp_allocator) or_return
+	for k in kids {
+		a, _ := path_join(from, k.name, context.temp_allocator)
+		r, _ := path_join(rel, k.name, p.long)
+		if k.entry.kind == .Dir {
+			stash_tree(p, a, r, out) or_return
+		}
+		shadow_remove(&m.shadow, a) or_return
+		append(out, Stashed{rel = r, entry = k.entry})
 	}
 	return .None
 }
