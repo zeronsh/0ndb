@@ -158,7 +158,9 @@ _dlog_apply :: proc(e: ^Engine, x: dl.Entry) -> Dlog_Step {
 	if rerr := _hist_ready(e, h); rerr != .None {
 		return _dlog_busy(rerr)
 	}
-	_hist_catch_up(e, h)
+	if _, cerr := _hist_catch_up(e, h); cerr != .None {
+		return _dlog_busy(cerr)
+	}
 	hist := h.hist
 	if hist == nil || !hist.awake || hist.own_wait {
 		return .Retry
