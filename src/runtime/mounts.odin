@@ -127,7 +127,7 @@ worktree_dir_busy :: proc(r: ^Runtime, dir: string, except: ^Worktree) -> bool {
 	for run in r.runs {
 		if run.ws != nil && run.ws != except {
 			for mb in run.ws.members {
-				if mb.dir == dir {
+				if fs.path_same(mb.dir, dir) {
 					return true
 				}
 			}
@@ -136,7 +136,7 @@ worktree_dir_busy :: proc(r: ^Runtime, dir: string, except: ^Worktree) -> bool {
 	for p in r.procs {
 		if p.ws != nil && p.ws != except && p.ws.busy {
 			for mb in p.ws.members {
-				if mb.dir == dir {
+				if fs.path_same(mb.dir, dir) {
 					return true
 				}
 			}
@@ -312,7 +312,7 @@ _home_on_line :: proc(r: ^Runtime, home: string, line: prim.Id) -> bool {
 		return true
 	}
 	for m in reg.mounts {
-		if m != nil && m.root == home {
+		if m != nil && fs.path_same(m.root, home) {
 			return m.line == line_name(line)
 		}
 	}
@@ -333,7 +333,7 @@ _member_mount :: proc(ws: ^Worktree, mb: ^Wt_Member) -> Error {
 	}
 	clean := fs.clean_path(mb.dir, context.temp_allocator)
 	for m in reg.mounts {
-		if m != nil && m.history == h && m.root == clean {
+		if m != nil && m.history == h && fs.path_same(m.root, clean) {
 			mb.m = m
 			mb.borrowed = true
 			return .None
