@@ -2738,6 +2738,9 @@ recover_orphan :: proc(m: ^Mount, p: string, e: Entry, ino: fstree.Inode_Id, int
 		}
 		at := [1]crdt.Op_Id{it.end}
 		t, terr := history_text_at(h, ino, at[:], context.temp_allocator)
+		if terr != .None && !_text_absent(terr) {
+			return false, terr
+		}
 		if terr != .None || string(t) != string(data) {
 			continue
 		}
@@ -2774,6 +2777,9 @@ recover_at :: proc(m: ^Mount, e: ^Entry, p: string, ino: fstree.Inode_Id, target
 		}
 		at := [1]crdt.Op_Id{it.end}
 		t, terr := history_text_at(h, ino, at[:], context.temp_allocator)
+		if terr != .None && !_text_absent(terr) {
+			return terr
+		}
 		if terr != .None || string(t) != string(data) {
 			continue
 		}
@@ -2790,7 +2796,11 @@ recover_at :: proc(m: ^Mount, e: ^Entry, p: string, ino: fstree.Inode_Id, target
 			for id, i in ids {
 				v[i] = inode_op(h, id)
 			}
-			if t, terr := history_text_at(h, ino, v, context.temp_allocator); terr == .None && string(t) == string(data) {
+			t, terr := history_text_at(h, ino, v, context.temp_allocator)
+			if terr != .None && !_text_absent(terr) {
+				return terr
+			}
+			if terr == .None && string(t) == string(data) {
 				e.ver = was.ver
 				e.stat = d.stat
 				e.oid = oid
@@ -2800,7 +2810,11 @@ recover_at :: proc(m: ^Mount, e: ^Entry, p: string, ino: fstree.Inode_Id, target
 		}
 	}
 	held := crdt.graph_version_ids(&h.g, have, context.temp_allocator)
-	if t, terr := history_text_at(h, ino, held, context.temp_allocator); terr == .None && string(t) == string(data) {
+	t, terr := history_text_at(h, ino, held, context.temp_allocator)
+	if terr != .None && !_text_absent(terr) {
+		return terr
+	}
+	if terr == .None && string(t) == string(data) {
 		at := make([]fstree.Op_Id, len(held), context.temp_allocator)
 		for id, i in held {
 			at[i] = op_inode(h, id)

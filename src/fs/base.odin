@@ -381,10 +381,24 @@ _same_content :: proc(m: ^Mount, c: ^Change) -> bool {
 }
 
 @(private)
-_change_pin :: proc(m: ^Mount, c: ^Change, buf: ^Pin) -> (p: ^Pin, actor: prim.Id, observed: bool) {
+_text_absent :: proc(e: Error) -> bool {
+	return e == .Not_Found || e == .Redacted || e == .Corrupt
+}
+
+@(private)
+_text_is :: proc(h: ^History, inode: fstree.Inode_Id, v: []crdt.Op_Id, hash: [32]u8) -> (same: bool, err: Error) {
+	t, terr := history_text_at(h, inode, v, context.temp_allocator)
+	if terr != .None {
+		return false, .None if _text_absent(terr) else terr
+	}
+	return _content_hash(t) == hash, .None
+}
+
+@(private)
+_change_pin :: proc(m: ^Mount, c: ^Change, buf: ^Pin) -> (p: ^Pin, actor: prim.Id, observed: bool, err: Error) {
 	if c.scope != nil {
 		if x := _pin(c.scope, c.path, false); x != nil && (x.has_read || x.has_write) && !_same_content(m, c) {
-			return x, c.scope.actor, false
+			return x, c.scope.actor, false, .None
 		}
 		return _entry_pin(m, c, buf, c.scope.actor)
 	}
@@ -392,7 +406,7 @@ _change_pin :: proc(m: ^Mount, c: ^Change, buf: ^Pin) -> (p: ^Pin, actor: prim.I
 	if !ok || a.used || m.history == nil {
 		return _entry_pin(m, c, buf, attrib_default_actor(m, c.path))
 	}
-	o, found := _observed(m.history, a.actor, c.path)
+	o, found := _observed(m.history, a.actor, c.path) or_return
 	if !found || _same_content(m, c) {
 		return _entry_pin(m, c, buf, attrib_default_actor(m, c.path))
 	}
@@ -401,44 +415,42 @@ _change_pin :: proc(m: ^Mount, c: ^Change, buf: ^Pin) -> (p: ^Pin, actor: prim.I
 	buf.read_inode = op_inode(m.history, o.inode)
 	buf.read_hash = o.hash
 	buf.has_read = true
-	return buf, a.actor, true
+	return buf, a.actor, true, .None
 }
 
 @(private)
-_entry_pin :: proc(m: ^Mount, c: ^Change, buf: ^Pin, actor: prim.Id) -> (p: ^Pin, who: prim.Id, observed: bool) {
+_entry_pin :: proc(m: ^Mount, c: ^Change, buf: ^Pin, actor: prim.Id) -> (p: ^Pin, who: prim.Id, observed: bool, err: Error) {
 	if m.history == nil || c.kind != .Modify || c.old.kind != .File || c.old.ver == 0 {
-		return nil, {}, false
+		return nil, {}, false, .None
 	}
 	h := m.history
-	snap, serr := synced_snapshot(m)
-	if serr != .None {
-		return nil, {}, false
-	}
+	snap := synced_snapshot(m) or_return
 	removed, rerr := snapshot_removed(&snap, c.old.inode)
 	fstree.snapshot_destroy(&snap)
-	if rerr != .None || removed {
-		return nil, {}, false
+	rerr or_return
+	if removed {
+		return nil, {}, false, .None
 	}
 	buf.read = make([dynamic]crdt.Op_Id, context.temp_allocator)
 	ids, vok := shadow_version(&m.shadow, c.old)
 	if !vok {
-		return nil, {}, false
+		return nil, {}, false, .None
 	}
 	for id in ids {
 		append(&buf.read, inode_op(h, id))
 	}
 	t, terr := history_text_at(h, c.old.inode, buf.read[:], context.temp_allocator)
 	if terr != .None {
-		return nil, {}, false
+		return nil, {}, false, .None if _text_absent(terr) else terr
 	}
 	buf.read_inode = c.old.inode
 	buf.read_hash = _content_hash(t)
 	buf.has_read = true
-	return buf, actor, true
+	return buf, actor, true, .None
 }
 
 @(private)
-_observed :: proc(h: ^History, actor: prim.Id, rel: string) -> (o: fshist.Observe_Op, found: bool) {
+_observed :: proc(h: ^History, actor: prim.Id, rel: string) -> (o: fshist.Observe_Op, found: bool, err: Error) {
 	known := crdt.graph_known(&h.g, actor)
 	seq := known
 	written := make(map[crdt.Op_Id]bool, context.temp_allocator)
@@ -452,6 +464,9 @@ _observed :: proc(h: ^History, actor: prim.Id, rel: string) -> (o: fshist.Observ
 			return
 		}
 		b, berr := history_read_batch(h, stream, off, context.temp_allocator)
+		if berr != .None && !_text_absent(berr) {
+			return {}, false, berr
+		}
 		if berr == .None {
 			for op in b.ops {
 				if op.kind == .Opaque && len(op.content) > 0 && op.content[0] == fshist.TOP_OBSERVE {
@@ -463,7 +478,7 @@ _observed :: proc(h: ^History, actor: prim.Id, rel: string) -> (o: fshist.Observ
 			}
 			if found {
 				if written[o.inode] {
-					return {}, false
+					return {}, false, .None
 				}
 				return
 			}
@@ -487,51 +502,52 @@ _change_pin_drop :: proc(m: ^Mount, c: ^Change, observed: bool) {
 }
 
 @(private)
-_base_version :: proc(m: ^Mount, p: ^Pin, actor: prim.Id) -> (v: []crdt.Op_Id, inode: fstree.Inode_Id, pinned: bool) {
+_base_version :: proc(m: ^Mount, p: ^Pin, actor: prim.Id) -> (v: []crdt.Op_Id, inode: fstree.Inode_Id, pinned: bool, err: Error) {
 	if p == nil {
-		return nil, {}, false
+		return nil, {}, false, .None
 	}
 	h := m.history
 	if p.has_write && p.has_base {
-		if t, err := history_text_at(h, p.write_inode, p.write[:], context.temp_allocator); err == .None && _content_hash(t) == p.base_hash {
-			return _base_parents(m, actor, p.write_inode, p.write[:], p.base_hash), p.write_inode, true
+		if _text_is(h, p.write_inode, p.write[:], p.base_hash) or_return {
+			v = _base_parents(m, actor, p.write_inode, p.write[:], p.base_hash) or_return
+			return v, p.write_inode, true, .None
 		}
 	}
 	if p.has_read {
-		if t, err := history_text_at(h, p.read_inode, p.read[:], context.temp_allocator); err == .None && _content_hash(t) == p.read_hash {
-			return _base_parents(m, actor, p.read_inode, p.read[:], p.read_hash), p.read_inode, true
+		if _text_is(h, p.read_inode, p.read[:], p.read_hash) or_return {
+			v = _base_parents(m, actor, p.read_inode, p.read[:], p.read_hash) or_return
+			return v, p.read_inode, true, .None
 		}
 	}
-	return nil, {}, p.has_read || p.has_base
+	return nil, {}, p.has_read || p.has_base, .None
 }
 
 @(private)
-_base_parents :: proc(m: ^Mount, actor: prim.Id, inode: fstree.Inode_Id, v: []crdt.Op_Id, hash: [32]u8) -> []crdt.Op_Id {
+_base_parents :: proc(m: ^Mount, actor: prim.Id, inode: fstree.Inode_Id, v: []crdt.Op_Id, hash: [32]u8) -> (out: []crdt.Op_Id, err: Error) {
 	h := m.history
 	known := crdt.graph_known(&h.g, actor)
 	if known == 0 {
-		return slice.clone(v, context.temp_allocator)
+		return slice.clone(v, context.temp_allocator), .None
 	}
 	own, ok := crdt.graph_lv(&h.g, crdt.Op_Id{actor, known - 1})
 	vl := make([dynamic]crdt.Lv, context.temp_allocator)
 	if !ok || crdt.graph_version_lvs(&h.g, v, &vl) != .None {
-		return nil
+		return nil, .None
 	}
 	if crdt.graph_contains(&h.g, vl[:], own) {
-		return slice.clone(v, context.temp_allocator)
+		return slice.clone(v, context.temp_allocator), .None
 	}
 	if !lv_in_line(m, own) {
-		return nil
+		return nil, .None
 	}
 	one := [1]crdt.Lv{own}
 	both := make([dynamic]crdt.Lv, context.temp_allocator)
 	crdt.version_union(&h.g, vl[:], one[:], &both)
 	ids := crdt.graph_version_ids(&h.g, both[:], context.temp_allocator)
-	t, err := history_text_at(h, inode, ids, context.temp_allocator)
-	if err != .None || _content_hash(t) != hash {
-		return nil
+	if !(_text_is(h, inode, ids, hash) or_return) {
+		return nil, .None
 	}
-	return ids
+	return ids, .None
 }
 
 @(private)
@@ -549,7 +565,7 @@ rebase_changes :: proc(p: ^Pass) -> Error {
 			append(&p.young, k)
 		}
 		pbuf: Pin
-		pin, actor, observed := _change_pin(m, &c, &pbuf)
+		pin, actor, observed := _change_pin(m, &c, &pbuf) or_return
 		if pin == nil {
 			append(&keep, c)
 			continue
@@ -565,12 +581,11 @@ rebase_changes :: proc(p: ^Pass) -> Error {
 			append(&keep, c)
 			continue
 		}
-		v, inode, pinned := _base_version(m, pin, actor)
+		v, inode, pinned := _base_version(m, pin, actor) or_return
 		event := false
 		if v == nil {
-			if v, inode = _base_plain(m, pin); v != nil {
-				event = true
-			}
+			v, inode = _base_plain(m, pin) or_return
+			event = v != nil
 		}
 		if v != nil && (c.kind != .Modify || inode != c.old.inode) {
 			if _, _, elsewhere, serr := shadow_by_inode(&m.shadow, inode, context.temp_allocator); serr != .None || elsewhere {
@@ -580,13 +595,13 @@ rebase_changes :: proc(p: ^Pass) -> Error {
 		fell := false
 		if v == nil && pinned && c.kind == .Modify && c.old.ver != 0 {
 			ebuf: Pin
-			if ep, _, _ := _entry_pin(m, &c, &ebuf, actor); ep != nil {
-				v, inode, _ = _base_version(m, ep, actor)
+			ep, _, _ := _entry_pin(m, &c, &ebuf, actor) or_return
+			if ep != nil {
+				v, inode, _ = _base_version(m, ep, actor) or_return
 				event = false
 				if v == nil {
-					if v, inode = _base_plain(m, ep); v != nil {
-						event = true
-					}
+					v, inode = _base_plain(m, ep) or_return
+					event = v != nil
 				}
 				fell = v != nil
 			}
@@ -658,22 +673,22 @@ rebase_changes :: proc(p: ^Pass) -> Error {
 }
 
 @(private)
-_base_plain :: proc(m: ^Mount, p: ^Pin) -> (v: []crdt.Op_Id, inode: fstree.Inode_Id) {
+_base_plain :: proc(m: ^Mount, p: ^Pin) -> (v: []crdt.Op_Id, inode: fstree.Inode_Id, err: Error) {
 	if p == nil {
-		return nil, {}
+		return nil, {}, .None
 	}
 	h := m.history
 	if p.has_write && p.has_base {
-		if t, err := history_text_at(h, p.write_inode, p.write[:], context.temp_allocator); err == .None && _content_hash(t) == p.base_hash {
-			return slice.clone(p.write[:], context.temp_allocator), p.write_inode
+		if _text_is(h, p.write_inode, p.write[:], p.base_hash) or_return {
+			return slice.clone(p.write[:], context.temp_allocator), p.write_inode, .None
 		}
 	}
 	if p.has_read {
-		if t, err := history_text_at(h, p.read_inode, p.read[:], context.temp_allocator); err == .None && _content_hash(t) == p.read_hash {
-			return slice.clone(p.read[:], context.temp_allocator), p.read_inode
+		if _text_is(h, p.read_inode, p.read[:], p.read_hash) or_return {
+			return slice.clone(p.read[:], context.temp_allocator), p.read_inode, .None
 		}
 	}
-	return nil, {}
+	return nil, {}, .None
 }
 
 @(private)
