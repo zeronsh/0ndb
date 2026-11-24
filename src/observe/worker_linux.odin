@@ -332,6 +332,7 @@ _encode_write :: proc(buf: ^[dynamic]u8, w: ^Write) {
 	prim.write_u32le(&pw, u32(w.pid))
 	prim.write_u32le(&pw, u32(w.tree))
 	prim.write_u64le(&pw, w.dev)
+	prim.write_u64le(&pw, u64(w.age))
 	prim.write_uvarint(&pw, u64(len(w.lineage)))
 	for p in w.lineage {
 		prim.write_u32le(&pw, u32(p))
@@ -354,6 +355,8 @@ _deliver_record :: proc(s: ^Supervisor, rec: []u8) {
 	w.pid = prim.Pid(i32(prim.read_u32le(&rd)))
 	w.tree = prim.Pid(i32(prim.read_u32le(&rd)))
 	w.dev = prim.read_u64le(&rd)
+	w.age = max(prim.mono_ns() - i64(prim.read_u64le(&rd)), 0)
+	w.stamped = true
 	n := int(prim.read_uvarint(&rd))
 	if n > MAX_LINEAGE {
 		return

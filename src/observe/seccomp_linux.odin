@@ -1043,6 +1043,7 @@ _handle_one :: proc(s: ^Supervisor, t: ^Tree) -> bool {
 	if w.op == .Write && w.flags & u32(O_CREAT | O_EXCL) == u32(O_CREAT | O_EXCL) && len(w.path) > 11 && w.path[len(w.path) - 11:] == "/index.lock" {
 		_lock_record(s, w.path, tgid)
 	}
+	w.age = prim.mono_ns()
 	_encode_write(&t.wbuf, &w)
 	if gid, gated := _gate_match(s, w.path, w.from, tgid, w.lineage); gated && _park(s, t, n.id, gid) {
 		_stat_add(&s.stats.parked)
