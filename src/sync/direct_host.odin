@@ -18,6 +18,12 @@ replicator_direct :: proc(r: ^Replicator, to: Device_Id, tag: u64, payload: []u8
 _on_direct_event :: proc(r: ^Replicator, ev: ^Event) {
 	d: Device_Id
 	copy(d[:], ev.id[:16])
+	if u64(ev.at) == SERVABLE_TAG {
+		if ev.kind == .Direct {
+			_pipe_on_servable(r, d, ev.data)
+		}
+		return
+	}
 	_emit(r, Repl_Event{kind = .Direct if ev.kind == .Direct else .Undelivered, device = d, length = ev.at, meta = ev.data})
 }
 

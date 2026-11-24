@@ -3241,8 +3241,15 @@ Relay cost tracks the reachable information, not the activity. Items marked
   presence `up` re-drives every pending content wait in the space from the
   relay stage with its rounds reset, so a blob uploaded meanwhile arrives
   from the relay and one still held arrives from the holder; no wait is
-  left parked on a request that was already answered. Device-only trees
-  upload neither blobs nor checkpoints.
+  left parked on a request that was already answered. A holder that answers
+  a blob pull `none` because it has no serve entry yet remembers the
+  requester for that part key (at most four requesters per key and 64 keys;
+  dropped when the notice is sent, when the requester's presence goes down,
+  or when the connection resets, so an idle device holds none). When it
+  registers that key as servable it sends exactly those requesters a direct
+  message (tag `SERVABLE_TAG`, payload the part keys), and each re-arms its
+  piping get for that key on that holder at once, with no presence change
+  and no new read. Device-only trees upload neither blobs nor checkpoints.
 - **Peer serving.** A reader that needs a range below `base` pulls it from a
   holder: the segment's writer or another device with segments in the same
   object, filtered by presence. Up to four 1 MiB pulls per segment are in

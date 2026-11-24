@@ -356,10 +356,14 @@ _pipe_presence :: proc(r: ^Replicator, d: Device_Id, up: bool) {
 			_pipe_pull(r, j)
 		}
 	}
+	if !up {
+		_refusals_drop(r, d)
+	}
 }
 
 @(private)
 _pipe_on_reset :: proc(r: ^Replicator) {
+	clear(&r.objs.refusals)
 	clear(&r.objs.pulls)
 	r.objs.prx = nil
 	for j in r.objs.jobs {
@@ -378,6 +382,7 @@ _serve_object :: proc(r: ^Replicator, q: Serve_Req) -> bool {
 	}
 	src, ok := r.cfg.object_source(r.cfg.user, Object_Key(q.id), context.temp_allocator)
 	if !ok {
+		_refusal_note(r, Object_Key(q.id), q.requester)
 		return false
 	}
 	defer crypto.zero_explicit(&src.ckey, size_of(src.ckey))
@@ -522,4 +527,133 @@ _serve_send_raw :: proc(r: ^Replicator, q: Serve_Req, at: i64, data: []u8, lengt
 			return
 		}
 	}
+}
+
+SERVABLE_TAG :: u64(0x306e_6462_7365_7276)
+
+@(private)
+REFUSALS_MAX :: 64
+
+@(private)
+REFUSERS_MAX :: 4
+
+Refusal :: struct {
+	n:   int,
+	who: [REFUSERS_MAX]Device_Id,
+}
+
+@(private)
+_refusal_note :: proc(r: ^Replicator, key: Object_Key, who: Device_Id) {
+	if r.objs.refusals == nil {
+		r.objs.refusals = make(map[Object_Key]Refusal, r.allocator)
+	}
+	x, has := r.objs.refusals[key]
+	if !has && len(r.objs.refusals) >= REFUSALS_MAX {
+		return
+	}
+	for i in 0 ..< x.n {
+		if x.who[i] == who {
+			return
+		}
+	}
+	if x.n >= REFUSERS_MAX {
+		return
+	}
+	x.who[x.n] = who
+	x.n += 1
+	r.objs.refusals[key] = x
+}
+
+@(private)
+_refusals_drop :: proc(r: ^Replicator, d: Device_Id) {
+	for k in prim.sorted_keys(r.objs.refusals) {
+		x := r.objs.refusals[k]
+		kept := 0
+		for i in 0 ..< x.n {
+			if x.who[i] != d {
+				x.who[kept] = x.who[i]
+				kept += 1
+			}
+		}
+		x.n = kept
+		if kept == 0 {
+			delete_key(&r.objs.refusals, k)
+		} else {
+			r.objs.refusals[k] = x
+		}
+	}
+}
+
+replicator_objects_servable :: proc(r: ^Replicator, keys: []Object_Key) {
+	if len(r.objs.refusals) == 0 {
+		return
+	}
+	_enter(r)
+	defer _leave(r)
+	Notice :: struct {
+		to:   Device_Id,
+		keys: [dynamic]u8,
+	}
+	out := make([dynamic]Notice, context.temp_allocator)
+	for k in keys {
+		x, has := r.objs.refusals[k]
+		if !has {
+			continue
+		}
+		delete_key(&r.objs.refusals, k)
+		kk := k
+		each: for i in 0 ..< x.n {
+			for &o in out {
+				if o.to == x.who[i] {
+					append(&o.keys, ..kk[:])
+					continue each
+				}
+			}
+			o := Notice{to = x.who[i], keys = make([dynamic]u8, context.temp_allocator)}
+			append(&o.keys, ..kk[:])
+			append(&out, o)
+		}
+	}
+	if r.phase != .Ready {
+		return
+	}
+	step := (DIRECT_MAX / size_of(Object_Key)) * size_of(Object_Key)
+	for o in out {
+		for at := 0; at < len(o.keys); at += step {
+			client_direct(&r.client, o.to, SERVABLE_TAG, o.keys[at:min(at + step, len(o.keys))])
+		}
+	}
+	_repl_flush(r)
+}
+
+@(private)
+_pipe_on_servable :: proc(r: ^Replicator, from: Device_Id, data: []u8) {
+	for at := 0; at + size_of(Object_Key) <= len(data); at += size_of(Object_Key) {
+		k: Object_Key
+		copy(k[:], data[at:at + size_of(Object_Key)])
+		for j in r.objs.jobs {
+			if !j.piping || _part_key(j.key, j.p_part) != k {
+				continue
+			}
+			for i := 0; i < len(j.refused); {
+				if j.refused[i] == from {
+					unordered_remove(&j.refused, i)
+					continue
+				}
+				i += 1
+			}
+			known := false
+			for h in j.holders {
+				known ||= h == from
+			}
+			if !known {
+				append(&j.holders, from)
+			}
+			if j.p_tag == 0 {
+				j.p_unavail = false
+				_pipe_pull(r, j)
+			}
+		}
+	}
+	_repl_flush(r)
 }

@@ -75,6 +75,7 @@ Objects :: struct {
 	flying: int,
 	pulls:  map[u64]^Obj_Job,
 	prx:    ^Obj_Job,
+	refusals: map[Object_Key]Refusal,
 }
 
 Part_Ref :: struct {
@@ -242,6 +243,7 @@ _objs_destroy :: proc(r: ^Replicator) {
 	delete(r.objs.gets)
 	delete(r.objs.forgets)
 	delete(r.objs.pulls)
+	delete(r.objs.refusals)
 	r.objs = {}
 }
 
