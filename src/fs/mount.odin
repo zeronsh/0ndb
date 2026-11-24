@@ -543,6 +543,7 @@ Mount :: struct {
 	switch_fence_ok: bool,
 	switch_timer: prim.Timer,
 	switch_fences: u64,
+	event_actors: u64,
 	switch_done: Switch_Done,
 	switch_data: rawptr,
 	link_mode:   Link_Mode,
