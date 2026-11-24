@@ -746,16 +746,6 @@ graph_redacted :: proc(g: ^Graph, actor: u32, seq: u64, n: int, out: ^[dynamic]S
 	}
 }
 
-graph_is_redacted :: proc(g: ^Graph, id: Op_Id) -> bool {
-	ix, ok := graph_actor(g, id.actor)
-	if !ok {
-		return false
-	}
-	rs := g.seqs[ix].red[:]
-	i := red_first(rs, id.seq)
-	return i < len(rs) && rs[i].seq <= id.seq && id.seq < rs[i].seq + u64(rs[i].len)
-}
-
 graph_redacted_any :: proc(g: ^Graph, actor: prim.Id, seq: u64, n: int) -> bool {
 	ix, ok := graph_actor(g, actor)
 	if !ok || int(ix) >= len(g.seqs) {

@@ -320,11 +320,6 @@ text_redact :: proc(t: ^Text, g: ^Graph, actor: prim.Id, seq: u64, n: int) {
 	redact_parts(t, parts[:])
 }
 
-text_is_redacted :: proc(t: ^Text, pos: int) -> bool {
-	s, _, ok := run_get(&t.spans, pos)
-	return ok && s.red
-}
-
 @(private)
 conflict_shift :: proc(m: ^Merge, insert: bool, pos: int, n: int) {
 	if m.conflicts == nil {
