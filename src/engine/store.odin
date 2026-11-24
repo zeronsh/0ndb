@@ -741,6 +741,9 @@ _batch_complete :: proc(e: ^Engine, b: ^Durable_Batch, err: Error, direct := fal
 	delete(b.drafts)
 	delete(b.restores)
 	free(b, e.allocator)
+	if err == .None && e.fatal == .None {
+		_sleep_owed(e)
+	}
 }
 
 @(private)

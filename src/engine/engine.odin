@@ -368,6 +368,7 @@ Engine :: struct {
 	tick_hook:    Tick_Hook,
 	deliver_hook: Tick_Hook,
 	tick_wanted:  bool,
+	sweep_owed:   bool,
 	settle_timer: prim.Timer,
 	settling:     bool,
 	in_tick:      bool,
@@ -972,6 +973,7 @@ _on_settle :: proc(l: ^prim.Loop, data: rawptr) {
 	_index_settle(e)
 	_checkpoints_write(e)
 	_handles_sweep(e, 0)
+	e.sweep_owed = _hists_sleep(e) || len(e.lru) > 0
 	e.settling = false
 	_spaces_settle(e)
 	_trees_release(e)
