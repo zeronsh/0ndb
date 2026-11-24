@@ -169,6 +169,8 @@ materialize_to :: proc(m: ^Mount, target: Version, merge: bool) -> Error {
 			touched[ino] = true
 		} else if e, found := shadow_get(&m.shadow, a) or_return; found {
 			touched[e.inode] = true
+		} else {
+			name_group_touch(&snap, a, &touched) or_return
 		}
 		delete(a, m.allocator)
 	}
@@ -911,6 +913,36 @@ displaced_touch :: proc(m: ^Mount, snap: ^fstree.Snapshot, touched: ^map[fstree.
 		if found && e.inode != ino && !touched[e.inode] {
 			touched[e.inode] = true
 			append(&work, e.inode)
+		}
+	}
+	return .None
+}
+
+@(private)
+name_group_touch :: proc(snap: ^fstree.Snapshot, path: string, touched: ^map[fstree.Inode_Id]bool) -> Error {
+	base := conflict_base(path)
+	if base == path {
+		return .None
+	}
+	dir := fstree.ROOT
+	if parent := path_parent(path); parent != "" {
+		d, ok, derr := fstree.lookup(snap, parent)
+		if derr != nil {
+			return .Corrupt
+		}
+		if !ok {
+			return .None
+		}
+		dir = d
+	}
+	kids, kerr := fstree.children(snap, dir, nil, 0, context.temp_allocator)
+	if kerr != nil {
+		return .Corrupt
+	}
+	name := path_name(base)
+	for k in kids {
+		if k.name == name || (len(k.name) > len(name) && k.name[len(name)] == '~' && k.name[:len(name)] == name) {
+			touched[k.inode] = true
 		}
 	}
 	return .None
