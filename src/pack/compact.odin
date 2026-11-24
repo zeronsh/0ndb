@@ -1,5 +1,6 @@
 package pack
 
+import "core:fmt"
 import "core:mem/virtual"
 import "../prim"
 
@@ -270,7 +271,23 @@ _phys_live :: proc(p: ^Pack, inum: u64, ph: Phys, ino: ^Inode) -> (live: bool, e
 	return false, .None
 }
 
+DBG_N: int
+DBG_OWED: int
+
 step :: proc(p: ^Pack, budget: i64 = 4 * 1024 * 1024) -> (more: bool, err: Error) {
+	DBG_N += 1
+	if _reclaim_owed(p) {
+		DBG_OWED += 1
+	}
+	if DBG_N % 5000 == 0 {
+		n := 0
+		for c in p.conts {
+			if c.id < p.ck_cont {
+				n += 1
+			}
+		}
+		fmt.eprintln("DBGSTEP", DBG_N, "owed", DBG_OWED, "fl", p.fl.on, "kind", p.fl.kind, "blocked", _compact_blocked(p), "compacting", p.compacting, "con", p.compact.on, "ck", p.ck_cont, "act", _active_id(p), "below", n, "nrec", p.nrec, "dirty", len(p.dirty), "mem", _mem_bytes(&p.mem), "lsck", p.log_since_ck, "imgs", len(p.imgs), "want", p.want_flush, "pressure", p.pressure, "batch", p.batch, "waiters", len(p.waiters))
+	}
 	if p.poisoned {
 		return false, .Io
 	}
