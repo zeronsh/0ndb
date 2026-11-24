@@ -810,12 +810,18 @@ _hist_catch_up :: proc(e: ^Engine, h: ^Handle) -> (blocked: bool) {
 					blocked = true
 					break
 				}
+				if aerr == .Need_Source {
+					_hist_hold_sources(e, h, s)
+					blocked = true
+					break
+				}
 				if aerr != .None {
 					if !_store_err(e, _ferr(aerr)) {
 						_log(e, .Warn, "history admit failed")
 					}
 					break
 				}
+				h.source_stall = false
 				progress = true
 				pos = next
 			}
@@ -1105,4 +1111,42 @@ _line_mount_id :: proc(line: string) -> (id: prim.Id) {
 	blake2b.update(&ctx, transmute([]u8)line)
 	blake2b.final(&ctx, id[:])
 	return
+}
+
+@(private)
+_hist_hold_sources :: proc(e: ^Engine, h: ^Handle, held: ^Seg) {
+	e.stats.copy_source_holds += 1
+	sp := h.sp
+	pending := !sp.repl_on || !sp.connected
+	for sg in h.segs {
+		if sg == held || !sp.repl_on {
+			continue
+		}
+		if osync.replicator_catching_up(&sp.repl, &h.scope, sg.device, h.name, 0) || (journal.replica_length(sg.rep) == 0 && !_seg_empty(h, sg)) {
+			pending = true
+			osync.replicator_want_tail(&sp.repl, &h.scope, sg.device, h.name, 0, i64(1) << 40)
+		}
+	}
+	for src in fs.history_need_sources(h.hist) {
+		dev, ok := fs.history_actor_stream(h.hist, src.actor)
+		if !ok || dev == held.device {
+			pending = true
+			continue
+		}
+		var: ^Seg
+		for sg in h.segs {
+			if sg.device == dev {
+				var = sg
+			}
+		}
+		if var == nil || !var.in_view {
+			pending = true
+		}
+	}
+	if pending || h.source_stall {
+		return
+	}
+	h.source_stall = true
+	e.stats.copy_source_stalls += 1
+	_log(e, .Error, "a history record copies from an op absent from the complete stream that writes it; the stream stalls there")
 }

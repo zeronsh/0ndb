@@ -95,6 +95,7 @@ Handle :: struct {
 	table:      omap.Table,
 	table_open: bool,
 	damaged:    bool,
+	source_stall: bool,
 	local:      bool,
 	grouped:    bool,
 	drafts:     [dynamic]^Draft_View,

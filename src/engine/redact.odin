@@ -1253,7 +1253,7 @@ _hist_admit_redacted :: proc(e: ^Engine, h: ^Handle, s: ^Seg, off: i64) -> fs.Er
 		return .None
 	case .Found:
 	}
-	if _, err := fs.history_admit(h.hist, s.device, off, synth); err == .Not_Found {
+	if _, err := fs.history_admit(h.hist, s.device, off, synth); err == .Not_Found || err == .Need_Source {
 		return .Not_Found
 	}
 	return .None
