@@ -1503,6 +1503,17 @@ concurrent typing is never lost or reverted.
   flipped bit in an old record cut every later durable record (seen as an
   own stream going fatal with no crash). A promoted file is created fresh and
   exclusive, never by truncating a leftover.
+- A small file keeps at most 32 extents. A write that would pass that moves
+  the file into memory (an image of at most `promote_size` bytes; images
+  together never exceed `mem_budget`): further writes go only to the image,
+  reads are served from it, and the group's commit logs the dirty 512-byte
+  runs, or the file as one extent when more than 24 extents would result. A
+  group therefore logs at most what was written plus one copy of each file,
+  however many small writes it held, where before each write that crossed
+  the extent limit rewrote part of the file. An image is logged and dropped
+  when its group commits, before anything reads or moves the file's extents,
+  before another image would pass the budget, and at the file's last close;
+  an unlinked file's image is dropped unlogged.
 - Durability is batched across objects: every journal written in a loop
   tick is committed with one container fdatasync. `Async` (the C API
   default) runs the commit on a worker thread and completes it on a later
