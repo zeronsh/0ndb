@@ -768,8 +768,8 @@ _zero_pending :: proc(n: ^Node) -> bool {
 	if !n.alive || !n.e_open {
 		return false
 	}
-	for _, sp in n.e.spaces {
-		for _, rm in sp.repl.remotes {
+	for _, sp in prim.unordered(n.e.spaces) {
+		for _, rm in prim.unordered(sp.repl.remotes) {
 			if rm.arc != nil && len(rm.arc.pend) > 0 {
 				return true
 			}
@@ -1065,7 +1065,7 @@ _range_add :: proc(have: ^[dynamic]journal.Range, r: journal.Range) {
 check_fetch_bound :: proc(w: ^World) {
 	worst: i64
 	keys := make([dynamic]Fetch_Key, 0, len(w.fetches), context.temp_allocator)
-	for k in w.fetches {
+	for k in prim.unordered(w.fetches) {
 		append(&keys, k)
 	}
 	slice.sort_by(keys[:], proc(a, b: Fetch_Key) -> bool {

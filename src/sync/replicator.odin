@@ -2922,13 +2922,15 @@ _on_refused :: proc(r: ^Replicator, ev: ^Event) {
 
 @(private)
 _repl_on_ready :: proc(r: ^Replicator) {
-	for _, al in r.locals {
-		if al.arc_child && al.floor >= al.trim_at {
+	for id in prim.sorted_keys(r.locals) {
+		if al, ok := r.locals[id]; ok && al.arc_child && al.floor >= al.trim_at {
 			_arc_trim_send(r, al)
 		}
 	}
-	for _, l in r.locals {
-		_arc_maybe_run(r, l)
+	for id in prim.sorted_keys(r.locals) {
+		if l, ok := r.locals[id]; ok {
+			_arc_maybe_run(r, l)
+		}
 	}
 	for id in _sorted_ids(r.remotes) {
 		if rm, ok := r.remotes[id]; ok && rm.arc != nil && len(rm.arc.wants) > 0 {
