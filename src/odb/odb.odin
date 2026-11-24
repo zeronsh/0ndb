@@ -178,6 +178,42 @@ sweep_temps :: proc(db: ^Odb) {
 	}
 }
 
+sweep_ref_locks :: proc(db: ^Odb) {
+	if !db.store || len(db.common_dir) == 0 {
+		return
+	}
+	prim.remove(db.vfs, strings.concatenate({db.common_dir, "/packed-refs.lock"}, context.temp_allocator))
+	dirs := make([dynamic]string, context.temp_allocator)
+	append(&dirs, strings.concatenate({db.common_dir, "/refs"}, context.temp_allocator))
+	for len(dirs) > 0 {
+		dir := pop(&dirs)
+		d: prim.Dir
+		if prim.dir_open(db.vfs, &d, dir, context.temp_allocator) != .None {
+			continue
+		}
+		stale := make([dynamic]string, context.temp_allocator)
+		for {
+			ent, more, derr := prim.dir_next(db.vfs, &d)
+			if derr != .None || !more {
+				break
+			}
+			if ent.name == "." || ent.name == ".." {
+				continue
+			}
+			path := strings.concatenate({dir, "/", ent.name}, context.temp_allocator)
+			if ent.kind == .Dir {
+				append(&dirs, path)
+			} else if strings.has_suffix(ent.name, ".lock") {
+				append(&stale, path)
+			}
+		}
+		prim.dir_close(db.vfs, &d)
+		for p in stale {
+			prim.remove(db.vfs, p)
+		}
+	}
+}
+
 @(private)
 own_temp_name :: proc(name, prefix: string) -> bool {
 	if len(name) != len(prefix) + 16 || !strings.has_prefix(name, prefix) {

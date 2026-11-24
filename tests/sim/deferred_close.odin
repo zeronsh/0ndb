@@ -1,5 +1,6 @@
 package sim
 
+import "core:fmt"
 import "core:slice"
 import "core:strings"
 import "../../src/crdt"
@@ -107,6 +108,7 @@ _deferred_undo :: proc(w: ^World, ev: ^Sim_Event) {
 	c := _resumed[ev.arg]
 	n := w.nodes[ev.node]
 	if !n.alive || !n.e_open || int(n.incarnation) != c.inc {
+		fmt.eprintf("DUSKIP node\n")
 		return
 	}
 	m := &w.model
@@ -130,7 +132,7 @@ _deferred_undo :: proc(w: ^World, ev: ^Sim_Event) {
 			return
 		}
 	}
-	if _, rerr := eng.tree_revert_set(&n.e, tree, fs.Version(c.before), []prim.Id{op.actor}, line); rerr != .None {
+	if _, rerr := eng.tree_revert_set(&n.e, tree, fs.Version(c.before), []prim.Id{op.actor if env_u64("DU_WRONG", 0) == 0 else n.identity.id}, line); rerr != .None {
 		world_fail(w, "deferred close: undo of %s's turn on %s failed: %v", id_short(op.actor), c.root, rerr)
 		return
 	}
@@ -146,6 +148,21 @@ _deferred_undo :: proc(w: ^World, ev: ^Sim_Event) {
 					world_fail(w, "deferred close: undo of %s's turn on %s left its token %s in %s (%q)", id_short(op.actor), c.root, tok, p, string(t))
 				}
 			}
+		}
+		{
+			want := strings.builder_make(context.temp_allocator)
+			src := was[p]
+			for l in strings.split_lines_iterator(&src) {
+				if p == c.path && slice.contains(op.tokens[:], l) {
+					continue
+				}
+				strings.write_string(&want, l)
+				strings.write_byte(&want, '\n')
+			}
+			if strings.to_string(want) != string(t) && !(len(was[p]) == 0 && len(t) == 0) {
+				world_fail(w, "DUEXACT %s: was %q now %q want %q", p, was[p], string(t), strings.to_string(want))
+			}
+			fmt.eprintf("DUCMP %s line %q mount-line-at-write %q same %v\n", p, line, c.line, strings.to_string(want) == string(t))
 		}
 		it := was[p]
 		for l in strings.split_lines_iterator(&it) {
