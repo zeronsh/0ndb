@@ -186,7 +186,7 @@ _race :: proc(w: ^World, rc: Race_Case) {
 			world_fail(w, "race: mount missing")
 			return
 		}
-		scope := fs.scope_open(n.reg, sm.m, prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng)), agent, nil, since)
+		scope := sim_scope_open(w, n.reg, sm.m, prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng)), agent, since)
 		fs.scope_write_begin(scope, "a.txt")
 		if oerr := fs.mount_observe_begin(sm.m, "a.txt", scope, nil, nil, since); oerr != .None {
 			world_fail(w, "race: observe: %v", oerr)

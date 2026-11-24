@@ -136,7 +136,7 @@ _cut_crash :: proc(w: ^World, crash_at: u64, process: bool, pass: bool) -> (cras
 			}
 		}
 		before = slice.clone(_line_heads(sm.m), w.allocator)
-		scope := fs.scope_open(n.reg, sm.m, prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng)), agent)
+		scope := sim_scope_open(w, n.reg, sm.m, prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng)), agent)
 		obs := Cut_Observed{}
 		if fs.mount_observe_begin(sm.m, "a.txt", scope, _cut_observed, &obs) != .None || n.disk.dead {
 			break write

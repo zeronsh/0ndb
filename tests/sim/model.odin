@@ -371,7 +371,7 @@ op_done :: proc(op: ^M_Op, tick: u64, err: eng.Error) {
 	if err == .Io {
 		op.status = .Uncertain
 		w.stats.ops_failed += 1
-		if !w.nodes[op.node].disk.dead {
+		if !w.nodes[op.node].disk.dead && !(op.kind == .Redact_Text && outage_active(w.nodes[op.node])) {
 			world_fail(w, "op %d %v on %s failed with Io on a healthy disk", op.idx, op.kind, w.nodes[op.node].name)
 		}
 		return

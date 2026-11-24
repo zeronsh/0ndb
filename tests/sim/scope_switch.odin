@@ -105,7 +105,7 @@ _scope_switch :: proc(w: ^World) {
 		}
 		actor := prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng))
 		sid := prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng))
-		scope = fs.scope_open(n.reg, sm.m, sid, actor)
+		scope = sim_scope_open(w, n.reg, sm.m, sid, actor)
 		base, _ := prim.read_file(vfs, abs, context.temp_allocator)
 		fs.scope_read_base(scope, "a.txt", base)
 	}
@@ -241,7 +241,7 @@ _scope_held_switch :: proc(w: ^World) {
 			fs.history_register_owned_actor(sm.m.history, actor, pseudo, conv)
 		}
 		sid := prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng))
-		first := fs.scope_open(n.reg, sm.m, sid, actor)
+		first := sim_scope_open(w, n.reg, sm.m, sid, actor)
 		n.writers[strings.clone(abs, w.allocator)] = Writer_Info{scope = first, agent = true}
 		fs.mount_observe_begin(sm.m, "a.txt", first)
 		node_after(n)
@@ -265,7 +265,7 @@ _scope_held_switch :: proc(w: ^World) {
 			return
 		}
 		sid := prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng))
-		scope = fs.scope_open(n.reg, sm.m, sid, actor)
+		scope = sim_scope_open(w, n.reg, sm.m, sid, actor)
 		node_after(n)
 	}
 	{
