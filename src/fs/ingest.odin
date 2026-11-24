@@ -2,6 +2,7 @@ package fs
 
 import "base:runtime"
 import "core:bytes"
+import "core:fmt"
 import "core:crypto/blake2b"
 import "core:strings"
 import "core:mem/virtual"
@@ -1831,6 +1832,15 @@ fork_version :: proc(m: ^Mount) -> (v: Version, err: Error) {
 		next := make([dynamic]crdt.Lv, context.temp_allocator)
 		crdt.version_union(&h.g, acc[:], x.lvs, &next)
 		acc = next
+	}
+	{
+		ids := crdt.graph_version_ids(&h.g, acc[:], context.temp_allocator)
+		e, f, _ := shadow_get(&m.shadow, "a.txt")
+		st, _ := history_text_at(h, e.inode, m.synced[:], context.temp_allocator)
+		ut, _ := history_text_at(h, e.inode, ids, context.temp_allocator)
+		mv, _, _ := history_line(h, "main", context.temp_allocator)
+		mt, _ := history_text_at(h, e.inode, mv, context.temp_allocator)
+		fmt.eprintf("DBGFORK named %d rejected %d a.txt found %v ver %d synced %q fork %q main %q\n", len(named), m.fork_rejected, f, e.ver, string(st), string(ut), string(mt))
 	}
 	return crdt.graph_version_ids(&h.g, acc[:], context.temp_allocator), .None
 }

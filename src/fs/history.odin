@@ -1,5 +1,7 @@
 package fs
 
+import "core:fmt"
+
 import "base:runtime"
 import "core:mem/virtual"
 import "core:slice"
@@ -883,7 +885,18 @@ remote_line :: proc(h: ^History, stream: prim.Id, name: string, lvs: ^[dynamic]c
 	return false, .None
 }
 
-history_set_line :: proc(h: ^History, name: string, v: Version) -> Error {
+history_set_line :: proc(h: ^History, name: string, v: Version, loc := #caller_location) -> Error {
+	if strings.has_suffix(name, "feature") {
+		lv := make([dynamic]crdt.Lv, context.temp_allocator)
+		crdt.graph_version_lvs(&h.g, v, &lv)
+		fmt.eprintf("DBGSET %s %v lvs %v from %s:%d\n", name, v, lv[:], loc.file_path[len(loc.file_path)-14:], loc.line)
+		for ino in prim.sorted_keys(h.files) {
+			t, terr := history_text_at(h, ino, v, context.temp_allocator)
+			if terr == .None && len(t) > 0 && strings.has_prefix(string(t), "base") {
+				fmt.eprintf("DBGSET   inode %v text %q\n", ino, string(t))
+			}
+		}
+	}
 	history_wake(h) or_return
 	key := line_key(name, context.temp_allocator)
 	sorted := slice.clone(v, context.temp_allocator)
@@ -1242,6 +1255,9 @@ history_marked :: proc(h: ^History, from: i64, mark: []u8, out: ^[dynamic]Intent
 
 @(private)
 line_after :: proc(h: ^History, name: string, parents: []crdt.Lv, last: crdt.Op_Id) -> (key: []u8, version: []u8, err: Error) {
+	if strings.has_suffix(name, "feature") {
+		fmt.eprintf("DBGAFTER %s parents %v last %v\n", name, parents, last)
+	}
 	key = line_key(name, context.temp_allocator)
 	out := make([dynamic]crdt.Op_Id, context.temp_allocator)
 	if cur, found := history_line(h, name, context.temp_allocator) or_return; found {

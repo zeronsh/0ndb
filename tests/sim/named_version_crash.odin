@@ -311,6 +311,17 @@ _named_crash :: proc(w: ^World, arm: Named_Arm, crash_at: u64) -> (res: Named_Re
 		_nv_authors(w, n, tree, arm, crash_at, "main", agent, keeper)
 		if git_head_line(vfs, NV_ROOT) == NV_FEATURE {
 			res.forked = true
+			fver, _ := eng.tree_version(&n.e, tree, NV_FEATURE, context.temp_allocator)
+			if sm := _nv_mount(n); sm != nil {
+				fmt.eprintf("DBGEND feature version %v mount line %q synced %v\n", fver, fs.mount_line(sm.m), sm.m.synced[:])
+				if e, found, _ := fs.shadow_get(&sm.m.shadow, "a.txt"); found {
+					ht, herr := fs.history_text_at(sm.m.history, e.inode, fver, context.temp_allocator)
+					mv, _ := eng.tree_version(&n.e, tree, "main", context.temp_allocator)
+					mt, _ := fs.history_text_at(sm.m.history, e.inode, mv, context.temp_allocator)
+					et, eerr := eng.tree_read(&n.e, tree, "a.txt", context.temp_allocator, {}, NV_FEATURE)
+					fmt.eprintf("DBGEND inode %v ver %d fs feature %q (%v) fs main %q engine feature %q (%v)\n", e.inode, e.ver, string(ht), herr, string(mt), string(et), eerr)
+				}
+			}
 			fdata, ferr := eng.tree_read(&n.e, tree, "a.txt", context.temp_allocator, {}, NV_FEATURE)
 			if ferr != .None {
 				world_fail(w, "named fork: %v: a.txt unreadable on the new line: %v, at disk op %d", arm, ferr, crash_at)
@@ -410,6 +421,9 @@ named_version_crash :: proc(t: ^testing.T) {
 	test_begin(t)
 	defer test_end(t)
 	for kind in Named_Kind {
+		if env_u64("NV_K", 0) != 0 {
+			break
+		}
 		for bits in 0 ..< 10 {
 			arm := Named_Arm{kind = kind, process = bits & 1 != 0, early = bits & 2 != 0, control = bits >= 4, clean = bits >= 8}
 			points, named, ahead, bad := 0, 0, 0, 0
@@ -434,6 +448,14 @@ named_version_crash :: proc(t: ^testing.T) {
 			fmt.eprintf("named_version_crash: %v process=%v early=%v control=%v clean=%v: points=%d named=%d ahead=%d failed=%d\n", kind, arm.process, arm.early, arm.control, arm.clean, points, named, ahead, bad)
 			testing.expect(t, arm.control || named > 0, fmt.tprintf("named_version_crash %v: no run had a named version in flight", arm))
 		}
+	}
+	if k := env_u64("NV_K", 0); k != 0 {
+		failures, res := named_version_run(1, Named_Arm{kind = .Checkout_New, fork_check = true}, k)
+		for f in failures {
+			fmt.eprintf("named_version_crash: %s\n", f)
+		}
+		fmt.eprintf("NVK %d crashed %v forked %v failures %d\n", k, res.crashed, res.forked, len(failures))
+		return
 	}
 	for bits in ([]int{0, 1, 4, 5, 8, 9}) {
 		arm := Named_Arm{kind = .Checkout_New, process = bits & 1 != 0, control = bits >= 4, clean = bits >= 8, fork_check = true}
