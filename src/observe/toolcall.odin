@@ -450,17 +450,66 @@ attribute :: proc(calls: []Tool_Call, w: ^Write, agent: prim.Pid) -> (index: int
 	return match_write(calls, w.path, w.from)
 }
 
+names_path :: proc(c: ^Tool_Call, path: string) -> bool {
+	if m := match_path(c, path); m == .Exact || m == .Sibling {
+		return true
+	}
+	for cmd in c.commands {
+		start := 0
+		for i in 0 ..= len(cmd) {
+			if i < len(cmd) && !_token_end(cmd[i]) {
+				continue
+			}
+			if tok := cmd[start:i]; len(tok) > 0 && _token_names(c, tok, path) {
+				return true
+			}
+			start = i + 1
+		}
+	}
+	return false
+}
+
+@(private)
+_token_end :: proc "contextless" (b: u8) -> bool {
+	switch b {
+	case 0, ' ', '\t', '\n', '\r', '"', '\'', '`', ';', '&', '|', '<', '>', '(', ')', '=', ',':
+		return true
+	}
+	return false
+}
+
+@(private)
+_token_names :: proc(c: ^Tool_Call, tok: string, path: string) -> bool {
+	if tok == "." || tok == ".." || strings.index_any(tok, "$*?{[") >= 0 {
+		return false
+	}
+	t := _path_native(tok)
+	if clean_abs(t if path_is_abs(t) else _join(c.cwd, t, context.temp_allocator), context.temp_allocator) == path {
+		return true
+	}
+	if real, ok := _canonical(t if path_is_abs(t) else _join(c.cwd, t, context.temp_allocator), context.temp_allocator); ok && real == path {
+		return true
+	}
+	if path_is_abs(t) {
+		return false
+	}
+	tail := strings.trim_prefix(t, "./")
+	if len(tail) < 2 || strings.index_byte(tail, '.') < 0 {
+		return false
+	}
+	return len(path) > len(tail) && strings.has_suffix(path, tail) && path[len(path) - len(tail) - 1] == '/'
+}
+
 attribute_window :: proc(calls: []Tool_Call, w: ^Write) -> (index: int, ambiguous: bool) {
 	index = -1
-	if len(calls) == 0 {
-		return
+	for &c, i in calls {
+		if !names_path(&c, w.path) && (len(w.from) == 0 || !names_path(&c, w.from)) {
+			continue
+		}
+		if index >= 0 {
+			return -1, true
+		}
+		index = i
 	}
-	index, ambiguous = match_write(calls, w.path, w.from)
-	if index >= 0 {
-		return
-	}
-	if len(calls) == 1 {
-		return 0, false
-	}
-	return -1, true
+	return
 }
