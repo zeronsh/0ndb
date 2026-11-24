@@ -27,6 +27,7 @@ Attack_Kind :: enum u8 {
 	Aba,
 	Twins,
 	Person,
+	Typed,
 	Undone,
 }
 
@@ -209,7 +210,7 @@ _attack :: proc(w: ^World, arm: Attack_Arm, crash_at: u64) -> (out: Attack_Out) 
 				turns[1], ok = _sa_turn(w, n, SA_BASE, SA_BASE + SA_X)
 			}
 			count = 2
-		case .Person:
+		case .Person, .Typed:
 			turns[0], ok = _sa_turn(w, n, SA_BASE, SA_BASE + SA_X)
 			count = 1
 		case .Undone:
@@ -241,6 +242,8 @@ _attack :: proc(w: ^World, arm: Attack_Arm, crash_at: u64) -> (out: Attack_Out) 
 	}
 	if arm.kind == .Person {
 		_sa_write(vfs, SA_ROOT + "/a.txt", SA_BASE + SA_X + SA_Y)
+	} else if arm.kind == .Typed {
+		_sa_write(vfs, SA_ROOT + "/a.txt", SA_BASE + SA_X + SA_X)
 	}
 	crashes := w.stats.crashes
 	n.disk.force_process = arm.process

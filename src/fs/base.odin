@@ -636,6 +636,7 @@ rebase_changes :: proc(p: ^Pass) -> Error {
 			logged.actor = actor
 			logged.scope = c.scope.id if c.scope != nil else c.scope_id
 			c.step = step_new(m)
+			logged.at = mount_jlen(m)
 		}
 		done, rerr := rebase_commit(p, &c, v, inode, actor, event)
 		if (rerr == .None || rerr == .Reloading) && done && logged.needed {
@@ -714,6 +715,7 @@ Step_Log :: struct {
 	needed: bool,
 	actor:  prim.Id,
 	scope:  prim.Id,
+	at:     i64,
 }
 
 @(private)
@@ -728,7 +730,7 @@ step_log :: proc(m: ^Mount, c: ^Change, inode: fstree.Inode_Id, l: Step_Log) -> 
 	if got, werr := odb.write(m.db, .Blob, data); werr != .None || got != oid {
 		return .None
 	}
-	return attrib_log_append(m, c.path, l.actor, oid, l.scope, c.base, c.step)
+	return attrib_log_append(m, c.path, l.actor, oid, l.scope, c.base, c.step, l.at)
 }
 
 @(private)

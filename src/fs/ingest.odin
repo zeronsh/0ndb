@@ -1233,6 +1233,7 @@ Change :: struct {
 	scope_id: prim.Id,
 	step: prim.Id,
 	base: Step_Base,
+	at: i64,
 	moved:   string,
 	carried: bool,
 	copy_src: fstree.Inode_Id,
@@ -1360,8 +1361,8 @@ attribute_consumed :: proc(p: ^Pass, actor: prim.Id, idx: []int, scope := prim.I
 		if serr != .None || !found || e.oid == {} {
 			continue
 		}
-		attrib_set(m, c.path, actor, true, e.oid, scope, c.base, c.step)
-		attrib_log_append(m, c.path, actor, e.oid, scope, c.base, c.step) or_return
+		attrib_set(m, c.path, actor, true, e.oid, scope, c.base, c.step, c.at)
+		attrib_log_append(m, c.path, actor, e.oid, scope, c.base, c.step, c.at) or_return
 		logged = true
 	}
 	if logged {
@@ -1404,8 +1405,8 @@ attribute_changes :: proc(p: ^Pass) -> Error {
 			append(&steps, ..chain[:])
 			attrib_chain_drop(m, c.path)
 		}
-		if has && a.oid != {} && (len(steps) == 0 || steps[len(steps) - 1] != Attrib_Step{a.actor, a.oid, a.scope, a.base, a.step}) {
-			append(&steps, Attrib_Step{a.actor, a.oid, a.scope, a.base, a.step})
+		if has && a.oid != {} && (len(steps) == 0 || steps[len(steps) - 1] != Attrib_Step{a.actor, a.oid, a.scope, a.base, a.step, a.at}) {
+			append(&steps, Attrib_Step{a.actor, a.oid, a.scope, a.base, a.step, a.at})
 		}
 		if !m.lost {
 			kept := 0
@@ -2693,6 +2694,7 @@ pass_flush :: proc(p: ^Pass, final := true) -> Error {
 						c.step = a.step
 						c.base = a.base
 					}
+					c.at = mount_jlen(m)
 					if c.step == {} && (c.kind == .Modify || c.kind == .Create) && c.disk == .File {
 						c.step = step_new(m)
 					}
