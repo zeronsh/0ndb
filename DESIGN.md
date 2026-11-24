@@ -836,7 +836,14 @@ equal in both directions.
   durable before its name points at it: after any crash a written path holds
   its old content or its complete new content, and only directories are owed
   until that barrier. A structural item (a directory, a move or a removal)
-  first commits the files staged before it, so the pass keeps its order. A
+  first commits the files staged before it, so the pass keeps its order.
+  Removals come before moves, so a directory the target does not hold can
+  still hold entries the pass moves out: it is removed after the directory
+  barrier made those moves durable, deepest first, its entry is dropped only
+  then, and its parents are synced before `synced` advances. One holding
+  untracked content stays, and a pass that fails before it is done keeps
+  `synced`. So a directory that exists only because of a turn goes
+  with its undo, and one the target holds stays, empty or not. A
   pass that fails partway after its structural items rolls forward: `synced`
   becomes its target in memory (persisted only by the image saved after the
   owed barrier), and every file whose entry the pass left untouched (same
@@ -885,9 +892,10 @@ equal in both directions.
   file is still on disk. A pass whose line version is ahead of `synced`
   adopts a changed file whose content is its text at the line version (what
   an interrupted materialization wrote before a crash): its entry names that
-  version and nothing is committed. A removed file that the line version no
-  longer holds (an unlink applied before a crash, its shadow entry rolled
-  back to the image's mark) is adopted by dropping its entry and owing its
+  version and nothing is committed. A removed file or directory that the line version no
+  longer holds (a removal applied before a crash, its shadow entry rolled
+  back to the image's mark; a directory the line moved only once its new place
+  is a directory on disk) is adopted by dropping its entry and owing its
   path in `absent`, so `synced` still equals the disk except what is owed
   until the materialization that completes drains it. A created directory that is a present
   directory at the line version is adopted the same way, so a directory the
