@@ -35,7 +35,7 @@ _batch_digest :: proc(b: ^crdt.Batch) -> u64 {
 	return h
 }
 
-reissue_batches :: proc(n: ^Node, o: eng.Object, out: ^[dynamic]Reissue_Batch, wake: bool) -> (ok: bool) {
+reissue_batches :: proc(n: ^Node, o: eng.Object, out: ^[dynamic]Reissue_Batch, wake: bool, text := false) -> (ok: bool) {
 	if !n.alive || !n.e_open {
 		return false
 	}
@@ -48,7 +48,11 @@ reissue_batches :: proc(n: ^Node, o: eng.Object, out: ^[dynamic]Reissue_Batch, w
 	}
 	context = instance_context(&n.inst)
 	if !dead {
-		eng.tree_read(&n.e, o, "a.txt", context.temp_allocator)
+		if text {
+			eng.text_read(&n.e, o, context.temp_allocator)
+		} else {
+			eng.tree_read(&n.e, o, "a.txt", context.temp_allocator)
+		}
 	}
 	h, held := n.e.handles[o.id]
 	if !held || h.hist == nil || (!wake && !h.hist.awake) {
@@ -121,30 +125,30 @@ reissue_compare :: proc(w: ^World, what: string, a, b: []Reissue_Batch) {
 	}
 }
 
-reissue_watch :: proc(w: ^World, n: ^Node, o: eng.Object, seen: ^[dynamic]Reissue_Batch, limit: i64) {
+reissue_watch :: proc(w: ^World, n: ^Node, o: eng.Object, seen: ^[dynamic]Reissue_Batch, limit: i64, text := false) {
 	for w.now < limit && n.alive && reissue_going(w) {
 		t, ok := next_time(w)
 		if !ok || t > limit {
 			break
 		}
 		run_until(w, t, false)
-		reissue_see(w, n, o, seen)
+		reissue_see(w, n, o, seen, text)
 	}
 }
 
-reissue_see :: proc(w: ^World, n: ^Node, o: eng.Object, seen: ^[dynamic]Reissue_Batch) {
+reissue_see :: proc(w: ^World, n: ^Node, o: eng.Object, seen: ^[dynamic]Reissue_Batch, text := false) {
 	context.allocator = w.allocator
 	now := make([dynamic]Reissue_Batch)
-	if reissue_batches(n, o, &now, false) {
+	if reissue_batches(n, o, &now, false, text) {
 		reissue_note(seen, now[:])
 	}
 }
 
-reissue_settle :: proc(w: ^World, what: string, a, b: ^Node, o: eng.Object, seen: []Reissue_Batch) -> (lost, changed: int) {
+reissue_settle :: proc(w: ^World, what: string, a, b: ^Node, o: eng.Object, seen: []Reissue_Batch, text := false) -> (lost, changed: int) {
 	context.allocator = w.allocator
 	xs := make([dynamic]Reissue_Batch)
 	ys := make([dynamic]Reissue_Batch)
-	if !reissue_batches(a, o, &xs, true) || !reissue_batches(b, o, &ys, true) {
+	if !reissue_batches(a, o, &xs, true, text) || !reissue_batches(b, o, &ys, true, text) {
 		world_fail(w, "%s: a device's batches are unreadable", what)
 		return
 	}
