@@ -691,7 +691,7 @@ mat_barrier :: proc(m: ^Mount, ms: ^Mat_Sync) -> Error {
 	}
 	for f in ms.files {
 		fd, e := prim.open_file(m.vfs, f)
-		if e == .Not_Found {
+		if e == .Not_Found || e == .Not_Dir {
 			continue
 		}
 		from_prim(e) or_return
@@ -705,7 +705,7 @@ mat_barrier :: proc(m: ^Mount, ms: ^Mat_Sync) -> Error {
 	dirs := sorted_strings(ms.dirs)
 	for d in dirs {
 		fd, e := prim.open_file(m.vfs, d, {.Directory})
-		if e == .Not_Found {
+		if e == .Not_Found || e == .Not_Dir {
 			continue
 		}
 		from_prim(e) or_return
@@ -726,7 +726,7 @@ mat_barrier :: proc(m: ^Mount, ms: ^Mat_Sync) -> Error {
 mat_writeout :: proc(m: ^Mount, ms: ^Mat_Sync) -> Error {
 	for f in ms.files {
 		fd, e := prim.open_file(m.vfs, f)
-		if e == .Not_Found {
+		if e == .Not_Found || e == .Not_Dir {
 			continue
 		}
 		from_prim(e) or_return
@@ -736,7 +736,7 @@ mat_writeout :: proc(m: ^Mount, ms: ^Mat_Sync) -> Error {
 	}
 	for d in sorted_strings(ms.dirs) {
 		fd, e := prim.open_file(m.vfs, d, {.Directory})
-		if e == .Not_Found {
+		if e == .Not_Found || e == .Not_Dir {
 			continue
 		}
 		from_prim(e) or_return
