@@ -7,7 +7,7 @@ import eng "../../src/engine"
 import "../../src/prim"
 
 @(private = "file")
-_ric_case :: proc(seed: u64, k: u64) -> (crashed: bool, lost: bool, failures: [dynamic]string) {
+_ric_case :: proc(seed: u64, k: u64) -> (crashed: bool, changed: int, failures: [dynamic]string) {
 	failures = make([dynamic]string)
 	cfg := default_config(seed)
 	cfg.nodes = 2
@@ -23,7 +23,8 @@ _ric_case :: proc(seed: u64, k: u64) -> (crashed: bool, lost: bool, failures: [d
 	cfg.verbose = env_u64("SIM_VERBOSE", 0) != 0
 	w := new(World)
 	world_init(w, cfg)
-	crashed, lost = _ric_run(w, k)
+	w.node_cfg = reissue_hold
+	crashed, changed = _ric_run(w, k)
 	for f in w.failures {
 		append(&failures, fmt.aprintf("%s", f))
 	}
@@ -44,7 +45,9 @@ _ric_read :: proc(w: ^World, n: ^Node, tree: eng.Object) -> (data: string, ok: b
 }
 
 @(private = "file")
-_ric_run :: proc(w: ^World, k: u64) -> (crashed: bool, lost: bool) {
+_ric_run :: proc(w: ^World, k: u64) -> (crashed: bool, changed: int) {
+	lost := false
+	seen := make([dynamic]Reissue_Batch, w.allocator)
 	if !relay_start(&w.relay) {
 		world_fail(w, "reissue: relay start")
 		return
@@ -95,23 +98,36 @@ _ric_run :: proc(w: ^World, k: u64) -> (crashed: bool, lost: bool) {
 		}
 	}
 	run_until(w, w.now + 20_000_000_000, true)
+	ready := false
+	for _ in 0 ..< 40 {
+		if got, ok := _ric_read(w, b, tree); ok && got == "one\n" {
+			ready = true
+			break
+		}
+		run_until(w, w.now + 1_000_000_000, true)
+	}
+	if !ready {
+		world_fail(w, "reissue: n1 never read n0's write")
+		return
+	}
 	crashes := w.stats.crashes
 	{
 		context = instance_context(&b.inst)
+		base := tree_base(&b.e, tree)
 		b.disk.crash_at = b.disk.stats.ops + k
-		eng.tree_write(&b.e, tree, "a.txt", transmute([]u8)string("two\n"), tree_base(&b.e, tree))
+		err := eng.tree_write(&b.e, tree, "a.txt", transmute([]u8)string("two\n"), base)
+		if err != .None && !b.disk.dead {
+			world_fail(w, "reissue: n1 tree_write before the crash: %v", err)
+			return
+		}
+		reissue_see(w, b, tree, &seen)
 		node_after(b)
 	}
+	reissue_watch(w, b, tree, &seen, w.now + 5_000_000_000)
 	run_until(w, w.now + 5_000_000_000, true)
 	b.disk.crash_at = 0
 	crashed = w.stats.crashes > crashes
-	for _ in 0 ..< 40 {
-		if b.alive && b.e_open {
-			break
-		}
-		run_until(w, w.now + 1_000_000_000, false)
-	}
-	if !b.alive || !b.e_open {
+	if !reissue_restarted(w, b) {
 		world_fail(w, "reissue: n1 did not restart after the crash at op %d", k)
 		return
 	}
@@ -148,6 +164,7 @@ _ric_run :: proc(w: ^World, k: u64) -> (crashed: bool, lost: bool) {
 	if ga != gb {
 		world_fail(w, "reissue: crash at op %d (n1 lost its write: %v): n0 reads %q but n1 reads %q", k, lost, ga, gb)
 	}
+	_, changed = reissue_settle(w, fmt.tprintf("reissue: crash at op %d", k), a, b, tree, seen[:])
 	check_uploaded(w)
 	check_derived(a, fmt.tprintf("reissue crash at op %d, n0", k))
 	check_derived(b, fmt.tprintf("reissue crash at op %d, n1", k))
@@ -161,12 +178,13 @@ reissue_crash :: proc(t: ^testing.T) {
 	}
 	test_begin(t)
 	defer test_end(t)
-	lost_total := 0
+	points, changed_points := 0, 0
 	for seed in u64(1) ..= 2 {
 		for k := u64(1); k < 4000; k += 1 {
-			crashed, lost, failures := _ric_case(seed, k)
-			if crashed && lost {
-				lost_total += 1
+			crashed, changed, failures := _ric_case(seed, k)
+			if crashed {
+				points += 1
+				changed_points += 1 if changed > 0 else 0
 			}
 			for f in failures {
 				fmt.eprintf("reissue_crash seed %d crash %d: %s\n", seed, k, f)
@@ -180,6 +198,7 @@ reissue_crash :: proc(t: ^testing.T) {
 			}
 		}
 	}
-	fmt.eprintf("reissue_crash: %d crash points lost the write and re-issued its sequence\n", lost_total)
+	testing.expect(t, changed_points > 0, "reissue_crash never re-issued a sequence")
+	fmt.eprintf("reissue_crash: %d crash points, %d re-issued a lost sequence with other operations\n", points, changed_points)
 	free_all(context.temp_allocator)
 }
