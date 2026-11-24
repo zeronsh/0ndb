@@ -37,7 +37,23 @@ convo_move_on_disk :: proc(e: ^Engine, o: Object, move: prim.Id, ready: Ready = 
 		return .Pending
 	}
 	append(&e.move_waits, Move_Wait{o = o, move = move, ready = ready})
+	if u, uerr := _cu_undone_of(e, o, move); uerr == .None && e.plug.reg_on {
+		for r in u.reverts {
+			for mt in e.plug.mounts {
+				if mt.object.id == r.tree {
+					fs.mount_on_materialized(&mt.mount, _move_materialized, e)
+				}
+			}
+		}
+	}
 	return .Pending
+}
+
+@(private)
+_move_materialized :: proc(m: ^fs.Mount, data: rawptr) {
+	e := (^Engine)(data)
+	context = context_for(e)
+	_move_waits_run(e)
 }
 
 @(private)
@@ -445,6 +461,7 @@ convo_undo_drive :: proc(e: ^Engine, o: Object, undo: prim.Id) -> Error {
 		return .Not_Found
 	}
 	convs: []Undo_Conv
+	idle := false
 	for _ in 0 ..< int(max(convo.Undo_Phase)) + 1 {
 		if st.phase == .Released {
 			return .None
@@ -452,7 +469,7 @@ convo_undo_drive :: proc(e: ^Engine, o: Object, undo: prim.Id) -> Error {
 		if convs == nil {
 			convs = _cu_move_tree(e, o, &st) or_return
 		}
-		_cu_undo_step(e, o, &st, convs) or_return
+		_cu_undo_step(e, o, &st, convs, &idle) or_return
 	}
 	return .None
 }
@@ -564,7 +581,7 @@ _cu_descends :: proc(e: ^Engine, o: Object, at, of: Rid) -> (yes: bool, err: Err
 }
 
 @(private)
-_cu_undo_step :: proc(e: ^Engine, o: Object, st: ^convo.Undo_State, convs: []Undo_Conv) -> Error {
+_cu_undo_step :: proc(e: ^Engine, o: Object, st: ^convo.Undo_State, convs: []Undo_Conv, idle: ^bool) -> Error {
 	visible := make([dynamic]Object, context.temp_allocator)
 	for c in convs {
 		if !c.hidden {
@@ -577,9 +594,18 @@ _cu_undo_step :: proc(e: ^Engine, o: Object, st: ^convo.Undo_State, convs: []Und
 		if hk.hold != nil {
 			hk.hold(hk.data, e, visible[:], st.id) or_return
 		}
+		idle^ = true
+		for c in convs {
+			cs := convo_status(e, c.o) or_return
+			if cs.running {
+				idle^ = false
+			}
+		}
 		return _cu_advance(e, o, st, .Held, nil)
 	case .Held:
-		_cu_undo_fence(e, convs)
+		if !idle^ {
+			_cu_undo_fence(e, convs)
+		}
 		set: []convo.Undo_Line
 		if _cu_switch_like(st^) {
 			set = _cu_switch_set(e, o, st, convs) or_return
