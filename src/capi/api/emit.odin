@@ -86,7 +86,7 @@ event_code :: proc "contextless" (kind: eng.Event_Kind) -> u64 {
 	}
 	return u64(len(EVENT_NAMES))
 }
-DELTA_NAMES := [19]string{"message", "block", "chunk", "seal", "leaf", "intent", "run", "mount", "record", "status", "field", "element", "counter", "catalog", "text", "files", "redacted", "members", "quarantined"}
+DELTA_NAMES := [19]string{"message", "block", "chunk", "seal", "leaf", "intent", "run", "mount", "record", "status", "field", "element", "counter", "catalog", "text", "files", "reserved", "members", "quarantined"}
 INTENT_NAMES := [46]string {
 	25 = "queue",
 	26 = "steer",

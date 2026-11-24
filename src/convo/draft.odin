@@ -159,40 +159,6 @@ writer_draft_serve :: proc(w: ^Writer, msg: i64, from: i64, allocator := context
 	return runs, .None
 }
 
-writer_draft_redact :: proc(w: ^Writer, msg: i64) -> Error {
-	if w.buf.active && w.buf.msg == msg {
-		_flush(w) or_return
-	}
-	_draft_disable(w, msg)
-	if !w.draft.open {
-		return .None
-	}
-	offs := make([dynamic]i64, context.temp_allocator)
-	r: journal.Reader
-	journal.journal_reader(&w.draft.j, &r, context.temp_allocator)
-	pos := i64(0)
-	end := journal.journal_durable_len(&w.draft.j)
-	for pos < end {
-		body, next, je := journal.record_at(&r, pos)
-		if je == .None {
-			if d, derr := draft_decode(body); derr == .None && d.msg == msg {
-				append(&offs, pos)
-			}
-		} else if je != .Redacted {
-			break
-		}
-		pos = next
-	}
-	journal.reader_close(&r)
-	_draft_drop(w, msg)
-	if len(offs) > 0 {
-		if err := journal.journal_redact_records(&w.draft.j, offs[:]); err != .None {
-			return .Io
-		}
-	}
-	return _draft_maybe_reset(w)
-}
-
 @(private)
 _draft_find :: proc(w: ^Writer, msg: i64) -> ^Draft_Msg {
 	for i in 0 ..< w.draft.n {
@@ -224,17 +190,6 @@ _draft_disable :: proc(w: ^Writer, msg: i64) {
 	}
 	w.draft.off[w.draft.off_n] = msg
 	w.draft.off_n += 1
-}
-
-@(private)
-_draft_drop :: proc(w: ^Writer, msg: i64) {
-	for i in 0 ..< w.draft.n {
-		if w.draft.msgs[i].msg == msg {
-			w.draft.msgs[i] = w.draft.msgs[w.draft.n - 1]
-			w.draft.n -= 1
-			return
-		}
-	}
 }
 
 @(private)

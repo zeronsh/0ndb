@@ -545,12 +545,6 @@ writer_cancel :: proc(w: ^Writer, item: Rid) -> (off: i64, err: Error) {
 	return _event_sum(w, &sum, Cancel{item = r})
 }
 
-writer_redact_msg :: proc(w: ^Writer, msg: Rid) -> (off: i64, err: Error) {
-	_prepare(w, false) or_return
-	r := _local_rid(w, msg) or_return
-	return _event(w, Redact_Msg{msg = r})
-}
-
 writer_unqueue :: proc(w: ^Writer, item: Rid, outcome: Outcome, msg: Rid = {}) -> (off: i64, err: Error) {
 	if u8(outcome) < 1 || outcome > max(Outcome) {
 		return 0, .Invalid
@@ -889,54 +883,6 @@ writer_record :: proc(w: ^Writer, source, external_id: string, sequence: u64, ms
 	off := _event(w, Recorded{source = source, external_id = external_id, sequence = sequence, msg = mr}) or_return
 	_update(w, {key = _record_key(source, external_id), child = i64(min(sequence, u64(max(i64)))), seal = off}) or_return
 	return .Recorded, .None
-}
-
-redact_ranges :: proc(v: ^obj.View, msg: Rid, allocator := context.allocator) -> (out: []obj.Redaction, err: Error) {
-	x := _msg_at(v, msg) or_return
-	m := Message{}
-	sa := Vref{}
-	last := _seal_info(v, x, {}, false, &m, &sa) or_return
-	list := make([dynamic]obj.Redaction, allocator)
-	off := last
-	for off != 0 {
-		body, next := obj.get(v, x.seg, off) or_return
-		if obj.is_redacted(body) {
-			break
-		}
-		rec := decode_record(body, off, v.scratch) or_return
-		b, ok := rec.body.(Block)
-		if !ok || b.msg != x.off {
-			return nil, .Corrupt
-		}
-		if n := len(list); n > 0 && list[n - 1].from == next {
-			list[n - 1].from = off
-		} else {
-			append(&list, obj.Redaction{v.segs[x.seg].id, off, next})
-		}
-		off = b.prev
-	}
-	return list[:], .None
-}
-
-writer_redact :: proc(w: ^Writer, msg: Rid) -> (ranges: []obj.Redaction, err: Error) {
-	_prepare(w, false) or_return
-	v := w.core.v
-	ranges = redact_ranges(v, msg, v.scratch) or_return
-	x := obj.vref_pos(v, msg) or_return
-	for r in ranges {
-		from := Vref{obj.view_find(v, r.seg), r.from}
-		_redact_record(w, from, r.to, x) or_return
-	}
-	return ranges, .None
-}
-
-writer_redact_plan :: proc(w: ^Writer, msg: Rid, allocator := context.allocator) -> (ranges: []obj.Redaction, err: Error) {
-	_prepare(w, false) or_return
-	return redact_ranges(w.core.v, msg, allocator)
-}
-
-writer_redact_range :: proc(w: ^Writer, from: Vref, to: i64, target: Vref) -> Error {
-	return _redact_record(w, from, to, target)
 }
 
 writer_digest :: proc(w: ^Writer) -> Error {
@@ -1338,18 +1284,6 @@ _intent :: proc(w: ^Writer, body: Body) -> (item: Rid, err: Error) {
 		return {}, .Io
 	}
 	return Rid{w.core.id, off, w.core.gen}, .None
-}
-
-@(private)
-_redact_record :: proc(w: ^Writer, from: Vref, to: i64, target: Vref) -> Error {
-	_flush(w) or_return
-	obj.local(&w.core, from) or_return
-	obj.local(&w.core, target) or_return
-	obj.seg_flush(&w.core, true) or_return
-	off := obj.writer_len(&w.core)
-	extra := encode_summary(off, &w.sum)
-	obj.writer_redact(&w.core, from, to, target, extra) or_return
-	return .None
 }
 
 @(private)

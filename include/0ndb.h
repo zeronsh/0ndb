@@ -108,7 +108,7 @@
  *                 29 interrupt, 30 answer, 37 await, 45 hold
  *   delta         0 message, 1 block, 2 chunk, 3 seal, 4 leaf, 5 intent,
  *                 6 run, 7 mount, 8 record, 9 status, 10 field, 11 element,
- *                 12 counter, 13 catalog, 14 text, 15 files, 16 redacted,
+ *                 12 counter, 13 catalog, 14 text, 15 files, 16 reserved,
  *                 17 members, 18 quarantined
  *   event         0 connected, 1 disconnected, 2 durable, 3 uploaded,
  *                 4 quarantined, 5 refused, 6 fatal, 7 space_joined,

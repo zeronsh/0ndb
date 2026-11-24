@@ -217,15 +217,6 @@ decode_seg :: proc(e: ^Envelope, out: ^[dynamic]prim.Id) -> Error {
 	return .None
 }
 
-encode_redact :: proc(w: ^prim.Writer, off: i64, l: ^Links, r: ^Redact) {
-	prim.write_u8(w, RECORD_REDACT)
-	encode_links(w, off, l)
-	tw_ref(w, 1, off, r.from)
-	tw_uv(w, 2, u64(max(r.to, 0)))
-	tw_ref(w, 3, off, r.target)
-	tw_id(w, 4, r.cmd)
-}
-
 decode_redact :: proc(e: ^Envelope) -> (r: Redact, err: Error) {
 	if e.kind != RECORD_REDACT || e.links.zraw != 0 {
 		return r, .Corrupt

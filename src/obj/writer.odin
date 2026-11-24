@@ -42,12 +42,6 @@ Rec :: struct {
 	open:      bool,
 }
 
-Redaction :: struct {
-	seg:  prim.Id,
-	from: i64,
-	to:   i64,
-}
-
 writer_create :: proc(w: ^Writer, v: ^View, vfs: prim.Vfs, path: string, object: prim.Id, kind: Kind, id: prim.Id, gen: u64, created: prim.Hlc, settings: []u8 = nil, opts := journal.Options{}, allocator := context.allocator, clock := Clock{}) -> Error {
 	_zero(w, vfs, allocator)
 	w.source = clock
@@ -276,71 +270,6 @@ abort :: proc(w: ^Writer, rec: ^Rec) {
 		journal.journal_abort(&w.j)
 		rec.open = false
 	}
-}
-
-writer_redact :: proc(w: ^Writer, from: Vref, to: i64, target: Vref, extra: []u8 = nil, cmd: prim.Id = {}) -> (off: i64, err: Error) {
-	if vref_none(from) || to <= from.off {
-		return 0, .Invalid
-	}
-	fr := local(w, from) or_return
-	tr := local(w, target) or_return
-	seg_flush(w, fr.seg != 0 || tr.seg != 0) or_return
-	rec: Rec
-	rec.off = journal.journal_len(&w.j)
-	rec.links = Links{
-		event = rec.off,
-		segs  = w.segs,
-		prev  = w.event,
-		stamp = now(w),
-		gen   = w.gen,
-	}
-	pw, berr := journal.journal_begin(&w.j)
-	if berr != .None {
-		return 0, jerr(berr)
-	}
-	l := rec.links
-	l.extra = extra
-	r := Redact{
-		from   = fr,
-		to     = to,
-		target = tr,
-		cmd    = cmd,
-	}
-	encode_redact(&pw, rec.off, &l, &r)
-	got, eerr := journal.journal_end(&w.j, &pw)
-	if eerr != .None {
-		return 0, jerr(eerr)
-	}
-	w.event = rec.off
-	if from.seg == w.seg {
-		jerr(journal.journal_commit(&w.j)) or_return
-		jerr(journal.journal_redact(&w.j, from.off, to)) or_return
-		w.v.segs[w.seg].tail_end = -1
-	}
-	return got, .None
-}
-
-redactions :: proc(v: ^View, s: int, floor: prim.Hlc, allocator := context.allocator) -> (out: []Redaction, err: Error) {
-	Acc :: struct {
-		list: [dynamic]Redaction,
-		v:    ^View,
-	}
-	acc := Acc{
-		list = make([dynamic]Redaction, allocator),
-		v    = v,
-	}
-	visit :: proc(data: rawptr, s: int, off: i64, env: ^Envelope) -> (stop: bool, err: Error) {
-		a := (^Acc)(data)
-		if env.kind != RECORD_REDACT {
-			return false, .None
-		}
-		r := decode_redact(env) or_return
-		from := resolve(a.v, s, r.from) or_return
-		append(&a.list, Redaction{a.v.segs[from.seg].id, from.off, r.to})
-		return false, .None
-	}
-	walk_events(v, s, floor, &acc, visit) or_return
-	return acc.list[:], .None
 }
 
 @(private)
