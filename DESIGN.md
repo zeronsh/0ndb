@@ -1536,9 +1536,15 @@ concurrent typing is never lost or reverted.
     Key trees and space rows commit at once, so an own key tree is durable
     before any own segment byte. A copy-on-write omap file inside the pack (map tables) writes
     and syncs its pages at commit but keeps the new meta page in memory,
-    tagged with the open batch; the meta is written and synced only once that
-    batch is durable, after the registry rows that batch made eligible, so a
-    crash at any point leaves the previous meta valid. At most two pending
+    tagged with the open batch; the meta is written, behind a barrier, only
+    once that batch is durable, after the registry rows that batch made
+    eligible, so a crash at any point leaves the previous meta valid. A
+    barrier (`prim.barrier`: `F_BARRIERFSYNC` on macOS, a data sync
+    elsewhere) orders a file's writes before every later write on the device
+    without making them durable; the next full sync of any file does. It is
+    used only where order is all that matters: a table's meta needs only to
+    precede the next commit's pages, and a lost one falls back to the
+    previous meta, which re-applies. At most two pending
     metas are kept per file (the oldest unpublished one and the newest), the
     newest eligible one is the one written, and compaction waits while any is
     pending. The registry is a copy-on-write omap file outside the pack.

@@ -491,7 +491,7 @@ db_publish :: proc(db: ^Db, durable: u64) -> Error {
 			db.poisoned = true
 			return err
 		}
-		if err := prim.datasync(db.vfs, db.fd); err != .None {
+		if err := prim.barrier(db.vfs, db.fd); err != .None {
 			db.poisoned = true
 			return obj.perr(err)
 		}
