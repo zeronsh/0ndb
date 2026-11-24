@@ -2162,6 +2162,9 @@ pass_flush :: proc(p: ^Pass, final := true) -> Error {
 				if os, open := m.open_scopes[c.path]; scope == {} && open && os != nil && os.actor == actor {
 					scope = os.id
 				}
+			} else if t := active_scope(m); t != nil && !m.lost {
+				actor = t.actor
+				scope = t.id
 			}
 			if actor != m.actor && !actor_on_line(m, actor) {
 				if scope != {} && !is_unattributed(actor) {
