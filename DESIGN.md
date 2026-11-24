@@ -1501,6 +1501,15 @@ concurrent typing is never lost or reverted.
   inline job (a tier evict's punch-and-sync) never blocks the loop, and
   its acknowledgement, which follows the batch's completion, still follows
   the fsync.
+- **Idle holds nothing.** The settle hibernates every mount and sleeps every
+  history that has no awake mount and no open buffer. One that is still
+  waiting for its own durability answers Busy; the batch that completes with
+  none outstanding tries those again, with no timer, because that batch is
+  the last event there will be. A read that wakes a sleeping history arms the
+  settle, as opening a handle does. After quiesce no mount is awake except
+  for dirty paths, an owed rescan, durability waits or queued reverts, and no
+  history is awake without an awake mount or an open buffer; the sim checks
+  it with the idle check.
 - The unit of durability is the batch, not the tick: settle commits a batch
   of its own under the tick of the one before it. Every enqueued batch takes
   the next batch sequence; a command's result carries (as `tick`) the

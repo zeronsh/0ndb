@@ -581,8 +581,42 @@ _hist_ready :: proc(e: ^Engine, h: ^Handle) -> Error {
 	}
 	if !h.hist.awake {
 		_ferr(fs.history_wake(h.hist)) or_return
+		_hist_woken(e)
 	}
 	return .None
+}
+
+@(private)
+_hist_woken :: proc(e: ^Engine) {
+	if e.settle_timer == 0 && !e.in_tick && !e.settling && !e.closing {
+		_settle_arm(e)
+	}
+}
+
+@(private)
+_hists_sleep :: proc(e: ^Engine) -> (owed: bool) {
+	for id in prim.sorted_keys(e.handles) {
+		h := e.handles[id]
+		if h == nil || h.hist == nil || !h.hist.awake || len(h.hist.mounts) == 0 {
+			continue
+		}
+		busy := false
+		for m in h.hist.mounts {
+			busy ||= m.awake
+		}
+		for b in e.buffers {
+			busy ||= b.object.id == id
+		}
+		if busy {
+			continue
+		}
+		if fs.history_durable_mark(h.hist) > h.hist.durable {
+			owed = true
+			continue
+		}
+		fs.history_sleep(h.hist)
+	}
+	return
 }
 
 @(private)

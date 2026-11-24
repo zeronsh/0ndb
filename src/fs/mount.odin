@@ -513,6 +513,7 @@ Mount :: struct {
 	importing:   bool,
 	shadow_mark: Shadow_Mark,
 	passes:      u64,
+	sleep_owed:  bool,
 	reconciles:  u64,
 	jpos:        i64,
 	jpend:       i64,
@@ -1058,8 +1059,10 @@ mount_hibernate :: proc(m: ^Mount) -> Error {
 		return .None
 	}
 	if len(m.dirty) > 0 || m.rescan || len(m.waits) > 0 || len(m.reverts) > 0 {
+		m.sleep_owed = true
 		return .Busy
 	}
+	m.sleep_owed = false
 	err := shadow_flush(m)
 	save_mount_state(m)
 	shadow_detach(&m.shadow)
@@ -1086,6 +1089,22 @@ mount_hibernate :: proc(m: ^Mount) -> Error {
 	}
 	_heap_release()
 	return err
+}
+
+mount_awake_reason :: proc(m: ^Mount) -> string {
+	switch {
+	case !m.awake:
+		return "asleep"
+	case len(m.dirty) > 0:
+		return "dirty paths"
+	case m.rescan:
+		return "a rescan is owed"
+	case len(m.waits) > 0:
+		return "durability waits"
+	case len(m.reverts) > 0:
+		return "queued reverts"
+	}
+	return ""
 }
 
 Mat_Wait :: struct {
