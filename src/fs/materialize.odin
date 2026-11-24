@@ -1696,6 +1696,53 @@ mat_snapshot_named :: proc(m: ^Mount, it: ^Mat_Item, at: []fstree.Op_Id, base, p
 }
 
 @(private)
+mat_snapshot_writer :: proc(m: ^Mount, it: ^Mat_Item, a: Attrib, st: Stat, data: []u8, oid: odb.Oid) -> (head: crdt.Op_Id, err: Error) {
+	h := m.history
+	v := slice.clone(m.merge_base, context.temp_allocator)
+	old := history_text_at(h, it.inode, v, context.temp_allocator) or_return
+	e := it.entry
+	e.stat = st
+	e.oid = oid
+	if string(old) != string(data) {
+		actor := a.actor
+		blocked := false
+		if known := crdt.graph_known(&h.g, actor); known > 0 {
+			vl := make([dynamic]crdt.Lv, context.temp_allocator)
+			own, ok := crdt.graph_lv(&h.g, crdt.Op_Id{actor, known - 1})
+			blocked = !ok || crdt.graph_version_lvs(&h.g, v, &vl) != .None || !crdt.graph_contains(&h.g, vl[:], own)
+		}
+		if blocked {
+			actor = event_actor(m, a.actor, v, _event_digest(inode_op(h, it.inode), data)) or_return
+		}
+		if known := crdt.graph_known(&h.g, actor); blocked && known > 0 {
+			head = crdt.Op_Id{actor, known - 1}
+		} else {
+			b: Builder
+			builder_init(&b, h, actor)
+			emit_text_edits(m, &b, it.inode, it.path, old, data) or_return
+			if mk := scope_marker(a.actor, a.scope); mk != nil {
+				builder_opaque(&b, mk)
+			}
+			ch, has, cerr := builder_commit_at(m, &b, v)
+			if cerr != .None && cerr != .Reloading {
+				return {}, cerr
+			}
+			if !has {
+				return {}, .None
+			}
+			head = ch
+		}
+		one := [1]fstree.Op_Id{op_inode(h, head)}
+		e.ver = shadow_version_add(&m.shadow, one[:]) or_return
+	}
+	shadow_put(&m.shadow, it.path, e) or_return
+	it.entry = e
+	attrib_set(m, it.old, a.actor, true, {}, a.scope)
+	_base_note(m, it.old, .Current)
+	return head, .None
+}
+
+@(private)
 mat_snapshot_dirty :: proc(m: ^Mount, items: []Mat_Item, target: Version) -> (out: []crdt.Op_Id, took: bool, err: Error) {
 	h := m.history
 	pseudo := mount_snapshot_pseudo(m.id, m.line)
@@ -1735,6 +1782,13 @@ mat_snapshot_dirty :: proc(m: ^Mount, items: []Mat_Item, target: Version) -> (ou
 			e.oid = oid
 			shadow_put(&m.shadow, it.path, e) or_return
 			it.entry = e
+			continue
+		}
+		if a, attributed := m.attrib[it.old]; attributed && !a.used && it.entry.ver == 0 {
+			ev := mat_snapshot_writer(m, &it, a, d.stat, data, oid) or_return
+			if ev != {} {
+				append(&heads, ev)
+			}
 			continue
 		}
 		if it.entry.ver != 0 && it.entry.inode == it.inode {
