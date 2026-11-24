@@ -665,6 +665,9 @@ _d_open :: proc(data: rawptr, path: string, flags: prim.Open_Flags, mode: u32) -
 			return prim.INVALID_FD, .Not_Dir
 		}
 		if n.kind == .File && .Truncate in flags && .Write in flags && len(n.data) > 0 {
+			if dprobe(d, path) {
+				fmt.eprintf("DOP %s op=%d TRUNC-OPEN %s was %q\n", d.name, d.stats.ops, path, string(n.data[:]))
+			}
 			_event(d, path)
 			resize(&n.data, 0)
 			append(&n.pend, Pend{kind = .Truncate, size = 0})
@@ -794,11 +797,17 @@ _d_write_at :: proc(data: rawptr, fd: prim.Fd, src: []u8, off: i64) -> prim.Erro
 		return .Io
 	}
 	if ierr := _inject_fd(d, fd, true); ierr != .None {
+		if x, _, e := _fd_get(d, fd); e == .None && dprobe(d, x.path) {
+			fmt.eprintf("DOP %s op=%d WRITE-INJECTED %s %v\n", d.name, d.stats.ops, x.path, ierr)
+		}
 		return ierr
 	}
 	of, n, err := _fd_get(d, fd)
 	if err != .None {
 		return err
+	}
+	if dprobe(d, of.path) {
+		fmt.eprintf("DOP %s op=%d WRITE %s off=%d %q\n", d.name, d.stats.ops, of.path, off, string(src))
 	}
 	if !of.writable || n.kind != .File {
 		return .Invalid
@@ -833,6 +842,9 @@ _d_sync :: proc(data: rawptr, fd: prim.Fd) -> prim.Error {
 		return err
 	}
 	owned := len(d.ghost_root) > 0 && strings.has_prefix(of.path, d.ghost_root) && (len(of.path) == len(d.ghost_root) || of.path[len(d.ghost_root)] == '/')
+	if dprobe(d, of.path) {
+		fmt.eprintf("DOP %s op=%d SYNC %s fail_sync=%d data=%q\n", d.name, d.stats.ops, of.path, d.fail_sync, string(n.data[:]) if n.kind == .File else "")
+	}
 	if d.fail_sync > 0 || _inject_fd(d, fd, false) != .None || _tmp_sync_fail(d, n, of.path) {
 		if d.fail_sync > 0 {
 			d.fail_sync -= 1
@@ -1132,6 +1144,9 @@ _is_ancestor :: proc(d: ^Disk, anc: u64, ino: u64) -> bool {
 @(private = "file")
 _d_rename :: proc(data: rawptr, old: string, new: string) -> prim.Error {
 	d := (^Disk)(data)
+	if dprobe(d, old) || dprobe(d, new) {
+		fmt.eprintf("DOP %s op=%d RENAME %s -> %s\n", d.name, d.stats.ops, old, new)
+	}
 	if !_enter(d, 10) {
 		return .Io
 	}
@@ -1203,6 +1218,9 @@ _d_rename :: proc(data: rawptr, old: string, new: string) -> prim.Error {
 @(private = "file")
 _d_unlink :: proc(data: rawptr, path: string) -> prim.Error {
 	d := (^Disk)(data)
+	if dprobe(d, path) {
+		fmt.eprintf("DOP %s op=%d UNLINK %s\n", d.name, d.stats.ops, path)
+	}
 	if !_enter(d, 11) {
 		return .Io
 	}

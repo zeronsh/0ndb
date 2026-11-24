@@ -135,6 +135,7 @@ run_until :: proc(w: ^World, limit: i64, stop_when_idle: bool) -> (idle: bool) {
 			handle_event(w, &ev)
 			delete(ev.bytes, w.allocator)
 			drain_all(w)
+			probe_after(w)
 			if w.phase == .Workload && len(w.failures) >= 20 {
 				return false
 			}

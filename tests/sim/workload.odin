@@ -272,6 +272,9 @@ workload_step :: proc(w: ^World) {
 	append(&all, ..weights[:])
 	ext_op_weights(w, &all)
 	pick := rng_pick(&w.rng, all[:])
+	if len(probe_tok) > 0 && !w.cfg.quiet {
+		fmt.eprintf("OPRUN ev=%d %s pick=%d %v\n", w.stats.events, n.name, pick, Op_Kind(pick) if pick < len(weights) else Op_Kind(0))
+	}
 	if pick >= len(weights) {
 		ext_op_run(w, n, pick - len(weights))
 		node_after(n)
