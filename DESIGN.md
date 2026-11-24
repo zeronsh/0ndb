@@ -182,6 +182,15 @@ The engine is designed so that none of these has an exception:
   tool call whose input names the path, so parallel tool calls are separated.
   Any change not produced by an observed agent process belongs to the other
   actors on that machine, never to a tool.
+  Where nothing names the writing process (macOS without Endpoint Security
+  once libproc finds no process holding the file, and Windows), a change
+  is a tool's only when the input of exactly one open tool call names that
+  file, by its path or a relative path from the call's directory, and a
+  tool call that opens claims the pending changes first seen since the
+  provider's previous line that it names. Everything else is the person's,
+  so a person's save during a tool call stays theirs, while an agent's
+  write the tool input doesn't name (a formatter over a folder, a script, an
+  install) is the person's too until a process-naming observer exists.
 - **Nobody can forge or fork another participant's history.** Every segment
   is hash-chained (each record's links prefix carries the running chain
   hash) and each commit appends a signature of the chain head by the

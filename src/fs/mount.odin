@@ -1708,6 +1708,29 @@ attrib_base_stored :: proc(m: ^Mount, e: Entry) -> bool {
 	return werr == .None && got == e.oid
 }
 
+mount_pending_since :: proc(m: ^Mount, since: Observe_Since, allocator := context.temp_allocator) -> []string {
+	out := make([dynamic]string, allocator)
+	if since.mono == 0 || m.reg.observer.changed == nil {
+		return out[:]
+	}
+	for k in prim.sorted_keys(m.dirty) {
+		if at, ok := m.dirty_at[k]; ok && m.dirty[k] == nil && at >= since.mono {
+			c, _ := clone_string(k, allocator)
+			append(&out, c)
+		}
+	}
+	return out[:]
+}
+
+mount_claim :: proc(m: ^Mount, rel: string, scope: ^Scope, since: Observe_Since) -> Error {
+	err := mount_observe_begin(m, rel, scope, nil, nil, since)
+	if m.open_scopes[rel] == scope {
+		k, _ := delete_key(&m.open_scopes, rel)
+		delete(k, m.allocator)
+	}
+	return err
+}
+
 observer_installed :: proc(reg: ^Registry) -> bool {
 	return reg.observer.start != nil || reg.observer.changed != nil
 }

@@ -787,6 +787,17 @@ worktree_tool_open :: proc(ws: ^Worktree, run: ^Run, id: string) -> int {
 	return len(ws.tools) - 1
 }
 
+worktree_claim_named :: proc(ws: ^Worktree, run: ^Run, call: ^observe.Tool_Call, idx: int) {
+	if idx < 0 || idx >= len(ws.tools) {
+		return
+	}
+	for s in ws.tools[idx].scopes {
+		if s != nil && s.mount != nil {
+			observe.claim_named(s.mount, call, s, run.line_prev)
+		}
+	}
+}
+
 worktree_tool_close :: proc(ws: ^Worktree, run: ^Run, idx: int) {
 	if idx < 0 || idx >= len(ws.tools) || !ws.tools[idx].open {
 		return
