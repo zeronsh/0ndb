@@ -3328,6 +3328,9 @@ emit_modify :: proc(p: ^Pass, b: ^Builder, c: ^Change, e: Entry) -> Error {
 		builder_tree(b, fstree.Op_Set_Flags{inode = e.inode, mask = {.Git_Clean}, value = {.Git_Clean}})
 	}
 	if oid == e.oid && m.db != nil {
+		if c.old.inode == e.inode {
+			ne.ver = c.old.ver
+		}
 		return shadow_put(&m.shadow, path, ne)
 	}
 	was_binary := .Opaque in old_flags

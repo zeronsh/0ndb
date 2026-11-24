@@ -19,7 +19,7 @@ Ri_Notes :: struct {
 }
 
 @(private = "file")
-_ri_on_base :: proc(m: ^fs.Mount, rel: string, note: fs.Base_Note, data: rawptr) {
+_ri_on_base :: proc(m: ^fs.Mount, rel: string, note: fs.Base_Note, actor: prim.Id, data: rawptr) {
 	notes := (^Ri_Notes)(data)
 	if note == .Merged {
 		notes.merged += 1
