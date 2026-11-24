@@ -291,13 +291,13 @@ _write :: proc(w: ^World, n: ^Node, sm: Sim_Mount, rel: string, append_to: bool,
 		strings.write_byte(&b, '\n')
 	}
 	_writer_set(w, n, abs, Writer_Info{})
-	err := _disk_write(vfs, abs, transmute([]u8)strings.to_string(b), false)
+	err := disk_write_by(w, n, op, abs, transmute([]u8)strings.to_string(b))
 	if err == .None {
 		err = prim.sync_dir(vfs, prim.dir_name(prim.dir_name(abs)))
 	}
 	world_note(w, "%s tree move write %s/%s %v -> %v", n.name, id_short(m.objs[sm.oi].o.id), rel, op.tokens[:], err)
 	if err != .None {
-		op.status = .Uncertain if err == .Io else .Failed
+		op.status = .Uncertain if err == .Io || len(op.deletes) > 0 else .Failed
 		_failed(w, n, err)
 		return op, false
 	}

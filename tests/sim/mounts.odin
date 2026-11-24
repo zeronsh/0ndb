@@ -568,7 +568,7 @@ agent_finish :: proc(w: ^World, n: ^Node) {
 	if oerr == .None {
 		n.observed += 1
 		_agent_path(w, n, abs, pa.actor)
-		err = _disk_write(vfs, abs, transmute([]u8)strings.to_string(b), false)
+		err = disk_write_by(w, n, op, abs, transmute([]u8)strings.to_string(b))
 	}
 	if pa.hold && !n.disk.dead {
 		fs.scope_write_base(pa.scope, pa.name, from)
@@ -688,7 +688,7 @@ _rewrite_same_size :: proc(w: ^World, n: ^Node, sm: ^Sim_Mount, name: string, ag
 			world_fail(w, "%s mount_observe_begin failed: %v", n.name, oerr)
 		}
 	}
-	err := _disk_write(vfs, abs, data, false)
+	err := disk_write_by(w, n, op, abs, data)
 	serr := fs.Error.None
 	if agent && !n.disk.dead {
 		serr = _agent_scope_close(w, n, scope)
