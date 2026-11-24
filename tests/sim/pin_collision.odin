@@ -26,7 +26,18 @@ PC_TOOL :: "tool line\n"
 Pc_Arm :: struct {
 	pin:    Pc_Pin,
 	loser:  bool,
+	kind:   Pc_Kind,
 }
+
+Pc_Kind :: enum u8 {
+	Collide,
+	Second_Write,
+	Both_Texts,
+	Nested,
+}
+
+@(private = "file")
+PC_AGAIN :: "again line\n"
 
 Pc_Pin :: enum u8 {
 	None,
@@ -90,7 +101,7 @@ _pc_cut :: proc(w: ^World, cut: bool) {
 _pc_all :: proc(n: ^Node, tree: eng.Object) -> (text: string, files: string) {
 	b := strings.builder_make(context.temp_allocator)
 	f := strings.builder_make(context.temp_allocator)
-	names, _ := eng.tree_list(&n.e, tree, "", context.temp_allocator)
+	names, _ := tree_walk(n, tree, {}, "")
 	for nm in names {
 		d, _ := eng.tree_read(&n.e, tree, nm, context.temp_allocator)
 		strings.write_string(&b, string(d))
@@ -102,13 +113,17 @@ _pc_all :: proc(n: ^Node, tree: eng.Object) -> (text: string, files: string) {
 @(private = "file")
 _pc_check :: proc(w: ^World, n: ^Node, tree: eng.Object, root: string, arm: Pc_Arm, when_: string, tool: int) {
 	text, files := _pc_all(n, tree)
-	for line in ([]string{PC_ONE, PC_TWO, PC_TOOL}) {
-		want := tool if line == PC_TOOL else 1
-		if c := strings.count(text, line); c != want {
+	for line in ([]string{PC_ONE, PC_TWO, PC_TOOL, PC_AGAIN}) {
+		want := tool if line == PC_TOOL else 1 if line == PC_ONE || line == PC_TWO else tool if arm.kind == .Second_Write else 0
+		c := strings.count(text, line)
+		if arm.kind == .Both_Texts && line == PC_TWO && c >= 1 {
+			continue
+		}
+		if c != want {
 			world_fail(w, "pin collision %v: %s on %s: %q appears %d times, want %d (%s)", arm, when_, n.name, strings.trim_space(line), c, want, files)
 		}
 	}
-	names, _ := eng.tree_list(&n.e, tree, "", context.temp_allocator)
+	names, _ := tree_walk(n, tree, {}, "")
 	for nm in names {
 		d, _ := eng.tree_read(&n.e, tree, nm, context.temp_allocator)
 		n.disk.probe += 1
@@ -186,16 +201,23 @@ _pin_collision :: proc(w: ^World, arm: Pc_Arm) -> (collided: bool) {
 	join: {
 		context = instance_context(&first.inst)
 		defer node_after(first)
-		_pc_write(disk_vfs(&first.disk), strings.concatenate({froot, "/a.txt"}, context.temp_allocator), PC_ONE)
+		if arm.kind == .Nested {
+			prim.mkdir_all(disk_vfs(&first.disk), strings.concatenate({froot, "/d"}, context.temp_allocator), 0o755)
+		}
+		_pc_write(disk_vfs(&first.disk), strings.concatenate({froot, "/d/a.txt" if arm.kind == .Nested else "/a.txt"}, context.temp_allocator), PC_ONE)
 	}
 	_pc_step(w, 2_000_000_000)
 	{
 		context = instance_context(&other.inst)
 		defer node_after(other)
-		_pc_write(disk_vfs(&other.disk), strings.concatenate({oroot, "/a.txt"}, context.temp_allocator), PC_TWO)
+		if arm.kind == .Nested {
+			prim.mkdir_all(disk_vfs(&other.disk), strings.concatenate({oroot, "/d"}, context.temp_allocator), 0o755)
+		}
+		_pc_write(disk_vfs(&other.disk), strings.concatenate({oroot, "/d/a.txt" if arm.kind == .Nested else "/a.txt"}, context.temp_allocator), PC_TWO)
 	}
 	_pc_step(w, 2_000_000_000)
 	n, mine, root := b, PC_TWO, PC_B
+	path := "d/a.txt" if arm.kind == .Nested else "a.txt"
 	if arm.loser {
 		n, mine, root = a, PC_ONE, PC_A
 	}
@@ -217,11 +239,11 @@ _pin_collision :: proc(w: ^World, arm: Pc_Arm) -> (collided: bool) {
 		scope = fs.scope_open(n.reg, sm.m, prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng)), agent)
 		#partial switch arm.pin {
 		case .Read:
-			fs.scope_read_base(scope, "a.txt", transmute([]u8)mine)
+			fs.scope_read_base(scope, path, transmute([]u8)mine)
 		case .Hold:
-			fs.scope_write_begin(scope, "a.txt")
+			fs.scope_write_begin(scope, path)
 		}
-		if arm.pin != .None && !fs.scope_pinned(scope, "a.txt") {
+		if arm.pin != .None && !fs.scope_pinned(scope, path) {
 			world_fail(w, "pin collision: the agent pinned nothing on %s", n.name)
 			return
 		}
@@ -231,22 +253,38 @@ _pin_collision :: proc(w: ^World, arm: Pc_Arm) -> (collided: bool) {
 	{
 		context = instance_context(&n.inst)
 		names, _ := eng.tree_list(&n.e, tree, "", context.temp_allocator)
-		collided = len(names) == 2
+		collided = len(names) >= 2 || arm.kind == .Nested
 		if !collided {
 			world_fail(w, "pin collision: no collision on %s (%v), so the check proves nothing", n.name, names)
 			node_after(n)
 			return
 		}
-		abs := strings.concatenate({root, "/a.txt"}, context.temp_allocator)
+		abs := strings.concatenate({root, "/", path}, context.temp_allocator)
 		_writer_set(w, n, abs, Writer_Info{scope = scope, agent = true})
-		fs.mount_observe_begin(sm.m, "a.txt", scope)
-		_pc_write(disk_vfs(&n.disk), abs, strings.concatenate({mine, PC_TOOL}, context.temp_allocator))
+		fs.mount_observe_begin(sm.m, path, scope)
+		_pc_write(disk_vfs(&n.disk), abs, strings.concatenate({mine, PC_TWO if arm.kind == .Both_Texts else "", PC_TOOL}, context.temp_allocator))
 		if arm.pin == .Hold {
-			fs.scope_write_base(scope, "a.txt", transmute([]u8)mine)
-			fs.scope_write_end(scope, "a.txt")
+			fs.scope_write_base(scope, path, transmute([]u8)mine)
+			fs.scope_write_end(scope, path)
 		}
 		fs.scope_close(n.reg, scope)
 		_forget_scope(w, n, scope)
+		node_after(n)
+	}
+	if arm.kind == .Second_Write {
+		_pc_step(w, 20_000_000_000)
+		context = instance_context(&n.inst)
+		abs := strings.concatenate({root, "/", path}, context.temp_allocator)
+		again := fs.scope_open(n.reg, sm.m, prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng)), agent)
+		n.disk.probe += 1
+		now, _ := prim.read_file(disk_vfs(&n.disk), abs, context.temp_allocator)
+		n.disk.probe -= 1
+		fs.scope_read_base(again, path, now)
+		_writer_set(w, n, abs, Writer_Info{scope = again, agent = true})
+		fs.mount_observe_begin(sm.m, path, again)
+		_pc_write(disk_vfs(&n.disk), abs, strings.concatenate({string(now), PC_AGAIN}, context.temp_allocator))
+		fs.scope_close(n.reg, again)
+		_forget_scope(w, n, again)
 		node_after(n)
 	}
 	_pc_step(w, 30_000_000_000)
@@ -281,20 +319,22 @@ pin_collision :: proc(t: ^testing.T) {
 	}
 	test_begin(t)
 	defer test_end(t)
-	for pin in Pc_Pin {
-		for loser in ([]bool{false, true}) {
-			if pin == .None && loser {
-				continue
-			}
-			arm := Pc_Arm{pin, loser}
-			failures, collided := pin_collision_run(1, arm)
-			for f in failures {
-				fmt.eprintf("pin_collision: %s\n", f)
-				delete(f)
-			}
-			fmt.eprintf("pin_collision: %v collided=%v failures=%d\n", arm, collided, len(failures))
-			testing.expect(t, len(failures) == 0, fmt.tprintf("pin_collision %v failed", arm))
-			delete(failures)
+	for kind in Pc_Kind {
+		for pin in Pc_Pin {
+			for loser in ([]bool{false, true}) {
+				if pin == .None && loser || kind != .Collide && (pin == .None || !loser) {
+					continue
+				}
+				arm := Pc_Arm{pin, loser, kind}
+				failures, collided := pin_collision_run(1, arm)
+				for f in failures {
+					fmt.eprintf("pin_collision: %s\n", f)
+					delete(f)
+				}
+				fmt.eprintf("pin_collision: %v collided=%v failures=%d\n", arm, collided, len(failures))
+				testing.expect(t, len(failures) == 0, fmt.tprintf("pin_collision %v failed", arm))
+				delete(failures)
 		}
+	}
 	}
 }
