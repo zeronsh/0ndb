@@ -138,6 +138,9 @@ Disk :: struct {
 	lose_shrinks: bool,
 	dead:      bool,
 	fail_sync: u64,
+	fail_sync_root: string,
+	fail_sync_dir: string,
+	sync_fired: u64,
 	fail_nth:  u64,
 	fail_stick: bool,
 	fail_stuck: bool,
@@ -833,9 +836,12 @@ _d_sync :: proc(data: rawptr, fd: prim.Fd) -> prim.Error {
 		return err
 	}
 	owned := len(d.ghost_root) > 0 && strings.has_prefix(of.path, d.ghost_root) && (len(of.path) == len(d.ghost_root) || of.path[len(d.ghost_root)] == '/')
-	if d.fail_sync > 0 || _inject_fd(d, fd, false) != .None || _tmp_sync_fail(d, n, of.path) {
-		if d.fail_sync > 0 {
+	armed := d.probe == 0 && d.fail_sync > 0 && _close_syncs(d, of.path)
+	if armed || _inject_fd(d, fd, false) != .None || _tmp_sync_fail(d, n, of.path) {
+		if armed {
 			d.fail_sync -= 1
+			d.sync_fired += 1
+			d.stats.injected += 1
 		}
 		if n.kind == .File {
 			for p in n.pend {
@@ -905,6 +911,16 @@ _d_sync :: proc(data: rawptr, fd: prim.Fd) -> prim.Error {
 	_pend_drop(d, n)
 	clear(&n.pend)
 	return .None
+}
+
+@(private = "file")
+_close_syncs :: proc(d: ^Disk, path: string) -> bool {
+	for root in ([]string{d.fail_sync_root, d.fail_sync_dir}) {
+		if len(root) > 0 && strings.has_prefix(path, root) && (len(path) == len(root) || path[len(root)] == '/') {
+			return true
+		}
+	}
+	return false
 }
 
 @(private = "file")

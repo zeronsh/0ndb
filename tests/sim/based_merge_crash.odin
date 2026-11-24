@@ -125,6 +125,8 @@ _merge_crash :: proc(w: ^World, crash_at: u64, sync_fail: bool) -> (crashed: boo
 		n.disk.crash_at = n.disk.stats.ops + crash_at
 		if sync_fail {
 			n.disk.fail_sync = 1
+			n.disk.fail_sync_root = MERGE_ROOT
+			n.disk.fail_sync_dir = sm.m.dir
 		}
 		if _merge_write(vfs, MERGE_ROOT + "/a.txt", strings.concatenate({base, tool}, context.temp_allocator)) != .None || n.disk.dead {
 			break pin
@@ -133,6 +135,8 @@ _merge_crash :: proc(w: ^World, crash_at: u64, sync_fail: bool) -> (crashed: boo
 		_forget_scope(w, n, scope)
 	}
 	n.disk.fail_sync = 0
+	n.disk.fail_sync_root = ""
+	n.disk.fail_sync_dir = ""
 	if n.disk.dead {
 		node_crashed(n)
 	} else {
