@@ -1,0 +1,13 @@
+base 2ad73bc711362fb5c18f70147473bf4528492873
+diff --git a/src/fs/ingest.odin b/src/fs/ingest.odin
+index 865c0ac0..c1a6cef1 100644
+--- a/src/fs/ingest.odin
++++ b/src/fs/ingest.odin
+@@ -1438,6 +1438,7 @@ attribute_changes :: proc(p: ^Pass) -> Error {
+ 			replayed = true
+ 			cur = st.oid
+ 			last = st
++			if st.oid == disk_oid { break }
+ 		}
+ 		if replayed && !broken && !gone && cur == disk_oid {
+ 			c.actor = last.actor

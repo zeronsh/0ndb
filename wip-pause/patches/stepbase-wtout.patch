@@ -1,0 +1,27 @@
+base f883d4c50a52ea3979ecb0fd774ac9255c5c3d0a
+diff --git a/src/fs/ingest.odin b/src/fs/ingest.odin
+index 5552dc22..bf879c94 100644
+--- a/src/fs/ingest.odin
++++ b/src/fs/ingest.odin
+@@ -1,5 +1,7 @@
+ package fs
+ 
++import "core:fmt"
++
+ import "base:runtime"
+ import "core:bytes"
+ import "core:crypto/blake2b"
+@@ -1328,6 +1330,13 @@ commit_group :: proc(p: ^Pass, b: ^Builder, indices: []int) -> Error {
+ 	shadow_txn_begin(&m.shadow)
+ 	err: Error
+ 	for i in indices {
++		if p.changes[i].path == "b.txt" || p.changes[i].path == "c.txt" {
++			rd, _, _, rok, rdb := read_content(m, p.changes[i].path, p.changes[i].stat, p.changes[i].old.inode, p.changes[i].kind == .Modify)
++			_ = rdb
++			if rok {
++				fmt.eprintfln("SIGB %s %v line=%s git_wrote=%v data=%q", p.changes[i].path, p.changes[i].kind, m.line, p.git_wrote, string(rd)[:min(len(rd), 60)])
++			}
++		}
+ 		if err = emit_change(p, b, &p.changes[i]); err != .None {
+ 			break
+ 		}

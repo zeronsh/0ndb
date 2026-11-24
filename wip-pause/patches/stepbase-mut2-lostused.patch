@@ -1,0 +1,14 @@
+base 2ad73bc711362fb5c18f70147473bf4528492873
+diff --git a/src/fs/mount.odin b/src/fs/mount.odin
+index 736d47e1..8e8bfd1d 100644
+--- a/src/fs/mount.odin
++++ b/src/fs/mount.odin
+@@ -2503,7 +2503,7 @@ landed_read :: proc(m: ^Mount) -> Error {
+ 		}
+ 	}
+ 	for _, a in prim.unordered(m.attrib) {
+-		if a.step != {} {
++		if !a.used && a.step != {} {
+ 			from = min(from, a.at)
+ 		}
+ 	}

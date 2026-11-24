@@ -1,0 +1,260 @@
+base 1b1f728cdf057b95652cc2d496f46655bbef43be
+diff --git a/src/fs/ingest.odin b/src/fs/ingest.odin
+index 871c7157..8d906eb8 100644
+--- a/src/fs/ingest.odin
++++ b/src/fs/ingest.odin
+@@ -1361,6 +1361,12 @@ attribute_consumed :: proc(p: ^Pass, actor: prim.Id, idx: []int, scope := prim.I
+ 		if serr != .None || !found || e.oid == {} {
+ 			continue
+ 		}
++		if m.db != nil && !odb.exists(m.db, e.oid) {
++			data, oid, _, ok := read_content(m, c.path, c.stat, e.inode, true) or_return
++			if ok && oid == e.oid {
++				odb.write(m.db, .Blob, data)
++			}
++		}
+ 		attrib_set(m, c.path, actor, true, e.oid, scope, c.base, c.step, c.at)
+ 		attrib_log_append(m, c.path, actor, e.oid, scope, c.base, c.step, c.at) or_return
+ 		logged = true
+@@ -1429,7 +1435,7 @@ attribute_changes :: proc(p: ^Pass) -> Error {
+ 			}
+ 			continue
+ 		}
+-		_, disk_oid, _, ok := read_content(m, c.path, c.stat, c.old.inode, c.kind == .Modify) or_return
++		disk_data, disk_oid, _, ok := read_content(m, c.path, c.stat, c.old.inode, c.kind == .Modify) or_return
+ 		if !ok {
+ 			if has {
+ 				c.actor = a.actor
+@@ -1446,8 +1452,14 @@ attribute_changes :: proc(p: ^Pass) -> Error {
+ 				continue
+ 			}
+ 			if !odb.exists(m.db, st.oid) {
+-				broken = true
+-				break
++				stored: odb.Oid
++				if st.oid == disk_oid {
++					stored, _ = odb.write(m.db, .Blob, disk_data)
++				}
++				if stored != st.oid {
++					broken = true
++					break
++				}
+ 			}
+ 			committed := replay_step(p, &c, st) or_return
+ 			if !committed {
+diff --git a/src/fs/mount.odin b/src/fs/mount.odin
+index 736d47e1..50d432cd 100644
+--- a/src/fs/mount.odin
++++ b/src/fs/mount.odin
+@@ -1572,7 +1572,11 @@ attrib_log_open :: proc(m: ^Mount) -> Error {
+ 					delete(key, m.allocator)
+ 				}
+ 			} else {
+-				attrib_set(m, path, actor, false, o, sc, base, step, at)
++				base_step := actor == m.actor && o != {} && sc == {}
++				b, pending := m.attrib[path]
++				if !base_step || !pending || b.used {
++					attrib_set(m, path, actor, false, o, sc, base, step, at)
++				}
+ 				if o != {} {
+ 					attrib_chain_add(m, path, Attrib_Step{actor, o, sc, base, step, at})
+ 				}
+diff --git a/tests/sim/agent_cut_crash.odin b/tests/sim/agent_cut_crash.odin
+index 75d48484..b33fe355 100644
+--- a/tests/sim/agent_cut_crash.odin
++++ b/tests/sim/agent_cut_crash.odin
+@@ -2,15 +2,17 @@ package sim
+ 
+ import "core:fmt"
+ import "core:os"
++import "core:slice"
+ import "core:strings"
+ import "core:testing"
++import "../../src/crdt"
+ import eng "../../src/engine"
+ import "../../src/fs"
+ import "../../src/prim"
+ 
+ CUT_ROOT :: "/work/cut-n0"
+ 
+-agent_cut_run :: proc(seed: u64, crash_at: u64, process: bool) -> (failures: [dynamic]string, crashed: bool) {
++agent_cut_run :: proc(seed: u64, crash_at: u64, process: bool, pass: bool) -> (failures: [dynamic]string, crashed: bool, undone: bool) {
+ 	failures = make([dynamic]string)
+ 	cfg := default_config(seed)
+ 	cfg.nodes = 1
+@@ -25,7 +27,7 @@ agent_cut_run :: proc(seed: u64, crash_at: u64, process: bool) -> (failures: [dy
+ 	cfg.verbose = env_u64("SIM_VERBOSE", 0) != 0
+ 	w := new(World)
+ 	world_init(w, cfg)
+-	crashed = _cut_crash(w, crash_at, process)
++	crashed, undone = _cut_crash(w, crash_at, process, pass)
+ 	for f in w.failures {
+ 		append(&failures, fmt.aprintf("%s", f))
+ 	}
+@@ -69,7 +71,7 @@ _cut_write :: proc(vfs: prim.Vfs, path: string, data: []u8) -> prim.Error {
+ }
+ 
+ @(private = "file")
+-_cut_crash :: proc(w: ^World, crash_at: u64, process: bool) -> (crashed: bool) {
++_cut_crash :: proc(w: ^World, crash_at: u64, process: bool, pass: bool) -> (crashed: bool, undone: bool) {
+ 	n := w.nodes[0]
+ 	if !node_start(n) {
+ 		world_fail(w, "cut: node start")
+@@ -116,6 +118,7 @@ _cut_crash :: proc(w: ^World, crash_at: u64, process: bool) -> (crashed: bool) {
+ 	run_until(w, w.now + 2_000_000_000, true)
+ 	agent := prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng))
+ 	line := "agent line\n"
++	before: []crdt.Op_Id
+ 	crashes := w.stats.crashes
+ 	n.disk.crash_at = n.disk.stats.ops + crash_at
+ 	n.disk.force_process = process
+@@ -126,6 +129,13 @@ _cut_crash :: proc(w: ^World, crash_at: u64, process: bool) -> (crashed: bool) {
+ 			world_fail(w, "cut: mount missing before the write")
+ 			return
+ 		}
++		if pass {
++			fs.mount_sync(sm.m)
++			if n.disk.dead {
++				break write
++			}
++		}
++		before = slice.clone(_line_heads(sm.m), w.allocator)
+ 		scope := fs.scope_open(n.reg, sm.m, prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng)), agent)
+ 		obs := Cut_Observed{}
+ 		if fs.mount_observe_begin(sm.m, "a.txt", scope, _cut_observed, &obs) != .None || n.disk.dead {
+@@ -169,30 +179,82 @@ _cut_crash :: proc(w: ^World, crash_at: u64, process: bool) -> (crashed: bool) {
+ 		world_fail(w, "cut: mount missing after recovery")
+ 		return
+ 	}
+-	context = instance_context(&n.inst)
+-	defer node_after(n)
+-	data, spans, berr := eng.tree_blame(&n.e, tree, "a.txt", context.temp_allocator)
+-	if berr != .None {
+-		world_fail(w, "cut: blame a.txt: %v", berr)
++	want, mine := "", false
++	credit: {
++		context = instance_context(&n.inst)
++		defer node_after(n)
++		data, spans, berr := eng.tree_blame(&n.e, tree, "a.txt", context.temp_allocator)
++		if berr != .None {
++			world_fail(w, "cut: blame a.txt: %v", berr)
++			return
++		}
++		at := strings.index(string(data), line)
++		if at < 0 {
++			return
++		}
++		pos := 0
++		mine = true
++		for sp in spans {
++			lo := max(pos, at)
++			hi := min(pos + sp.len, at + len(line))
++			if lo < hi && sp.id.actor != agent {
++				if process || !fs.is_unattributed(sp.id.actor) {
++					world_fail(w, "cut: %d bytes of the agent's line are credited to %s, not the agent %s (%v crash at disk op %d)", hi - lo, id_short(sp.id.actor), id_short(agent), "process" if process else "power", crash_at)
++					return
++				}
++				mine = false
++			}
++			pos += sp.len
++		}
++		want = strings.clone(string(data), w.allocator)
++	}
++	if !mine {
+ 		return
+ 	}
+-	at := strings.index(string(data), line)
+-	if at < 0 {
++	revert: prim.Id
++	undo: {
++		context = instance_context(&n.inst)
++		defer node_after(n)
++		rerr: fs.Error
++		revert, rerr = fs.mount_revert_set(_cut_mount(n).m, fs.Version(before), []prim.Id{agent})
++		if rerr != .None || revert == {} {
++			world_fail(w, "cut: undo of the agent's write: revert %s, %v", id_short(revert), rerr)
++			return
++		}
++	}
++	run_until(w, w.now + 5_000_000_000, true)
++	cut, _ := strings.remove_all(want, line, w.allocator)
++	if !_cut_holds(w, n, tree, cut, "undo") {
+ 		return
+ 	}
+-	pos := 0
+-	for sp in spans {
+-		lo := max(pos, at)
+-		hi := min(pos + sp.len, at + len(line))
+-		if lo < hi && sp.id.actor != agent && (process || !fs.is_unattributed(sp.id.actor)) {
+-			world_fail(w, "cut: %d bytes of the agent's line are credited to %s, not the agent %s (%v crash at disk op %d)", hi - lo, id_short(sp.id.actor), id_short(agent), "process" if process else "power", crash_at)
++	redo: {
++		context = instance_context(&n.inst)
++		defer node_after(n)
++		if _, rerr := fs.mount_unrevert(_cut_mount(n).m, revert); rerr != .None {
++			world_fail(w, "cut: redo of the agent's write: %v", rerr)
+ 			return
+ 		}
+-		pos += sp.len
+ 	}
++	run_until(w, w.now + 5_000_000_000, true)
++	undone = _cut_holds(w, n, tree, want, "redo")
+ 	return
+ }
+ 
++@(private = "file")
++_cut_holds :: proc(w: ^World, n: ^Node, tree: eng.Object, want: string, what: string) -> bool {
++	context = instance_context(&n.inst)
++	defer node_after(n)
++	stored, serr := eng.tree_read(&n.e, tree, "a.txt", context.temp_allocator)
++	n.disk.probe += 1
++	disk, derr := prim.read_file(disk_vfs(&n.disk), CUT_ROOT + "/a.txt", context.temp_allocator)
++	n.disk.probe -= 1
++	if serr != .None || derr != .None || string(stored) != want || string(disk) != want {
++		world_fail(w, "cut: after the %s a.txt is %q (%v) and on disk %q (%v), want %q", what, string(stored), serr, string(disk), derr, want)
++		return false
++	}
++	return true
++}
++
+ @(test)
+ agent_cut_crash :: proc(t: ^testing.T) {
+ 	if s, ok := os.lookup_env("SIM_SEED", context.temp_allocator); ok && len(s) > 0 {
+@@ -200,21 +262,24 @@ agent_cut_crash :: proc(t: ^testing.T) {
+ 	}
+ 	test_begin(t)
+ 	defer test_end(t)
+-	for process in ([]bool{true, false}) {
+-		points := 0
+-		for k in u64(1) ..= 4000 {
+-			failures, crashed := agent_cut_run(1, k, process)
+-			for f in failures {
+-				fmt.eprintf("agent_cut_crash at disk op %d (%s): %s\n", k, "process" if process else "power", f)
+-				delete(f)
+-			}
+-			testing.expect(t, len(failures) == 0, fmt.tprintf("agent_cut_crash at disk op %d failed", k))
+-			delete(failures)
+-			if !crashed {
+-				points = int(k) - 1
+-				break
++	for pass in ([]bool{false, true}) {
++		for process in ([]bool{true, false}) {
++			points, undos := 0, 0
++			for k in u64(1) ..= 4000 {
++				failures, crashed, undone := agent_cut_run(1, k, process, pass)
++				for f in failures {
++					fmt.eprintf("agent_cut_crash at disk op %d (%s%s): %s\n", k, "process" if process else "power", ", after a pass" if pass else "", f)
++					delete(f)
++				}
++				testing.expect(t, len(failures) == 0, fmt.tprintf("agent_cut_crash at disk op %d failed", k))
++				delete(failures)
++				undos += 1 if undone else 0
++				if !crashed {
++					points = int(k) - 1
++					break
++				}
+ 			}
++			fmt.eprintf("agent_cut_crash: %d %s crash points%s, %d undone and redone\n", points, "process" if process else "power", " after a pass" if pass else "", undos)
+ 		}
+-		fmt.eprintf("agent_cut_crash: %d %s crash points\n", points, "process" if process else "power")
+ 	}
+ }

@@ -1,0 +1,14 @@
+base 2ad73bc711362fb5c18f70147473bf4528492873
+diff --git a/src/fs/base.odin b/src/fs/base.odin
+index 1a655893..ccb4139a 100644
+--- a/src/fs/base.odin
++++ b/src/fs/base.odin
+@@ -625,7 +625,7 @@ rebase_changes :: proc(p: ^Pass) -> Error {
+ 			c.base = a.base
+ 			logged.needed = a.step == {} && (c.scope != nil || c.scope_id != {})
+ 		} else if c.scope != nil {
+-			logged.needed = true
++			logged.needed = false
+ 		}
+ 		if logged.needed {
+ 			logged.actor = actor

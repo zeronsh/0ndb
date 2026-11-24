@@ -1,0 +1,16 @@
+base 2ad73bc711362fb5c18f70147473bf4528492873
+diff --git a/src/fs/ingest.odin b/src/fs/ingest.odin
+index 865c0ac0..980bcbbf 100644
+--- a/src/fs/ingest.odin
++++ b/src/fs/ingest.odin
+@@ -2200,9 +2200,7 @@ line_follow :: proc(m: ^Mount, key: string, replayed: ^Replayed) -> Error {
+ 		history_set_line(h, key, ids) or_return
+ 		clear(&m.synced)
+ 		append(&m.synced, ..ids)
+-		for path in replayed.paths {
+-			mount_reshow_add(m, path)
+-		}
++
+ 	} else {
+ 		target := v
+ 		if row, ok := shown_version(m, key, v); ok {

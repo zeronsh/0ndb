@@ -1,0 +1,14 @@
+base 2ad73bc711362fb5c18f70147473bf4528492873
+diff --git a/src/fs/ingest.odin b/src/fs/ingest.odin
+index 865c0ac0..1e2a07ba 100644
+--- a/src/fs/ingest.odin
++++ b/src/fs/ingest.odin
+@@ -1520,7 +1520,7 @@ landed_settle :: proc(m: ^Mount) {
+ steps_pending :: proc(m: ^Mount, steps: []Attrib_Step, shown: odb.Oid) -> []Attrib_Step {
+ 	#reverse for st, i in steps {
+ 		landed := st.step != {} && (st.step in m.landed || m.landed_gone)
+-		if landed || (st.step == {} && st.scope != {} && shown != {} && st.oid == shown) {
++		if landed || (st.step == {} && shown != {} && st.oid == shown) {
+ 			return steps[i + 1:]
+ 		}
+ 	}

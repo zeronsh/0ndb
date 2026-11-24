@@ -1,0 +1,14 @@
+base 2ad73bc711362fb5c18f70147473bf4528492873
+diff --git a/src/fs/ingest.odin b/src/fs/ingest.odin
+index 865c0ac0..742a6d97 100644
+--- a/src/fs/ingest.odin
++++ b/src/fs/ingest.odin
+@@ -1719,7 +1719,7 @@ step_base_resolve :: proc(p: ^Pass, c: ^Change, st: Attrib_Step, inode: fstree.I
+ 			return ids, .None
+ 		}
+ 	}
+-	if c.old.ver != 0 && c.old.inode == inode {
++	if false {
+ 		if ids, ok := shadow_version(&m.shadow, c.old); ok && len(ids) > 0 {
+ 			out := make([]crdt.Op_Id, len(ids), context.temp_allocator)
+ 			for id, i in ids {

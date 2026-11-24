@@ -1,0 +1,40 @@
+base 36b3d2c840132e5b03c31768f3c6d4552c8a549a
+diff --git a/src/fs/ingest.odin b/src/fs/ingest.odin
+index 8d906eb8..8f3865e7 100644
+--- a/src/fs/ingest.odin
++++ b/src/fs/ingest.odin
+@@ -1,5 +1,7 @@
+ package fs
+ 
++import "core:fmt"
++
+ import "base:runtime"
+ import "core:bytes"
+ import "core:crypto/blake2b"
+@@ -2213,6 +2215,7 @@ shown_with_own :: proc(m: ^Mount, line: string, row: Version) -> (v: Version, er
+ line_follow :: proc(m: ^Mount, key: string, replayed: ^Replayed) -> Error {
+ 	h := m.history
+ 	shown_put(&m.shown, m.line, m.synced[:], m.allocator)
++	fmt.eprintfln("SIGN follow %s -> %s row=%v", m.line, key, m.synced[:])
+ 	v, found := history_line(h, key, context.temp_allocator) or_return
+ 	if !found || len(v) == 0 {
+ 		sl := make([dynamic]crdt.Lv, context.temp_allocator)
+@@ -2247,6 +2250,9 @@ line_retarget :: proc(m: ^Mount, target: Version, replayed: map[fstree.Inode_Id]
+ 	if crdt.graph_version_lvs(&h.g, m.synced[:], &sl) != .None || crdt.graph_version_lvs(&h.g, target, &tl) != .None {
+ 		return .Corrupt
+ 	}
++	dbg_e, dbg_f, _ := shadow_get(&m.shadow, "a.txt")
++	dbg_d, _ := prim.read_file(m.vfs, "/work/retarget-n0-git/a.txt", context.temp_allocator)
++	fmt.eprintfln("SIGN retarget to %v synced %v entry ver=%d found=%v disk=%q", target, m.synced[:], dbg_e.ver, dbg_f, string(dbg_d))
+ 	if !crdt.frontier_eq(sl[:], tl[:]) || len(replayed) > 0 {
+ 		only_a := make([dynamic]crdt.Lv_Span, context.temp_allocator)
+ 		only_b := make([dynamic]crdt.Lv_Span, context.temp_allocator)
+@@ -2316,6 +2322,8 @@ line_retarget :: proc(m: ^Mount, target: Version, replayed: map[fstree.Inode_Id]
+ 			shadow_put(&m.shadow, p, Entry{inode = ino, kind = info.kind}) or_return
+ 		}
+ 	}
++	dbg_e2, dbg_f2, _ := shadow_get(&m.shadow, "a.txt")
++	fmt.eprintfln("SIGN retargeted entry ver=%d found=%v", dbg_e2.ver, dbg_f2)
+ 	clear(&m.synced)
+ 	append(&m.synced, ..target)
+ 	m.rescan = true

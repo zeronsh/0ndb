@@ -1,0 +1,463 @@
+base 38acdeb803ac9b040cb34bee6a1c4b1c0dcaa19f
+diff --git a/src/fs/base.odin b/src/fs/base.odin
+index 49814e58..7bbcfe06 100644
+--- a/src/fs/base.odin
++++ b/src/fs/base.odin
+@@ -1,5 +1,7 @@
+ package fs
+ 
++import "core:fmt"
++
+ import "core:crypto/blake2b"
+ import "core:slice"
+ import "../crdt"
+@@ -178,6 +180,7 @@ observe_record :: proc(m: ^Mount, s: ^Scope, kind: fshist.Observe_Kind, inode: f
+ 	if !actor_on_line(m, s.actor) {
+ 		return .None
+ 	}
++	fmt.eprintfln("DBGR observe_record %s kind %v version %v", rel, kind, version)
+ 	buf := make([dynamic]u8, context.temp_allocator)
+ 	fshist.encode_observe(&buf, fshist.Observe_Op{kind = kind, inode = inode_op(m.history, inode), path = rel, version = version, hash = hash})
+ 	b: Builder
+@@ -545,6 +548,12 @@ rebase_changes :: proc(p: ^Pass) -> Error {
+ 		}
+ 		pbuf: Pin
+ 		pin, actor, observed := _change_pin(m, &c, &pbuf)
++		if pin != nil {
++			fmt.eprintfln("DBGR pin path %s kind %v observed %v has_read %v read %v read_inode %v has_write %v write %v oldver %d", c.path, c.kind, observed, pin.has_read, pin.read[:], pin.read_inode, pin.has_write, pin.write[:], c.old.ver)
++			if c.kind == .Modify && c.old.ver != 0 {
++				if ids, vo := shadow_version(&m.shadow, c.old); vo { fmt.eprintfln("DBGR  entry version %v", ids) }
++			}
++		}
+ 		if pin == nil {
+ 			append(&keep, c)
+ 			continue
+@@ -689,6 +698,7 @@ rebase_commit :: proc(p: ^Pass, c: ^Change, v: []crdt.Op_Id, inode: fstree.Inode
+ 	ne.oid = oid
+ 	ne.ver = 0
+ 	predicted: fstree.Op_Id
++	fmt.eprintfln("DBGR rebase_commit path %s actor %v kind %v n %d v %v synced %v oldver %d oldinode %v inode %v git_wrote %v scope %v scope_id %v old %q data %q line %s", c.path, actor, c.kind, b.n, v, m.synced[:], c.old.ver, c.old.inode, inode, p.git_wrote, c.scope != nil, c.scope_id, string(old), string(data), m.line)
+ 	if err == .None {
+ 		if b.n == 0 {
+ 			buf := make([dynamic]u8, context.temp_allocator)
+diff --git a/src/fs/ingest.odin b/src/fs/ingest.odin
+index 8c3233e4..f85bb30a 100644
+--- a/src/fs/ingest.odin
++++ b/src/fs/ingest.odin
+@@ -1,5 +1,7 @@
+ package fs
+ 
++import "core:fmt"
++
+ import "base:runtime"
+ import "core:bytes"
+ import "core:crypto/blake2b"
+@@ -1175,6 +1177,7 @@ adopt_one :: proc(p: ^Pass, snap: ^fstree.Snapshot, ll: []crdt.Lv, line: Version
+ 		return false, .None
+ 	}
+ 	adopt_version(p, line, ver) or_return
++	fmt.eprintfln("DBGA adopt_one %s kind %v line %v synced %v git_wrote %v mline %s", c.path, c.kind, line, m.synced[:], p.git_wrote, m.line)
+ 	e := Entry{inode = ino, kind = .File, stat = c.stat, oid = disk_oid, ver = ver^}
+ 	shadow_put(&m.shadow, c.path, e) or_return
+ 	return true, .None
+@@ -1788,6 +1791,7 @@ line_follow :: proc(m: ^Mount, key: string) -> Error {
+ 		if row, ok := shown_version(m, key, v); ok {
+ 			target = shown_with_own(m, key, row) or_return
+ 		}
++		fmt.eprintfln("DBGN retarget %s target %v head %v synced %v", key, target, v, m.synced[:])
+ 		line_retarget(m, target) or_return
+ 	}
+ 	delete(m.line, m.allocator)
+diff --git a/src/fs/materialize.odin b/src/fs/materialize.odin
+index 39ae5475..25776dac 100644
+--- a/src/fs/materialize.odin
++++ b/src/fs/materialize.odin
+@@ -1,5 +1,7 @@
+ package fs
+ 
++import "core:fmt"
++
+ import "base:runtime"
+ import "core:crypto/blake2b"
+ import "core:slice"
+@@ -109,6 +111,12 @@ _mount_materialize :: proc(m: ^Mount) -> (done: bool, err: Error) {
+ 
+ @(private)
+ materialize_to :: proc(m: ^Mount, target: Version, merge: bool) -> Error {
++	dbg_t := target
++	fmt.eprintfln("DBGN mat target %v synced %v merge %v", dbg_t, m.synced[:], merge)
++	defer {
++		dd, _ := prim.read_file(m.vfs, "/work/named-n0-git/a.txt", context.temp_allocator)
++		fmt.eprintfln("DBGN mat end synced %v disk %q", m.synced[:], string(dd))
++	}
+ 	attr_begin(m)
+ 	defer attr_end(m)
+ 	defer if m.has_placed {
+diff --git a/src/fs/mount.odin b/src/fs/mount.odin
+index bf438443..cc3aa723 100644
+--- a/src/fs/mount.odin
++++ b/src/fs/mount.odin
+@@ -1,5 +1,7 @@
+ package fs
+ 
++import "core:fmt"
++
+ import "base:runtime"
+ import "core:hash/xxhash"
+ import "core:crypto/blake2b"
+@@ -2200,6 +2202,7 @@ load_mount_state :: proc(m: ^Mount) -> (fresh: bool, err: Error) {
+ 		return false, .Corrupt
+ 	}
+ 	switch_record_load(m, rec_head, rec_reflog)
++	fmt.eprintfln("DBGN load line %s synced %v shown %v", m.line, m.synced[:], m.shown)
+ 	return false, .None
+ }
+ 
+@@ -2646,6 +2649,22 @@ mount_recover :: proc(m: ^Mount) -> Error {
+ 	if len(lost) > 0 {
+ 		drop_lost(m, "", lost[:]) or_return
+ 	}
++	for it in m.intents {
++		if lv, okl := crdt.graph_lv(&h.g, crdt.Op_Id{it.actor, it.seq}); okl {
++			if _, _, st, off, bok := history_batch_at(h, lv); bok {
++				if b, be := history_read_batch(h, st, off, context.temp_allocator); be == .None {
++					fmt.eprintfln("DBGN intent %v seq %d n %d parents %v synced-before %v", it.actor, it.seq, it.n, b.parents, m.synced[:])
++					for op in b.ops {
++						fmt.eprintfln("DBGN    op %v len %d content %q", op.kind, op.len, string(op.content[:min(len(op.content), 24)]))
++					}
++				}
++			}
++		}
++	}
++	{
++		e, ef, _ := shadow_get(&m.shadow, "a.txt")
++		fmt.eprintfln("DBGN before-recover a.txt entry %v %v ver %d oid %x", ef, e.inode, e.ver, e.oid[:4])
++	}
+ 	if recovered {
+ 		target := have[:]
+ 		if len(ends) > 0 {
+@@ -2690,6 +2709,12 @@ mount_recover :: proc(m: ^Mount) -> Error {
+ 			append(&m.synced, ..v)
+ 		}
+ 	}
++	{
++		e, ef, _ := shadow_get(&m.shadow, "a.txt")
++		dd, _ := prim.read_file(m.vfs, "/work/named-n0-git/a.txt", context.temp_allocator)
++		tt, _ := history_text_at(h, e.inode, m.synced[:], context.temp_allocator)
++		fmt.eprintfln("DBGN recovered %v synced %v a.txt entry %v %v ver %d oid %x text-at-synced %q disk %q absent %v reshow %v", recovered, m.synced[:], ef, e.inode, e.ver, e.oid[:4], string(tt), string(dd), m.absent[:], m.reshow[:])
++	}
+ 	m.jpend = mount_jlen(m)
+ 	history_trim(h)
+ 	return mount_settle(m)
+diff --git a/tests/sim/named_version_crash.odin b/tests/sim/named_version_crash.odin
+new file mode 100644
+index 00000000..9d0a663d
+--- /dev/null
++++ b/tests/sim/named_version_crash.odin
+@@ -0,0 +1,306 @@
++package sim
++
++import "core:fmt"
++import "core:os"
++import "core:strings"
++import "core:testing"
++import eng "../../src/engine"
++import "../../src/fs"
++import "../../src/prim"
++
++@(private = "file")
++NV_ROOT :: "/work/named-n0-git"
++
++@(private = "file")
++NV_FEATURE :: "git:refs/heads/feature"
++
++@(private = "file")
++NV_BASE :: "base line\n"
++
++@(private = "file")
++NV_KEPT :: "kept line\n"
++
++@(private = "file")
++NV_TOOL :: "tool line\n"
++
++Named_Kind :: enum u8 {
++	Plain,
++	Checkout_New,
++	Checkout_Existing,
++	Line_Switch,
++}
++
++Named_Arm :: struct {
++	kind:    Named_Kind,
++	process: bool,
++	early:   bool,
++	control: bool,
++	clean:   bool,
++}
++
++@(private = "file")
++NV_OTHER :: "other line\n"
++
++Named_Result :: struct {
++	crashed: bool,
++	named:   bool,
++	ahead:   bool,
++}
++
++named_version_run :: proc(seed: u64, arm: Named_Arm, crash_at: u64) -> (failures: [dynamic]string, res: Named_Result) {
++	failures = make([dynamic]string)
++	cfg := default_config(seed)
++	cfg.nodes = 1
++	cfg.spaces = 0
++	cfg.ops = 0
++	cfg.crash_rate = 0
++	cfg.fault_rate = 0
++	cfg.io_rate = 0
++	cfg.byzantine = false
++	cfg.bulk = false
++	cfg.durability = .Async
++	cfg.mem_max = 1500
++	cfg.verbose = env_u64("SIM_VERBOSE", 0) != 0
++	w := new(World)
++	world_init(w, cfg)
++	res = _named_crash(w, arm, crash_at)
++	for f in w.failures {
++		append(&failures, fmt.aprintf("%s", f))
++	}
++	world_destroy(w)
++	free(w)
++	return
++}
++
++@(private = "file")
++_nv_mount :: proc(n: ^Node) -> ^Sim_Mount {
++	for &x in n.mounts {
++		if x.root == NV_ROOT && x.m != nil {
++			return &x
++		}
++	}
++	return nil
++}
++
++@(private = "file")
++_nv_write :: proc(vfs: prim.Vfs, path: string, data: string) -> prim.Error {
++	fd := prim.open_file(vfs, path, {.Write, .Create, .Truncate}, 0o644) or_return
++	err := prim.write_at(vfs, fd, transmute([]u8)data, 0)
++	if err == .None {
++		err = prim.datasync(vfs, fd)
++	}
++	cerr := prim.close_file(vfs, fd)
++	return err if err != .None else cerr
++}
++
++@(private = "file")
++_nv_checkout :: proc(w: ^World, n: ^Node, branch: string) -> bool {
++	changes := make([dynamic]Git_Change, context.temp_allocator)
++	res, err := git_checkout(disk_vfs(&n.disk), NV_ROOT, branch, false, clock_wall(&n.clock) / 1_000_000_000, node_clock(&n.clock), rng_random(&w.rng), &changes)
++	return res == .Done && err == .None
++}
++
++@(private = "file")
++_named_crash :: proc(w: ^World, arm: Named_Arm, crash_at: u64) -> (res: Named_Result) {
++	n := w.nodes[0]
++	if !node_start(n) {
++		world_fail(w, "named: node start")
++		return
++	}
++	m := &w.model
++	vfs := disk_vfs(&n.disk)
++	tree: eng.Object
++	setup: {
++		context = instance_context(&n.inst)
++		space, err := eng.space_create(&n.e, "named")
++		if err != .None {
++			world_fail(w, "named: space_create: %v", err)
++			return
++		}
++		eng.space_open(&n.e, space)
++		tree, err = eng.tree_create(&n.e, space, "work")
++		if err != .None {
++			world_fail(w, "named: tree_create: %v", err)
++			return
++		}
++		node_after(n)
++	}
++	cop := new_op(m, .Create, n, len(m.objs))
++	op_done(cop, 0, .None)
++	ob := M_Obj{kind = .Tree, creator = n.idx, op = cop.idx, o = tree}
++	ob.removed = make(map[string]bool, w.allocator)
++	ob.shared = make([dynamic]int, w.allocator)
++	append(&m.objs, ob)
++	oi := len(m.objs) - 1
++	when_s := clock_wall(&n.clock) / 1_000_000_000
++	files := [?]Git_File{{name = "a.txt", data = transmute([]u8)string(NV_BASE)}, {name = "b.txt", data = transmute([]u8)string("main b\n")}}
++	if err := git_checkout_create(vfs, NV_ROOT, files[:], when_s, node_clock(&n.clock), rng_random(&w.rng)); err != .None {
++		world_fail(w, "named: git checkout: %v", err)
++		return
++	}
++	branch_files := [?]Git_File{{name = "c.txt", data = transmute([]u8)string("feature c\n")}}
++	if err := git_branch_commit(vfs, NV_ROOT, "feature", branch_files[:], nil, when_s, node_clock(&n.clock), rng_random(&w.rng)); err != .None {
++		world_fail(w, "named: branch commit: %v", err)
++		return
++	}
++	if err := node_mount(w, n, oi, NV_ROOT); err != .None {
++		world_fail(w, "named: mount: %v", err)
++		return
++	}
++	append(&m.mounts, M_Mount{node = n.idx, oi = oi, root = strings.clone(NV_ROOT, w.allocator)})
++	run_until(w, w.now + 2_000_000_000, true)
++	kind := arm.kind
++	if kind == .Checkout_Existing {
++		for b in ([]string{"feature", "main"}) {
++			if !_nv_checkout(w, n, b) {
++				world_fail(w, "named: round trip to %s", b)
++				return
++			}
++			trip: {
++				context = instance_context(&n.inst)
++				node_after(n)
++			}
++			run_until(w, w.now + 2_000_000_000, true)
++		}
++		other: {
++			context = instance_context(&n.inst)
++			fbase, _ := eng.tree_version(&n.e, tree, NV_FEATURE, context.temp_allocator)
++			if err := eng.tree_write(&n.e, tree, "a.txt", transmute([]u8)string(NV_BASE + NV_OTHER), fbase, NV_FEATURE); err != .None {
++				world_fail(w, "named: tree_write on feature: %v", err)
++				return
++			}
++			node_after(n)
++		}
++		run_until(w, w.now + 2_000_000_000, true)
++	}
++	agent := prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng))
++	holder := prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng))
++	pin: {
++		context = instance_context(&n.inst)
++		sm := _nv_mount(n)
++		if sm == nil {
++			world_fail(w, "named: mount missing")
++			return
++		}
++		if !arm.control {
++			hold := fs.scope_open(n.reg, sm.m, prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng)), holder)
++			fs.scope_write_begin(hold, "a.txt")
++		}
++		reader := fs.scope_open(n.reg, sm.m, prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng)), agent)
++		fs.scope_read_base(reader, "a.txt", transmute([]u8)string(NV_BASE))
++		if !fs.scope_pinned(reader, "a.txt") {
++			world_fail(w, "named: the reader did not pin a.txt")
++			return
++		}
++		if !arm.control {
++			other := fs.scope_open(n.reg, sm.m, prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng)), prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng)))
++			fs.mount_observe_begin(sm.m, "a.txt", other)
++			_writer_set(w, n, NV_ROOT + "/a.txt", Writer_Info{scope = other, agent = true})
++			if err := _nv_write(vfs, NV_ROOT + "/a.txt", NV_BASE + NV_KEPT); err != .None {
++				world_fail(w, "named: other scope's write: %v", err)
++				return
++			}
++			fs.scope_close(n.reg, other)
++			_forget_scope(w, n, other)
++		}
++		if arm.clean {
++			fs.scope_close(n.reg, reader)
++			break pin
++		}
++		fs.mount_observe_begin(sm.m, "a.txt", reader)
++		_writer_set(w, n, NV_ROOT + "/a.txt", Writer_Info{scope = reader, agent = true})
++		if err := _nv_write(vfs, NV_ROOT + "/a.txt", NV_BASE + NV_TOOL); err != .None {
++			world_fail(w, "named: agent write: %v", err)
++			return
++		}
++		fs.scope_close(n.reg, reader)
++		_forget_scope(w, n, reader)
++		res.named = _nv_named(n)
++		node_after(n)
++	}
++	if !arm.early {
++		run_until(w, w.now + 2_000_000_000, true)
++	}
++	seen: {
++		context = instance_context(&n.inst)
++		n.disk.probe += 1
++		disk, _ := prim.read_file(vfs, NV_ROOT + "/a.txt", context.temp_allocator)
++		n.disk.probe -= 1
++		line, _ := eng.tree_read(&n.e, tree, "a.txt", context.temp_allocator, {}, "main")
++		res.ahead = strings.contains(string(line), NV_KEPT) && strings.contains(string(line), NV_TOOL) && !strings.contains(string(disk), NV_KEPT)
++	}
++	crashes := w.stats.crashes
++	n.disk.force_process = arm.process
++	n.disk.crash_at = n.disk.stats.ops + crash_at
++	_nv_write(vfs, NV_ROOT + "/b.txt", "main b\nraised\n")
++	if !n.disk.dead {
++		switch kind {
++		case .Plain:
++		case .Checkout_New, .Checkout_Existing:
++			_nv_checkout(w, n, "feature")
++		case .Line_Switch:
++			context = instance_context(&n.inst)
++			if sm := _nv_mount(n); sm != nil {
++				fs.mount_line_switch(sm.m, NV_FEATURE)
++			}
++		}
++	}
++	after: {
++		context = instance_context(&n.inst)
++		node_after(n)
++	}
++	run_until(w, w.now + 20_000_000_000, true)
++	n.disk.crash_at = 0
++	n.disk.force_process = false
++	res.crashed = w.stats.crashes > crashes
++	run_until(w, w.now + 20_000_000_000, true)
++	if !n.alive {
++		world_fail(w, "named: node did not come back")
++		return
++	}
++	context = instance_context(&n.inst)
++	defer node_after(n)
++	data, rerr := eng.tree_read(&n.e, tree, "a.txt", context.temp_allocator, {}, "main")
++	if rerr != .None {
++		world_fail(w, "named: tree_read: %v", rerr)
++		return
++	}
++	for line in ([]string{NV_BASE, NV_KEPT, NV_TOOL}) {
++		want := 0 if (arm.control && line == NV_KEPT) || (arm.clean && line == NV_TOOL) else 1
++		if c := strings.count(string(data), line); c != want {
++			world_fail(w, "named: %v: %q appears %d times in a.txt on main, want %d (%q), at disk op %d", arm, strings.trim_space(line), c, want, string(data), crash_at)
++		}
++	}
++	if kind == .Checkout_Existing {
++		fdata, ferr := eng.tree_read(&n.e, tree, "a.txt", context.temp_allocator, {}, NV_FEATURE)
++		if c := strings.count(string(fdata), NV_OTHER); ferr != .None || c != 1 {
++			world_fail(w, "named: %v: %q appears %d times in a.txt on feature (%v %q), at disk op %d", arm, strings.trim_space(NV_OTHER), c, ferr, string(fdata), crash_at)
++		}
++	}
++	return
++}
++
++@(private = "file")
++_nv_named :: proc(n: ^Node) -> bool {
++	sm := _nv_mount(n)
++	if sm == nil || !fs.shadow_attached(&sm.m.shadow) {
++		return false
++	}
++	e, found, err := fs.shadow_get(&sm.m.shadow, "a.txt")
++	return err == .None && found && e.ver != 0
++}
++
++@(test)
++named_version_crash :: proc(t: ^testing.T) {
++	if s, ok := os.lookup_env("SIM_SEED", context.temp_allocator); ok && len(s) > 0 {
++		return
++	}
++	test_begin(t)
++	defer test_end(t)
++	op := env_u64("NV_OP", 0)
++	failures, res := named_version_run(1, Named_Arm{kind = .Checkout_Existing, early = true, control = true}, op)
++	for f in failures {
++		fmt.eprintf("named_version_crash: %s\n", f)
++	}
++	fmt.eprintf("DBGN crashed %v\n", res.crashed)
++}

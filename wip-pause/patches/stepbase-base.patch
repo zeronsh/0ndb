@@ -1,0 +1,237 @@
+base 93b419e35210cf015a17550ce9c85baecb2a80ba
+diff --git a/tests/sim/step_size.odin b/tests/sim/step_size.odin
+new file mode 100644
+index 00000000..147873a1
+--- /dev/null
++++ b/tests/sim/step_size.odin
+@@ -0,0 +1,112 @@
++package sim
++
++import "core:fmt"
++import "core:os"
++import "core:strings"
++import "core:testing"
++import eng "../../src/engine"
++import "../../src/fs"
++import "../../src/prim"
++import "../../src/journal"
++
++@(private = "file")
++_ss_disk :: proc(n: ^Node) -> (total: i64) {
++	for _, ino in n.disk.inodes {
++		total += i64(len(ino.data))
++	}
++	return
++}
++
++@(test)
++step_size :: proc(t: ^testing.T) {
++	if s, ok := os.lookup_env("SIM_SEED", context.temp_allocator); ok && len(s) > 0 {
++		return
++	}
++	test_begin(t)
++	defer test_end(t)
++	edits := int(env_u64("SS_EDITS", 1000))
++	big := int(env_u64("SS_SIZE", 400))
++	cfg := default_config(1)
++	cfg.nodes = 1
++	cfg.spaces = 0
++	cfg.ops = 0
++	cfg.crash_rate = 0
++	cfg.fault_rate = 0
++	cfg.io_rate = 0
++	cfg.byzantine = false
++	cfg.bulk = false
++	cfg.durability = .Async
++	cfg.mem_max = 1500
++	w := new(World)
++	world_init(w, cfg)
++	defer {
++		world_destroy(w)
++		free(w)
++	}
++	n := w.nodes[0]
++	node_start(n)
++	vfs := disk_vfs(&n.disk)
++	root := "/work/size-n0-git"
++	tree: eng.Object
++	{
++		context = instance_context(&n.inst)
++		space, _ := eng.space_create(&n.e, "size")
++		eng.space_open(&n.e, space)
++		tree, _ = eng.tree_create(&n.e, space, "work")
++		node_after(n)
++	}
++	m := &w.model
++	cop := new_op(m, .Create, n, len(m.objs))
++	op_done(cop, 0, .None)
++	ob := M_Obj{kind = .Tree, creator = n.idx, op = cop.idx, o = tree}
++	ob.removed = make(map[string]bool, w.allocator)
++	ob.shared = make([dynamic]int, w.allocator)
++	append(&m.objs, ob)
++	oi := len(m.objs) - 1
++	base := make([dynamic]u8, w.allocator)
++	for i in 0 ..< big {
++		append(&base, ..transmute([]u8)fmt.tprintf("line %d of the file\n", i))
++	}
++	when_s := clock_wall(&n.clock) / 1_000_000_000
++	files := [?]Git_File{{name = "a.txt", data = base[:]}}
++	git_checkout_create(vfs, root, files[:], when_s, node_clock(&n.clock), rng_random(&w.rng))
++	node_mount(w, n, oi, root)
++	append(&m.mounts, M_Mount{node = n.idx, oi = oi, root = strings.clone(root, w.allocator)})
++	run_until(w, w.now + 2_000_000_000, true)
++	sm: ^Sim_Mount
++	for &x in n.mounts {
++		if x.root == root {
++			sm = &x
++		}
++	}
++	h := sm.m.history
++	before := journal.journal_durable_len(&h.journal)
++	disk0 := _ss_disk(n)
++	max_log := i64(0)
++	cur := make([dynamic]u8, w.allocator)
++	append(&cur, ..base[:])
++	for i in 0 ..< edits {
++		who := prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng))
++		{
++			context = instance_context(&n.inst)
++			s := fs.scope_open(n.reg, sm.m, prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng)), who)
++			fs.scope_read_base(s, "a.txt", cur[:])
++			fs.mount_observe_begin(sm.m, "a.txt", s)
++			_writer_set(w, n, strings.concatenate({root, "/a.txt"}), Writer_Info{scope = s, agent = true})
++			append(&cur, ..transmute([]u8)fmt.tprintf("edit %d added by the agent\n", i))
++			fd, _ := prim.open_file(vfs, strings.concatenate({root, "/a.txt"}), {.Write, .Create, .Truncate}, 0o644)
++			prim.write_at(vfs, fd, cur[:], 0)
++			prim.datasync(vfs, fd)
++			prim.close_file(vfs, fd)
++			fs.scope_close(n.reg, s)
++			_forget_scope(w, n, s)
++			node_after(n)
++		}
++		max_log = max(max_log, sm.m.log_len)
++		run_until(w, w.now + 20_000_000, true)
++	}
++	run_until(w, w.now + 4_000_000_000, true)
++	after := journal.journal_durable_len(&h.journal)
++	disk1 := _ss_disk(n)
++	fmt.eprintf("step_size: disk_delta=%d per_edit=%.1f edits=%d journal_bytes=%d per_edit=%.1f max_attrib_log=%d\n", disk1 - disk0, f64(disk1 - disk0) / f64(edits), edits, after - before, f64(after - before) / f64(edits), max_log)
++}
+diff --git a/tools/stepsize/main.odin b/tools/stepsize/main.odin
+new file mode 100644
+index 00000000..d410116a
+--- /dev/null
++++ b/tools/stepsize/main.odin
+@@ -0,0 +1,112 @@
++package stepsize
++
++import "core:fmt"
++import "core:os"
++import "core:strings"
++import "core:strconv"
++import "core:time"
++import eng "../../src/engine"
++import "../../src/fs"
++import "../../src/prim"
++
++write_file :: proc(path, data: string) {
++	fd, err := os.open(path, os.O_WRONLY | os.O_CREATE | os.O_TRUNC, os.Permissions_Read_Write_All)
++	if err != nil {
++		fmt.eprintln("open", path, err)
++		os.exit(1)
++	}
++	os.write_string(fd, data)
++	os.sync(fd)
++	os.close(fd)
++}
++
++file_size :: proc(path: string) -> i64 {
++	info, err := os.stat(path, context.temp_allocator)
++	if err != nil {
++		return 0
++	}
++	return info.size
++}
++
++dir_bytes :: proc(path: string) -> (total: i64) {
++	fd, err := os.open(path)
++	if err != nil {
++		return
++	}
++	defer os.close(fd)
++	infos, rerr := os.read_dir(fd, -1, context.temp_allocator)
++	if rerr != nil {
++		return
++	}
++	for info in infos {
++		p := strings.concatenate({path, "/", info.name}, context.temp_allocator)
++		if info.type == .Directory {
++			total += dir_bytes(p)
++		} else {
++			total += info.size
++		}
++	}
++	return
++}
++
++pump :: proc(e: ^eng.Engine, ms: int) {
++	end := time.time_to_unix_nano(time.now()) + i64(ms) * 1_000_000
++	for time.time_to_unix_nano(time.now()) < end {
++		eng.step(e, false)
++		time.sleep(2 * time.Millisecond)
++	}
++}
++
++main :: proc() {
++	edits := 1000
++	if len(os.args) > 3 {
++		edits, _ = strconv.parse_int(os.args[3])
++	}
++	dir := os.args[1]
++	repo := os.args[2]
++	e: eng.Engine
++	if err := eng.open(&e, eng.default_config(dir)); err != .None {
++		fmt.eprintln("open", err)
++		os.exit(1)
++	}
++	space, _ := eng.space_create(&e, "size")
++	eng.space_open(&e, space)
++	tree, terr := eng.tree_create(&e, space, "work")
++	fmt.eprintln("tree", terr)
++	reg, rerr := eng.registry(&e)
++	fmt.eprintln("registry", rerr)
++	write_file(strings.concatenate({repo, "/a.txt"}), "line 0\nline 1\n")
++	m, merr := eng.tree_mount(&e, tree, repo, fs.DEFAULT_MOUNT)
++	fmt.eprintln("mount", merr)
++	pump(&e, 1500)
++	before := dir_bytes(dir)
++	cur := strings.builder_make()
++	strings.write_string(&cur, "line 0\nline 1\n")
++	maxlog := i64(0)
++	t0 := time.now()
++	for i in 0 ..< edits {
++		who: prim.Id
++		prim.random_fill(reg.random, who[:])
++		sid: prim.Id
++		prim.random_fill(reg.random, sid[:])
++		s := fs.scope_open(reg, m, sid, who)
++		text := strings.to_string(cur)
++		fs.scope_read_base(s, "a.txt", transmute([]u8)text)
++		fs.mount_observe_begin(m, "a.txt", s)
++		strings.write_string(&cur, fmt.tprintf("edit %d added by the agent\n", i))
++		write_file(strings.concatenate({repo, "/a.txt"}, context.temp_allocator), strings.to_string(cur))
++		fs.scope_close(reg, s)
++		pump(&e, 3)
++		maxlog = max(maxlog, m.log_len)
++		free_all(context.temp_allocator)
++	}
++	pump(&e, 2500)
++	fs.mount_sync(m)
++	pump(&e, 1500)
++	if len(os.args) > 4 {
++		extra, _ := strconv.parse_int(os.args[4])
++		pump(&e, extra * 1000)
++	}
++	after := dir_bytes(dir)
++	fmt.eprintf("stepsize: edits=%d disk_delta=%d per_edit=%.1f max_attrib_log=%d elapsed=%v\n", edits, after - before, f64(after - before) / f64(edits), maxlog, time.since(t0))
++}

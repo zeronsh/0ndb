@@ -1,0 +1,14 @@
+base 2ad73bc711362fb5c18f70147473bf4528492873
+diff --git a/src/fs/ingest.odin b/src/fs/ingest.odin
+index 865c0ac0..421c4c30 100644
+--- a/src/fs/ingest.odin
++++ b/src/fs/ingest.odin
+@@ -2191,7 +2191,7 @@ line_follow :: proc(m: ^Mount, key: string, replayed: ^Replayed) -> Error {
+ 	if !found || len(v) == 0 {
+ 		sl := make([dynamic]crdt.Lv, context.temp_allocator)
+ 		rl := make([dynamic]crdt.Lv, context.temp_allocator)
+-		if crdt.graph_version_lvs(&h.g, m.synced[:], &sl) != .None || crdt.graph_version_lvs(&h.g, replayed.heads[:], &rl) != .None {
++		if crdt.graph_version_lvs(&h.g, m.synced[:], &sl) != .None || false {
+ 			return .Corrupt
+ 		}
+ 		both := make([dynamic]crdt.Lv, context.temp_allocator)

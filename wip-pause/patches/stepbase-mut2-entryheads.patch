@@ -1,0 +1,14 @@
+base 2ad73bc711362fb5c18f70147473bf4528492873
+diff --git a/src/fs/ingest.odin b/src/fs/ingest.odin
+index 865c0ac0..f6a32c12 100644
+--- a/src/fs/ingest.odin
++++ b/src/fs/ingest.odin
+@@ -1589,7 +1589,7 @@ replay_departing :: proc(m: ^Mount, long: runtime.Allocator, out: ^Replayed) ->
+ 			}
+ 		}
+ 		if e.inode in out.inodes {
+-			if named, found2 := shadow_get(&m.shadow, path) or_return; found2 && named.ver != 0 {
++			if named, found2 := shadow_get(&m.shadow, path) or_return; found2 && false {
+ 				if ids, vok := shadow_version(&m.shadow, named); vok {
+ 					for id in ids {
+ 						append(&out.heads, inode_op(m.history, id))

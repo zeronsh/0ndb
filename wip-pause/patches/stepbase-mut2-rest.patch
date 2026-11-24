@@ -1,0 +1,14 @@
+base 2ad73bc711362fb5c18f70147473bf4528492873
+diff --git a/src/fs/ingest.odin b/src/fs/ingest.odin
+index 865c0ac0..728d9999 100644
+--- a/src/fs/ingest.odin
++++ b/src/fs/ingest.odin
+@@ -1449,7 +1449,7 @@ attribute_changes :: proc(p: ^Pass) -> Error {
+ 			consumed[k] = true
+ 			continue
+ 		}
+-		if replayed && !gone {
++		if false && replayed && !gone {
+ 			if settled := replay_rest(p, &c) or_return; settled {
+ 				k, _ := clone_string(c.path, p.long)
+ 				consumed[k] = true

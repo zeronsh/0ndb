@@ -1,0 +1,4 @@
+G=/home/user/gates/stepbase; t=$1
+head -5 $G/sr_${t}_build.log; python3 -I $G/summ.py $G/sr_$t.txt | grep -v "^named" | head -8; grep -a "named_version_crash:" $G/sr_$t.txt | grep -a "points=" | grep -a "early=true" | sed 's/named_version_crash: //;s/process=//;s/early=//;s/control=//;s/clean=//' | awk '{print $1,$2,$3,$4,$5,$6,$NF}' | paste -sd'|'
+grep -a "early=false" $G/sr_$t.txt | grep -a points= | grep -av "failed=0" | head; grep -a "named_version_edit: \|edit " $G/sr_$t.txt | grep -a points= | grep -av "failed=0\|text_wrong=0" | head -6
+grep -a "retarget_keep" $G/sr_$t.txt | grep -av "ERROR\|INFO\|WARN" | head -3 | cut -c1-160; grep -a "named_version_crash: " $G/sr_$t.txt | grep -av points= | sed -E 's/, at disk op [0-9]+//; s/process = [a-z]+, //; s/[0-9]+ times/N times/' | sort | uniq -c | sort -rn | head -10 | cut -c1-230
