@@ -110,6 +110,7 @@ remote_event :: proc(w: ^World, ev: ^Sim_Event) {
 	} else {
 		db: odb.Odb
 		if odb.open_store(&db, disk_vfs(&n.disk), req.git_dir, nil, req.format, context.temp_allocator, node_clock(&n.clock)) == .None {
+			db.sync_writes = true
 			for oid in req.oids {
 				if body, ok := w.remote.objects[oid]; ok {
 					if _, werr := odb.write(&db, .Blob, body); werr == .None {
