@@ -28,3 +28,5 @@ Each flow prints one JSON line, followed by a table, and the results land in `$F
 - `FLOWS_MOUNT_RUNS` (5)
 - `FLOWS_CLI_RUNS` (3)
 - `ONDB_BIN`
+
+Every flow except `cli` runs its daemon with fake provider keys and loopback base URLs. Before anything is sent, the harness reads the environment of the process serving the socket and refuses to run if it differs. Programs are started with a null stdin and `bash --norc`, because bash sources `~/.bashrc` under `-c` when its stdin is a socket, and a `~/.bashrc` can unset `ANTHROPIC_BASE_URL`.

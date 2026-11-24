@@ -8,7 +8,7 @@ BIN = os.environ.get("ONDB_BIN", os.path.join(REPO, "bin", "0ndb"))
 OUT = os.environ.get("FLOWS_OUT", os.path.join(tempfile.gettempdir(), "flows"))
 RUNS = int(os.environ.get("FLOWS_RUNS", "30"))
 WINDOWS = os.name == "nt"
-LIMIT = [] if WINDOWS else ["bash", "-c", 'ulimit -v 4000000; exec "$@"', "x"]
+LIMIT = [] if WINDOWS else ["bash", "--norc", "--noprofile", "-c", 'ulimit -v 4000000; exec "$@"', "x"]
 INSTANT_MS = 50.0
 TAIL = 60
 PROCS = []
@@ -20,7 +20,7 @@ def now():
 
 def spawn(args, cwd, log, env):
     group = dict(creationflags=subprocess.CREATE_NEW_PROCESS_GROUP) if WINDOWS else dict(start_new_session=True)
-    p = subprocess.Popen(LIMIT + args, cwd=cwd, env=env, stdout=open(os.path.join(cwd, log), "w"), stderr=subprocess.STDOUT, **group)
+    p = subprocess.Popen(LIMIT + args, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=open(os.path.join(cwd, log), "w"), stderr=subprocess.STDOUT, **group)
     PROCS.append(p)
     return p
 
@@ -197,12 +197,73 @@ class Client:
             pass
 
 
+PROVIDER_ENV = ("ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "OPENAI_BASE_URL", "OPENAI_API_KEY", "CODEX_API_KEY")
+UNROUTABLE = "http://127.0.0.1:9"
+
+
+def serving_pid(sock, spawned):
+    if WINDOWS:
+        return spawned
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        s.connect(sock)
+        if sys.platform == "darwin":
+            return struct.unpack("i", s.getsockopt(0, 2, 4))[0]
+        return struct.unpack("3i", s.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))[0]
+    finally:
+        s.close()
+
+
+def process_env(pid):
+    if WINDOWS:
+        return windows_env(pid)
+    if sys.platform == "darwin":
+        out = subprocess.run(["ps", "-E", "-ww", "-o", "command=", "-p", str(pid)], capture_output=True, text=True).stdout
+        return dict(w.split("=", 1) for w in out.split() if "=" in w and w.split("=", 1)[0] in PROVIDER_ENV)
+    raw = open("/proc/%d/environ" % pid, "rb").read().decode("utf-8", "replace")
+    return dict(x.split("=", 1) for x in raw.split("\0") if "=" in x)
+
+
+def windows_env(pid):
+    import ctypes
+    from ctypes import wintypes as w
+    k, nt = ctypes.WinDLL("kernel32", use_last_error=True), ctypes.WinDLL("ntdll")
+    k.OpenProcess.restype = w.HANDLE
+    k.ReadProcessMemory.argtypes = [w.HANDLE, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p]
+    nt.NtQueryInformationProcess.argtypes = [w.HANDLE, ctypes.c_int, ctypes.c_void_p, ctypes.c_ulong, ctypes.c_void_p]
+    h = k.OpenProcess(0x0410, False, pid)
+    if not h:
+        raise RuntimeError("cannot open daemon %d" % pid)
+
+    def read(addr, n):
+        buf = ctypes.create_string_buffer(n)
+        if not k.ReadProcessMemory(h, addr, buf, n, None):
+            raise RuntimeError("cannot read the environment of daemon %d" % pid)
+        return buf.raw
+
+    try:
+        info = (ctypes.c_void_p * 6)()
+        if nt.NtQueryInformationProcess(h, 0, info, ctypes.sizeof(info), None):
+            raise RuntimeError("cannot query daemon %d" % pid)
+        params = struct.unpack("Q", read(info[1] + 0x20, 8))[0]
+        env = struct.unpack("Q", read(params + 0x80, 8))[0]
+        size = struct.unpack("Q", read(params + 0x3F0, 8))[0]
+        text = read(env, size).decode("utf-16-le", "replace")
+        return dict(x.split("=", 1) for x in text.split("\0") if "=" in x[1:])
+    finally:
+        k.CloseHandle(h)
+
+
 class Daemon:
-    def __init__(self, d, env_extra=None):
+    def __init__(self, d, env_extra=None, local=True):
         self.dir = d
         base = tempfile.gettempdir()
         self.rt = tempfile.mkdtemp(prefix="0f", dir=base if len(base) < 40 else "/tmp")
         self.env = dict(os.environ, ONDB_HOME=os.path.join(d, "home"), ONDB_RUNTIME_DIR=self.rt)
+        if local:
+            for k in PROVIDER_ENV:
+                self.env.pop(k, None)
+            self.env.update(ANTHROPIC_BASE_URL=UNROUTABLE, OPENAI_BASE_URL=UNROUTABLE, ANTHROPIC_API_KEY="x", OPENAI_API_KEY="x")
         self.env.update(env_extra or {})
         self.proc = spawn([BIN, "daemon"], d, "daemon.log", self.env)
         self.sock = os.path.join(self.rt, "daemon.sock")
@@ -211,9 +272,26 @@ class Daemon:
                 break
             time.sleep(0.025)
         self.space = None
+        want = {k: v for k, v in self.env.items() if k in PROVIDER_ENV} if local else {}
+        try:
+            self.check_env(want)
+        except BaseException:
+            self.stop()
+            raise
+
+    def check_env(self, want):
+        if not want:
+            return
+        pid = serving_pid(self.sock, self.proc.pid)
+        have = process_env(pid)
+        for k in PROVIDER_ENV:
+            if have.get(k) != want.get(k):
+                raise RuntimeError("refusing to run: daemon %d has %s=%r, expected %r" % (pid, k, have.get(k), want.get(k)))
+            if k.endswith("_BASE_URL") and not (have.get(k) or "").startswith("http://127.0.0.1:"):
+                raise RuntimeError("refusing to run: daemon %d has a %s that is not local" % (pid, k))
 
     def cli(self, *args, timeout=120):
-        p = subprocess.run(LIMIT + [BIN] + list(args) + ["--json"], cwd=self.dir, env=self.env, capture_output=True, text=True, timeout=timeout)
+        p = subprocess.run(LIMIT + [BIN] + list(args) + ["--json"], cwd=self.dir, env=self.env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout)
         if p.returncode != 0:
             raise RuntimeError("0ndb %s -> %d %s%s" % (" ".join(args), p.returncode, p.stdout, p.stderr))
         return json.loads(p.stdout or "{}")
@@ -368,7 +446,7 @@ def f_cli_first_token():
     d = flow_dir("cli_first_token")
     runs = int(os.environ.get("FLOWS_CLI_RUNS", "3"))
     picks = dict(claude="haiku")
-    dm = Daemon(d)
+    dm = Daemon(d, local=False)
     out = []
     try:
         listed = dm.cli("models").get("providers", [])
