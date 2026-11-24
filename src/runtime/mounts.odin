@@ -792,21 +792,8 @@ worktree_claim_named :: proc(ws: ^Worktree, run: ^Run, call: ^observe.Tool_Call,
 		return
 	}
 	for s in ws.tools[idx].scopes {
-		if s == nil || s.mount == nil {
-			continue
-		}
-		m := s.mount
-		for rel in fs.mount_pending_since(m, run.line_prev) {
-			abs := concat(m.root, "/", rel)
-			named := observe.names_path(call, abs)
-			if !named {
-				if real, _, _, ok := observe.real_path(abs, context.temp_allocator); ok {
-					named = observe.names_path(call, real)
-				}
-			}
-			if named {
-				fs.mount_claim(m, rel, s, run.line_prev)
-			}
+		if s != nil && s.mount != nil {
+			observe.claim_named(s.mount, call, s, run.line_prev)
 		}
 	}
 }

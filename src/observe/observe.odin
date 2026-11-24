@@ -167,6 +167,21 @@ _router_add :: proc(r: ^Router, m: ^fs.Mount) {
 	append(&r.roots, Root{mount = m, root = root, real = real, dev = dev, ino = ino})
 }
 
+claim_named :: proc(m: ^fs.Mount, call: ^Tool_Call, scope: ^fs.Scope, since: fs.Observe_Since) {
+	for rel in fs.mount_pending_since(m, since) {
+		abs := strings.concatenate({fs.mount_root(m), "/", rel}, context.temp_allocator)
+		named := names_path(call, abs)
+		if !named {
+			if real, _, _, ok := real_path(abs, context.temp_allocator); ok {
+				named = names_path(call, real)
+			}
+		}
+		if named {
+			fs.mount_claim(m, rel, scope, since)
+		}
+	}
+}
+
 real_path :: proc(path: string, allocator := context.allocator) -> (real: string, dev: u64, ino: u64, ok: bool) {
 	res, err := prim.real_path(path, allocator)
 	if err != .None {
