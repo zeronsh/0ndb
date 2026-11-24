@@ -85,7 +85,12 @@ kv_open :: proc(kv: ^Kv, vfs: prim.Vfs, dir: string, name: string, allocator := 
 		kv_close(kv)
 		return err
 	}
-	kv.gen = kv_read_gen(kv)
+	gen, gerr := kv_read_gen(kv)
+	if gerr != .None {
+		kv_close(kv)
+		return gerr
+	}
+	kv.gen = gen
 	if err := kv_attach(kv); err != .None {
 		kv_close(kv)
 		return err
@@ -731,20 +736,26 @@ kv_path :: proc(kv: ^Kv, gen: u64, ext: string, allocator: runtime.Allocator) ->
 }
 
 @(private = "file")
-kv_read_gen :: proc(kv: ^Kv) -> u64 {
+kv_read_gen :: proc(kv: ^Kv) -> (gen: u64, err: Error) {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	p := kv_path(kv, 0, "gen", context.temp_allocator)
-	fd, err := prim.open_file(kv.vfs, p)
-	if err != .None {
-		return 0
+	fd, oerr := prim.open_file(kv.vfs, p)
+	if oerr == .Not_Found {
+		return 0, .None
+	}
+	if oerr != .None {
+		return 0, from_prim(oerr)
 	}
 	defer prim.close_file(kv.vfs, fd)
 	b: [16]u8
-	n, _ := prim.read_at(kv.vfs, fd, b[:], 0)
-	if n != 16 || u32(xxhash.XXH3_64_default(b[0:8])) != prim.get_u32le(b[8:12]) {
-		return 0
+	n, rerr := prim.read_at(kv.vfs, fd, b[:], 0)
+	if rerr != .None {
+		return 0, from_prim(rerr)
 	}
-	return prim.get_u64le(b[0:8])
+	if n != 16 || u32(xxhash.XXH3_64_default(b[0:8])) != prim.get_u32le(b[8:12]) {
+		return 0, .None
+	}
+	return prim.get_u64le(b[0:8]), .None
 }
 
 @(private = "file")
