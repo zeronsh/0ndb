@@ -582,6 +582,9 @@ kv_find :: proc(kv: ^Kv, key: []u8) -> (index: u64, off: u64, found: bool, err: 
 		}
 		if sh == h {
 			r, rerr := kv_read(kv, so, &kv.probe)
+			if rerr != .None && rerr != .Corrupt {
+				return 0, 0, false, rerr
+			}
 			if rerr == .None && string(r.key) == string(key) {
 				return i, so, true, .None
 			}
