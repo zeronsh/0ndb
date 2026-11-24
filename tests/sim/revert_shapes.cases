@@ -34,6 +34,10 @@ dir_to_file     | d/=  d/f.txt=x          | rmtree d; write d dfile             
 dir_to_link     | k.txt=y d/=  d/f.txt=x  | rmtree d; ln_s k.txt d                            | directory replaced by a symlink to a file
 dir_to_dir_link | k/=  k/g.txt=y d/=  d/f.txt=x | rmtree d; ln_s k d                          | directory replaced by a symlink to a directory
 link_to_dir     | k.txt=y d->k.txt        | rm d; mkdir d; write d/f.txt z                    | symlink replaced by a directory
+symlink_rename  | a.txt=x l->a.txt        | mv l m
+file_to_link    | a.txt=x b.txt=y         | rm b.txt; ln_s a.txt b.txt
+link_to_file    | a.txt=x l->a.txt        | rm l; write l z
+link_moved_in   | a.txt=x l->a.txt        | mkdir d; mv l d/l
 rename          | a.txt=x                 | mv a.txt b.txt
 case_rename     | a.txt=x                 | mv a.txt A.txt                                    | case-only
 binary          | a.txt=x                 | write_bin b.bin 4096                              | bytes 0..255 incl. NUL
@@ -47,7 +51,7 @@ exec_clear      | s.sh=echo+x             | chmod_nx s.sh
 exec_new        | a.txt=x                 | write s.sh echo; chmod_x s.sh
 symlink_new     | a.txt=x                 | ln_s a.txt l
 symlink_retarget| a.txt=x b.txt=y l->a.txt| rm l; ln_s b.txt l
-symlink_delete  | a.txt=x l->a.txt        | rm l | known:crash
+symlink_delete  | a.txt=x l->a.txt        | rm l
 symlink_dangling| a.txt=x                 | ln_s missing.txt l
 person_between  | a.txt=x                 | write b.txt agent; person c.txt person; write b.txt agent2 | undo keeps c.txt
 person_same     | a.txt=x                 | write a.txt agent; person a.txt person-after      | undo:a.txt=person-after offer:a.txt known:revert

@@ -1147,7 +1147,7 @@ adopt_one :: proc(p: ^Pass, snap: ^fstree.Snapshot, ll: []crdt.Lv, line: Version
 		return false, .Corrupt
 	}
 	if c.kind == .Remove {
-		if (c.old.kind != .File && c.old.kind != .Dir) || (at_line && ino == c.old.inode) {
+		if at_line && ino == c.old.inode {
 			return false, .None
 		}
 		if c.old.kind == .Dir {
@@ -1181,11 +1181,37 @@ adopt_one :: proc(p: ^Pass, snap: ^fstree.Snapshot, ll: []crdt.Lv, line: Version
 		shadow_put(&m.shadow, c.path, Entry{inode = ino, kind = .Dir, ver = ver^}) or_return
 		return true, .None
 	}
-	if c.disk != .File || !at_line || (c.kind == .Modify && (c.old.kind != .File || c.old.inode != ino)) {
+	if !at_line || (c.kind == .Modify && c.old.inode != ino) {
 		return false, .None
 	}
 	info, ok, ierr := fstree.info(snap, ino, context.temp_allocator)
-	if ierr != nil || !ok || !info.present || info.kind != .File || m.db == nil {
+	if ierr != nil || !ok || !info.present || m.db == nil {
+		return false, .None
+	}
+	if info.kind == .Symlink {
+		target := c.target
+		if c.disk == .File && !mount_symlinks(m) {
+			abuf: prim.Path_Buf
+			t, tok := read_link_file(m, abs_path(m, c.path, abuf[:]), c.stat) or_return
+			if !tok {
+				return false, .None
+			}
+			target = t
+		} else if c.disk != .Symlink {
+			return false, .None
+		}
+		if target != info.target || (c.kind == .Modify && c.old.kind != .Symlink) {
+			return false, .None
+		}
+		oid, _ := odb.hash(m.db.format, .Blob, transmute([]u8)target)
+		if c.kind == .Modify && c.old.oid == oid {
+			return false, .None
+		}
+		adopt_version(p, line, ver) or_return
+		shadow_put(&m.shadow, c.path, Entry{inode = ino, kind = .Symlink, stat = c.stat, oid = oid, ver = ver^}) or_return
+		return true, .None
+	}
+	if info.kind != .File || c.disk != .File || (c.kind == .Modify && c.old.kind != .File) {
 		return false, .None
 	}
 	_, disk_oid, _, rok := read_content(m, c.path, c.stat, ino, true) or_return
