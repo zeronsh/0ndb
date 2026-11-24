@@ -5,7 +5,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
 WINDOWS = os.name == "nt"
-LIMIT = [] if WINDOWS else ["bash", "-c", 'ulimit -v 4000000; exec "$@"', "x"]
+VMEM = os.environ.get("SOAK_VMEM", "4000000")
+LIMIT = [] if WINDOWS else ["bash", "-c", 'ulimit -v %s 2>/dev/null; exec "$@"' % VMEM, "x"]
 MODEL = "claude-opus-5-5"
 AGENT_PATHS = 24
 PERSON_PATHS = 12
@@ -290,7 +291,8 @@ class Soak:
         self.person = {}
         self.base = {}
         self.undos = []
-        self.lastline = ""
+        self.left_newest = 0
+        self.desync = False
         self.log = open(os.path.join(self.dir, "steps.jsonl"), "w")
 
     def note(self, **kv):
@@ -373,6 +375,7 @@ class Soak:
             diffs.append("verify still reports %s" % json.dumps(bad)[:300])
         if diffs:
             self.fail("bytes", "after %s: %d differences: %s" % (what, len(diffs), "; ".join(diffs[:6])))
+            self.desync = True
             return False
         return True
 
@@ -382,9 +385,37 @@ class Soak:
                 f["count"] += 1
                 self.note(finding=kind, cls=cls, msg=msg)
                 return
+        if self.args.probe and kind == "error":
+            self.probe()
         self.findings.append(dict(kind=kind, step=self.steps, t=round(time.time() - self.t0, 1), msg=msg, cls=cls, count=1))
         self.note(finding=kind, msg=msg)
         print("FINDING step %d %s: %s" % (self.steps, kind, msg), flush=True)
+
+    def probe(self):
+        pid = self.dm.proc.pid
+        out = dict(proc=sample_proc(pid))
+        for op in ("convo.status", "tree.mounts"):
+            c = None
+            try:
+                c = Client(self.dm.sock)
+                out[op] = json.dumps(c.call(op, object=self.obj if op == "convo.status" else self.tree, timeout_ms=5000))[:300]
+            except Exception as e:
+                out[op] = str(e)[:200]
+            finally:
+                if c:
+                    c.close()
+        try:
+            out["status"] = [l.strip() for l in open("/proc/%d/status" % pid) if l.split(":")[0] in ("State", "VmSize", "VmPeak", "VmRSS", "Threads")]
+            out["fd_kinds"] = {}
+            for f in os.listdir("/proc/%d/fd" % pid):
+                k = re.sub(r"[0-9a-f]{6,}|\d+", "N", os.path.basename(os.readlink("/proc/%d/fd/%s" % (pid, f))))
+                out["fd_kinds"][k] = out["fd_kinds"].get(k, 0) + 1
+            out["children"] = subprocess.run(["ps", "--ppid", str(pid), "-o", "pid,stat,etime,args"], capture_output=True, text=True).stdout.splitlines()[1:8]
+        except Exception as e:
+            out["err"] = str(e)
+        out["git"] = [subprocess.run(["git"] + a, cwd=self.root, capture_output=True, text=True).stdout.strip()[:300] for a in (["symbolic-ref", "HEAD"], ["status", "--short"])]
+        out["locks"] = [os.path.join(d, f) for d, _, fs in os.walk(os.path.join(self.root, ".git")) for f in fs if f.endswith(".lock")]
+        print("PROBE " + json.dumps(out), flush=True)
 
     def plan(self, tag):
         k = self.rng.randint(1, 3)
@@ -423,6 +454,12 @@ class Soak:
             self.nodes[parent].children.append(rid)
         return n
 
+    def parent_of(self, rid):
+        for m in self.c.call("convo.window", object=self.obj, anchor=rid, before=1, after=1).get("messages") or []:
+            if m.get("id") == rid:
+                return m.get("parent")
+        return "missing"
+
     def wait_position(self, what, want):
         t = now()
         st = {}
@@ -460,6 +497,10 @@ class Soak:
         user = r["item"]
         self.add(user, "user", parent, base)
         reply, _ = self.wait_reply(user, set())
+        real = self.parent_of(user)
+        if real != parent:
+            self.fail("parent", "%s: message %s has parent %s, the model expected %s" % (op, user, real, parent))
+            self.desync = True
         self.lat.setdefault(op + " to seal", []).append(now() - t)
         self.add(reply, "assistant", user, self.apply(base, writes))
         self.position = reply
@@ -515,15 +556,16 @@ class Soak:
         res = self.timed("switch", self.c.call, "switch", object=self.obj, sibling=s, timeout_ms=120000)
         st = self.c.call("convo.status", object=self.obj)
         got = st.get("position") or res.get("leaf")
-        if got != want:
-            if got in self.nodes:
-                self.fail("position", "switch to %s went to %s, the model expected its newest leaf %s" % (s, got, want))
-                self.position = got
-            else:
-                self.fail("position", "switch to %s went to %s, which the model does not know" % (s, got))
-                return
-        else:
-            self.position = want
+        if got not in self.nodes:
+            self.fail("position", "switch to %s went to %s, which the model does not know" % (s, got))
+            return
+        r = got
+        while r and r != s:
+            r = self.nodes[r].parent
+        if r != s:
+            self.fail("position", "switch to %s went to %s, outside that sibling's branch" % (s, got))
+        self.position = got
+        self.left_newest = self.left_newest + (1 if got != want else 0)
         self.check("switch to %s" % s)
 
     def undo(self):
@@ -584,13 +626,15 @@ class Soak:
     def git_step(self):
         if self.rng.random() < 0.5 and self.person:
             git(self.root, "add", "-A", "person")
-            git(self.root, "commit", "-q", "-m", "person at step %d" % self.steps)
+            if git(self.root, "diff", "--cached", "--name-only").strip():
+                git(self.root, "commit", "-q", "-m", "person at step %d" % self.steps)
             what = "git commit"
         else:
             b = "soak-%d" % self.steps
+            home = git(self.root, "symbolic-ref", "--short", "HEAD").strip()
             git(self.root, "checkout", "-q", "-b", b)
             self.timed("tree.sync", self.sync)
-            git(self.root, "checkout", "-q", "main")
+            git(self.root, "checkout", "-q", home)
             what = "git checkout -b %s and back" % b
         self.timed("tree.sync", self.sync)
         self.check(what)
@@ -648,12 +692,15 @@ class Soak:
 
     def run(self):
         self.t0 = time.time()
+        self.ran = 0
         self.setup()
         end = time.time() + self.args.minutes * 60
         next_sample = time.time() + 60
         next_restart = time.time() + self.args.restart * 60
         minute = 0
         steps = [(self.turn, 30), (self.edit, 10), (self.regenerate, 10), (self.switch, 15), (self.undo, 8), (self.redo, 7), (self.person_edit, 13), (self.git_step, 7)]
+        skip = set(x for x in self.args.skip.split(",") if x)
+        steps = [(f, w) for f, w in steps if f.__name__ not in skip]
         total = sum(w for _, w in steps)
         while time.time() < end:
             self.steps += 1
@@ -669,7 +716,7 @@ class Soak:
                 self.fail("error", "%s: %s" % (fn.__name__, e))
                 if len([f for f in self.findings if f["kind"] == "error"]) > 5:
                     break
-            if len(self.findings) > 20 or (self.findings and self.args.stop):
+            if self.desync or len(self.findings) > 20 or (self.findings and self.args.stop):
                 break
             if time.time() >= next_restart:
                 self.steps += 1
@@ -684,6 +731,7 @@ class Soak:
                 minute += 1
                 self.sample(minute)
                 next_sample = time.time() + 60
+        self.ran = time.time() - self.t0
         self.growth()
 
     def close(self):
@@ -707,6 +755,8 @@ def main():
     ap.add_argument("--restart", type=float, default=10, help="minutes between daemon restarts")
     ap.add_argument("--dir", default="")
     ap.add_argument("--bin", default=os.environ.get("ONDB_BIN", os.path.join(REPO, "bin", "0ndb.exe" if WINDOWS else "0ndb")))
+    ap.add_argument("--probe", action="store_true", help="print the daemon's state at each error")
+    ap.add_argument("--skip", default="", help="steps to leave out, for example redo")
     ap.add_argument("--stop", action="store_true", help="stop at the first finding")
     ap.add_argument("--keep", action="store_true")
     args = ap.parse_args()
@@ -719,13 +769,14 @@ def main():
         s.close()
     summary = dict(host=platform.node(), platform=sys.platform, minutes=args.minutes, seed=args.seed, steps=s.steps, nodes=len(s.nodes), findings=s.findings, dir=s.dir)
     json.dump(dict(summary=summary, minutes=s.minute), open(os.path.join(s.dir, "soak.json"), "w"), indent=1)
-    print("soak %s seed %d: %d steps over %.0f min, %d messages, %d findings" % (sys.platform, args.seed, s.steps, args.minutes, len(s.nodes), len(s.findings)))
+    short = s.ran < args.minutes * 60 - 5
+    print("soak %s seed %d%s: %d steps in %.1f of %.0f min, %d messages, %d findings, %d switches returned to an older leaf" % (sys.platform, args.seed, " without " + args.skip if args.skip else "", s.steps, s.ran / 60, args.minutes, len(s.nodes), len(s.findings), s.left_newest))
     for f in s.findings:
         print("  %s at step %d (%.0f s)%s: %s" % (f["kind"], f["step"], f["t"], " x%d" % f["count"] if f["count"] > 1 else "", f["msg"]))
-    print("result: %s (log %s)" % ("PASS" if not s.findings else "FAIL", os.path.join(s.dir, "steps.jsonl")))
-    if not args.keep and not s.findings:
+    print("result: %s%s (log %s)" % ("PASS" if not s.findings and not short else "FAIL", " INCOMPLETE" if short else "", os.path.join(s.dir, "steps.jsonl")))
+    if not args.keep and not s.findings and not short:
         shutil.rmtree(s.dir, ignore_errors=True)
-    sys.exit(0 if not s.findings else 1)
+    sys.exit(0 if not s.findings and not short else 1)
 
 
 if __name__ == "__main__":
