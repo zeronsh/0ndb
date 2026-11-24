@@ -315,6 +315,55 @@ convo_regenerate :: proc(e: ^Engine, o: Object, msg: Rid) -> (move: prim.Id, err
 	return move, _cu_drive_new(e, o, move)
 }
 
+Kept_Lines :: struct {
+	tree:  prim.Id,
+	path:  string,
+	lines: int,
+}
+
+convo_kept :: proc(e: ^Engine, o: Object, move: prim.Id, allocator := context.allocator) -> (out: []Kept_Lines, err: Error) {
+	context = context_for(e)
+	u, uerr := _cu_undone_of(e, o, move)
+	if uerr != .None {
+		return nil, .None if uerr == .Not_Found else uerr
+	}
+	list := make([dynamic]Kept_Lines, allocator)
+	for r in u.reverts {
+		seen := false
+		for k in list {
+			seen ||= k.tree == r.tree
+		}
+		if seen {
+			continue
+		}
+		cs := tree_conflicts(e, Object{o.space, r.tree}, context.temp_allocator) or_return
+		for c in cs {
+			if c.kind != .Revert {
+				continue
+			}
+			mine := false
+			for x in u.reverts {
+				mine ||= x.tree == r.tree && x.revert == c.raw.revert
+			}
+			if !mine {
+				continue
+			}
+			at := -1
+			for k, i in list {
+				if k.tree == r.tree && k.path == c.path {
+					at = i
+				}
+			}
+			if at < 0 {
+				append(&list, Kept_Lines{tree = r.tree, path = strings.clone(c.path, allocator)})
+				at = len(list) - 1
+			}
+			list[at].lines += 1
+		}
+	}
+	return list[:], .None
+}
+
 Left_Branch :: struct {
 	move:    prim.Id,
 	cause:   convo.Move_Cause,

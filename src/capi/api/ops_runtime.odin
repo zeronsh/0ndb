@@ -40,10 +40,10 @@ RUNTIME_OPS := []Op {
 	{171, "line.hold", {{"tree", .Object, nil}, {"line", .Str, nil}, {"reason", .Enum, HOLD_REASON_NAMES[:]}, {"wait", .Bool, nil}}, "held:uvarint sealed:bool", op_line_hold},
 	{172, "line.resume", {{"tree", .Object, nil}, {"line", .Str, nil}}, "resumed:uvarint", op_line_resume},
 	{173, "line.switch", {{"tree", .Object, nil}, {"line", .Str, nil}, {"root", .Str, nil}}, "line:str held:uvarint", op_line_switch},
-	{174, "undo", {OBJ, MSG}, "undo:id done:bool", op_undo},
-	{175, "redo", {OBJ, {"undo", .Id, nil}}, "undo:id done:bool", op_redo},
+	{174, "undo", {OBJ, MSG}, "undo:id done:bool kept:[Kept]", op_undo},
+	{175, "redo", {OBJ, {"undo", .Id, nil}}, "undo:id done:bool kept:[Kept]", op_redo},
 	{176, "undo.resume", {OBJ}, "resumed:uvarint", op_undo_resume},
-	{177, "regenerate", {OBJ, MSG}, "undo:id done:bool", op_regenerate},
+	{177, "regenerate", {OBJ, MSG}, "undo:id done:bool kept:[Kept]", op_regenerate},
 	{179, "convo.turn_diff", {OBJ, MSG, {"patch", .Bool, nil}, {"blame", .Bool, nil}, {"max_chars", .U64, nil}}, "Turn", op_convo_turn_diff},
 	{180, "convo.history", {OBJ, {"from", .Rid, nil}, {"from_seal", .Rid, nil}, {"from_known", .Bool, nil}, {"limit", .U64, nil}, {"max_files", .U64, nil}}, "turns:[Turn] next:rid next_seal:rid next_known:bool more:bool", op_convo_history},
 	{143, "subscribe.fork_diff", {OBJ, {"caller", .Object, nil}, {"diff", .Bool, nil}, {"max_chars", .U64, nil}}, "changes:[Change] diff:str", nil},
@@ -764,6 +764,23 @@ op_wake :: proc(c: ^Call, o: ^Out) -> Status {
 	return .Ok
 }
 
+@(private)
+_o_kept :: proc(c: ^Call, o: ^Out, ob: Object, move: prim.Id, done: bool) {
+	list: []eng.Kept_Lines
+	if done {
+		list, _ = eng.convo_kept(c.api.e, ob, move, context.temp_allocator)
+	}
+	o_arr(o, "kept", len(list))
+	for k in list {
+		o_obj(o, "")
+		o_id(o, "tree", k.tree)
+		o_str(o, "path", k.path)
+		o_u64(o, "lines", u64(k.lines))
+		o_end(o)
+	}
+	o_end(o)
+}
+
 op_undo :: proc(c: ^Call, o: ^Out) -> Status {
 	r := _rt(c)
 	if r == nil {
@@ -776,6 +793,7 @@ op_undo :: proc(c: ^Call, o: ^Out) -> Status {
 	}
 	o_id(o, "undo", id)
 	o_bool(o, "done", err == .None)
+	_o_kept(c, o, a_object(c, "object"), id, err == .None)
 	return .Ok
 }
 
@@ -791,6 +809,7 @@ op_redo :: proc(c: ^Call, o: ^Out) -> Status {
 	}
 	o_id(o, "undo", id)
 	o_bool(o, "done", err == .None)
+	_o_kept(c, o, a_object(c, "object"), id, err == .None)
 	return .Ok
 }
 
@@ -805,6 +824,7 @@ op_regenerate :: proc(c: ^Call, o: ^Out) -> Status {
 	}
 	o_id(o, "undo", id)
 	o_bool(o, "done", err == .None)
+	_o_kept(c, o, a_object(c, "object"), id, err == .None)
 	return .Ok
 }
 

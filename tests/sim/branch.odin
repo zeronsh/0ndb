@@ -1216,26 +1216,27 @@ Bk_Case :: struct {
 	turn:    string,
 	person:  string,
 	want:    string,
+	kept:    int,
 }
 
 @(private = "file")
 _bk_cases := [?]Bk_Case {
-	{"same line", "k.txt", "x\n", "agent\n", "person\n", "person\n"},
-	{"same line among others", "k.txt", "1\n2\n3\n", "1\nA\n3\n", "1\nP\n3\n", "1\nP\n3\n"},
-	{"adjacent line", "k.txt", "1\n2\n3\n", "A\n2\n3\n", "A\nP\n3\n", "1\nP\n3\n"},
-	{"adjacent line above", "k.txt", "1\n2\n3\n", "1\nA\n3\n", "P\nA\n3\n", "P\n2\n3\n"},
-	{"far line", "k.txt", "1\n2\n3\n4\n5\n", "A\n2\n3\n4\n5\n", "A\n2\n3\n4\nP\n", "1\n2\n3\n4\nP\n"},
-	{"one of two lines", "k.txt", "1\n2\n3\n", "A\nB\n3\n", "A\nP\n3\n", "1\nP\n3\n"},
-	{"inside the line", "k.txt", "x\n", "agent\n", "agent bar\n", "agent bar\n"},
-	{"deletes the turn's line", "k.txt", "1\n2\n3\n", "1\nA\n3\n", "1\n3\n", "1\n3\n"},
-	{"deletes another line", "k.txt", "1\n2\n3\n", "A\n2\n3\n", "A\n3\n", "1\n3\n"},
-	{"inserts a line", "k.txt", "1\n2\n", "1\nA\n2\n", "1\nA\nP\n2\n", "1\nP\n2\n"},
-	{"the turn deleted a line", "k.txt", "1\n2\n3\n", "1\n3\n", "1\n3\nP\n", "1\n2\n3\nP\n"},
-	{"more lines than base", "k.txt", "x\n", "a\nb\nc\n", "a\nP\nc\n", "x\nP\n"},
-	{"created, edited", "n.txt", "", "a\nb\nc\n", "a\nP\nc\n", "P\n"},
-	{"created, a line deleted", "n.txt", "", "a\nb\nc\n", "a\nc\n", ""},
-	{"created, untouched", "n.txt", "", "a\nb\n", "", ""},
-	{"no newline at the end", "k.txt", "a\nb", "a\nb\nc", "a\nb\nP", "a\nb\nP"},
+	{"same line", "k.txt", "x\n", "agent\n", "person\n", "person\n", 1},
+	{"same line among others", "k.txt", "1\n2\n3\n", "1\nA\n3\n", "1\nP\n3\n", "1\nP\n3\n", 1},
+	{"adjacent line", "k.txt", "1\n2\n3\n", "A\n2\n3\n", "A\nP\n3\n", "1\nP\n3\n", 0},
+	{"adjacent line above", "k.txt", "1\n2\n3\n", "1\nA\n3\n", "P\nA\n3\n", "P\n2\n3\n", 0},
+	{"far line", "k.txt", "1\n2\n3\n4\n5\n", "A\n2\n3\n4\n5\n", "A\n2\n3\n4\nP\n", "1\n2\n3\n4\nP\n", 0},
+	{"one of two lines", "k.txt", "1\n2\n3\n", "A\nB\n3\n", "A\nP\n3\n", "1\nP\n3\n", 1},
+	{"inside the line", "k.txt", "x\n", "agent\n", "agent bar\n", "agent bar\n", 1},
+	{"deletes the turn's line", "k.txt", "1\n2\n3\n", "1\nA\n3\n", "1\n3\n", "1\n3\n", 1},
+	{"deletes another line", "k.txt", "1\n2\n3\n", "A\n2\n3\n", "A\n3\n", "1\n3\n", 0},
+	{"inserts a line", "k.txt", "1\n2\n", "1\nA\n2\n", "1\nA\nP\n2\n", "1\nP\n2\n", 0},
+	{"the turn deleted a line", "k.txt", "1\n2\n3\n", "1\n3\n", "1\n3\nP\n", "1\n2\n3\nP\n", 0},
+	{"more lines than base", "k.txt", "x\n", "a\nb\nc\n", "a\nP\nc\n", "x\nP\n", 1},
+	{"created, edited", "n.txt", "", "a\nb\nc\n", "a\nP\nc\n", "P\n", 1},
+	{"created, a line deleted", "n.txt", "", "a\nb\nc\n", "a\nc\n", "", 0},
+	{"created, untouched", "n.txt", "", "a\nb\n", "", "", 0},
+	{"no newline at the end", "k.txt", "a\nb", "a\nb\nc", "a\nb\nP", "a\nb\nP", 1},
 }
 
 @(private = "file")
@@ -1327,6 +1328,24 @@ _bk_run :: proc(w: ^World, arena: ^virtual.Arena, k: Bk_Case, api, between: bool
 		}
 		run_until(w, w.now + 5_000_000_000, true)
 		check(c, k, api, fmt.aprintf("undo %d", round, allocator = alloc), want, {})
+		if round == 0 {
+			lines := 0
+			kerr: eng.Error
+			list: []eng.Kept_Lines
+			k0: {
+				context = instance_context(&n.inst)
+				list, kerr = eng.convo_kept(&n.e, c.conv, undo, alloc)
+				node_after(n)
+			}
+			for x in list {
+				if x.path == k.path {
+					lines += x.lines
+				}
+			}
+			if kerr != .None || lines != k.kept {
+				world_fail(w, "branch kept, %s (%s): the undo reports %d kept lines (%v), not %d", k.name, "api" if api else "disk", lines, kerr, k.kept)
+			}
+		}
 		if between && len(want) > 0 && strings.has_suffix(want, "\n") {
 			z := fmt.aprintf("Z%d\n", round, allocator = alloc)
 			want = strings.concatenate({want, z}, alloc)
