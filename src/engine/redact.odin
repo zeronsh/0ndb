@@ -131,20 +131,6 @@ _map_redact :: proc(e: ^Engine, o: Object, key: []u8) -> Error {
 }
 
 @(private)
-_derived_purge :: proc(e: ^Engine, h: ^Handle) {
-	#partial switch h.kind {
-	case .Map:
-		if _map_table(e, h) == .None && omap.table_reset(&h.table) != .None {
-			omap.table_close(&h.table)
-			h.table_open = false
-		}
-		_index_reindex(e, h)
-	case .Conversation:
-		_index_reindex(e, h)
-	}
-}
-
-@(private)
 _relay_zeroed :: proc(e: ^Engine, sp: ^Space, id: prim.Id, kind: Kind, device: prim.Id, from, to: i64) {
 	if kind != .Map && kind != .Conversation {
 		return
@@ -422,27 +408,6 @@ _sealed_in :: proc(e: ^Engine, h: ^Handle, device: prim.Id, from, to: i64) -> []
 	}
 	omap.db_scan(&e.reg.db, ROOT_CKPT, start[:], pfx[:], &sc, visit)
 	return out[:]
-}
-
-@(private)
-_index_reindex :: proc(e: ^Engine, h: ^Handle) {
-	if !e.cfg.search {
-		return
-	}
-	if _index_open(e) != .None {
-		return
-	}
-	search.delete_content(&e.index, _source_id(h.id, e.self), 0, h.id)
-	for s in h.segs {
-		search.advance(&e.index, _source_id(h.id, s.device), 0)
-	}
-	search.erase(&e.index)
-	_index_item_add(e, h.sp.id, h.id, h.kind)
-}
-
-@(private)
-_oerr2b :: proc(a: $A, err: obj.Error) -> Error {
-	return _oerr(err)
 }
 
 @(private)
@@ -1199,28 +1164,4 @@ _hist_admit_redacted :: proc(e: ^Engine, h: ^Handle, s: ^Seg, off: i64) -> fs.Er
 		return .Not_Found
 	}
 	return .None
-}
-
-@(private)
-_publish_later :: proc(e: ^Engine, d: ^Dirty_Seg) {
-	for &x in e.dirty {
-		if x.object == d.object {
-			x.keys ||= d.keys
-			x.length = max(x.length, d.length)
-			if len(x.path) == 0 && len(d.path) > 0 {
-				x.path = _clone(d.path, e.allocator) or_else ""
-			}
-			if x.tree == nil && d.tree != nil {
-				d.tree.refs += 1
-				x.tree = d.tree
-			}
-			_touch(e)
-			return
-		}
-	}
-	if d.tree != nil {
-		d.tree.refs += 1
-	}
-	append(&e.dirty, Dirty_Seg{space = d.space, object = d.object, kind = d.kind, scope = d.scope, name = _clone(d.name, e.allocator) or_else "", path = _clone(d.path, e.allocator) or_else "", length = d.length, tree = d.tree, keys = d.keys})
-	_touch(e)
 }
