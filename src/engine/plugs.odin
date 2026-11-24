@@ -506,7 +506,7 @@ _plugs_close :: proc(e: ^Engine) {
 }
 
 @(private)
-_on_base_note :: proc(m: ^fs.Mount, rel: string, note: fs.Base_Note, data: rawptr) {
+_on_base_note :: proc(m: ^fs.Mount, rel: string, note: fs.Base_Note, actor: prim.Id, data: rawptr) {
 	e := (^Engine)(data)
 	switch note {
 	case .Merged:

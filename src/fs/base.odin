@@ -14,7 +14,7 @@ Base_Note :: enum u8 {
 	Not_Text,
 }
 
-Base_Proc :: #type proc(m: ^Mount, rel: string, note: Base_Note, data: rawptr)
+Base_Proc :: #type proc(m: ^Mount, rel: string, note: Base_Note, actor: prim.Id, data: rawptr)
 
 registry_set_base_note :: proc(reg: ^Registry, cb: Base_Proc, data: rawptr) {
 	reg.on_base = cb
@@ -369,9 +369,9 @@ scope_unhold :: proc(s: ^Scope) -> (released: bool) {
 }
 
 @(private)
-_base_note :: proc(m: ^Mount, rel: string, note: Base_Note) {
+_base_note :: proc(m: ^Mount, rel: string, note: Base_Note, actor: prim.Id) {
 	if m.reg != nil && m.reg.on_base != nil {
-		m.reg.on_base(m, rel, note, m.reg.base_data)
+		m.reg.on_base(m, rel, note, actor, m.reg.base_data)
 	}
 }
 
@@ -561,11 +561,17 @@ rebase_changes :: proc(p: ^Pass) -> Error {
 		}
 		if c.disk != .File || c.moved != "" || (c.kind != .Modify && c.kind != .Create) || (c.kind == .Modify && c.old.kind != .File) {
 			_change_pin_drop(m, &c, observed)
-			_base_note(m, c.path, .Mismatch)
+			_base_note(m, c.path, .Mismatch, actor)
 			append(&keep, c)
 			continue
 		}
 		v, inode, pinned := _base_version(m, pin, actor)
+		event := false
+		if v == nil {
+			if v, inode = _base_plain(m, pin); v != nil {
+				event = true
+			}
+		}
 		if v != nil && (c.kind != .Modify || inode != c.old.inode) {
 			if _, _, elsewhere, serr := shadow_by_inode(&m.shadow, inode, context.temp_allocator); serr != .None || elsewhere {
 				v = nil
@@ -576,17 +582,23 @@ rebase_changes :: proc(p: ^Pass) -> Error {
 			ebuf: Pin
 			if ep, _, _ := _entry_pin(m, &c, &ebuf, actor); ep != nil {
 				v, inode, _ = _base_version(m, ep, actor)
+				event = false
+				if v == nil {
+					if v, inode = _base_plain(m, ep); v != nil {
+						event = true
+					}
+				}
 				fell = v != nil
 			}
 			if fell {
 				_change_pin_drop(m, &c, observed)
-				_base_note(m, c.path, .Mismatch)
+				_base_note(m, c.path, .Mismatch, actor)
 			}
 		}
 		if v == nil {
 			if pinned {
 				_change_pin_drop(m, &c, observed)
-				_base_note(m, c.path, .Mismatch)
+				_base_note(m, c.path, .Mismatch, actor)
 			}
 			append(&keep, c)
 			continue
@@ -595,23 +607,23 @@ rebase_changes :: proc(p: ^Pass) -> Error {
 		sl := make([dynamic]crdt.Lv, context.temp_allocator)
 		if crdt.graph_version_lvs(&h.g, v, &vl) != .None || crdt.graph_version_lvs(&h.g, m.synced[:], &sl) != .None {
 			_change_pin_drop(m, &c, observed)
-			_base_note(m, c.path, .Mismatch)
+			_base_note(m, c.path, .Mismatch, actor)
 			append(&keep, c)
 			continue
 		}
 		if c.kind == .Modify && inode == c.old.inode && crdt.frontier_eq(vl[:], sl[:]) {
 			_change_pin_drop(m, &c, observed)
-			_base_note(m, c.path, .Current)
+			_base_note(m, c.path, .Current, actor)
 			append(&keep, c)
 			continue
 		}
 		if _off_line(m, vl[:], sl[:]) {
 			_change_pin_drop(m, &c, observed)
-			_base_note(m, c.path, .Mismatch)
+			_base_note(m, c.path, .Mismatch, actor)
 			append(&keep, c)
 			continue
 		}
-		done, rerr := rebase_commit(p, &c, v, inode, actor)
+		done, rerr := rebase_commit(p, &c, v, inode, actor, event)
 		#partial switch rerr {
 		case .None:
 		case .Reloading, .Io, .No_Space:
@@ -622,7 +634,7 @@ rebase_changes :: proc(p: ^Pass) -> Error {
 				continue
 			}
 			_change_pin_drop(m, &c, observed)
-			_base_note(m, c.path, .Mismatch)
+			_base_note(m, c.path, .Mismatch, actor)
 			append(&keep, c)
 			continue
 		}
@@ -634,15 +646,50 @@ rebase_changes :: proc(p: ^Pass) -> Error {
 		}
 		_change_pin_drop(m, &c, observed)
 		if !done {
-			_base_note(m, c.path, .Not_Text)
+			_base_note(m, c.path, .Not_Text, actor)
 			append(&keep, c)
 			continue
 		}
-		_base_note(m, c.path, .Merged)
+		_base_note(m, c.path, .Merged, actor)
 	}
 	clear(&p.changes)
 	append(&p.changes, ..keep[:])
 	return .None
+}
+
+@(private)
+_base_plain :: proc(m: ^Mount, p: ^Pin) -> (v: []crdt.Op_Id, inode: fstree.Inode_Id) {
+	if p == nil {
+		return nil, {}
+	}
+	h := m.history
+	if p.has_write && p.has_base {
+		if t, err := history_text_at(h, p.write_inode, p.write[:], context.temp_allocator); err == .None && _content_hash(t) == p.base_hash {
+			return slice.clone(p.write[:], context.temp_allocator), p.write_inode
+		}
+	}
+	if p.has_read {
+		if t, err := history_text_at(h, p.read_inode, p.read[:], context.temp_allocator); err == .None && _content_hash(t) == p.read_hash {
+			return slice.clone(p.read[:], context.temp_allocator), p.read_inode
+		}
+	}
+	return nil, {}
+}
+
+@(private)
+_event_digest :: proc(inode: crdt.Op_Id, data: []u8) -> (out: [32]u8) {
+	ctx: blake2b.Context
+	blake2b.init(&ctx, 32)
+	tag := "0ndb event edit"
+	blake2b.update(&ctx, transmute([]u8)tag)
+	a := inode.actor
+	blake2b.update(&ctx, a[:])
+	n: [8]u8
+	prim.put_u64le(n[:], inode.seq)
+	blake2b.update(&ctx, n[:])
+	blake2b.update(&ctx, data)
+	blake2b.final(&ctx, out[:])
+	return
 }
 
 @(private)
@@ -665,7 +712,7 @@ _off_line :: proc(m: ^Mount, vl: []crdt.Lv, sl: []crdt.Lv) -> bool {
 }
 
 @(private)
-rebase_commit :: proc(p: ^Pass, c: ^Change, v: []crdt.Op_Id, inode: fstree.Inode_Id, actor: prim.Id) -> (done: bool, err: Error) {
+rebase_commit :: proc(p: ^Pass, c: ^Change, v: []crdt.Op_Id, inode: fstree.Inode_Id, who: prim.Id, event: bool) -> (done: bool, err: Error) {
 	m := p.m
 	h := m.history
 	data, oid, binary, ok := read_content(m, c.path, c.stat, inode, true) or_return
@@ -673,12 +720,30 @@ rebase_commit :: proc(p: ^Pass, c: ^Change, v: []crdt.Op_Id, inode: fstree.Inode
 		return false, .None
 	}
 	old := history_text_at(h, inode, v, context.temp_allocator) or_return
+	actor := who
+	landed: crdt.Op_Id
+	if event {
+		actor = event_actor(m, who, v, _event_digest(inode_op(h, inode), data)) or_return
+		if known := crdt.graph_known(&h.g, actor); known > 0 {
+			landed = crdt.Op_Id{actor, known - 1}
+		}
+	}
+	if landed != {} {
+		ne := c.old if c.kind == .Modify && c.old.inode == inode else Entry{inode = inode, kind = .File}
+		ne.stat = c.stat
+		ne.oid = oid
+		one := [1]fstree.Op_Id{op_inode(h, landed)}
+		ne.ver = shadow_version_add(&m.shadow, one[:]) or_return
+		shadow_put(&m.shadow, c.path, ne) or_return
+		append(&p.rebased, landed)
+		return true, .None
+	}
 	b: Builder
 	builder_init(&b, h, actor)
-	if c.scope != nil && c.scope.actor == actor {
-		b.scope = scope_marker(actor, c.scope.id)
+	if c.scope != nil && c.scope.actor == who {
+		b.scope = scope_marker(who, c.scope.id)
 	} else if c.scope_id != {} {
-		b.scope = scope_marker(actor, c.scope_id)
+		b.scope = scope_marker(who, c.scope_id)
 	}
 	shadow_txn_begin(&m.shadow)
 	err = copy_begin(m, c, data)
@@ -725,10 +790,10 @@ rebase_commit :: proc(p: ^Pass, c: ^Change, v: []crdt.Op_Id, inode: fstree.Inode
 	}
 	shadow_txn_end(&m.shadow)
 	based_scope := c.scope_id
-	if c.scope != nil && c.scope.actor == actor {
+	if c.scope != nil && c.scope.actor == who {
 		based_scope = c.scope.id
 	}
-	attrib_set(m, c.path, actor, true, {}, based_scope)
+	attrib_set(m, c.path, who, true, {}, based_scope)
 	if has {
 		append(&p.rebased, head)
 	}
