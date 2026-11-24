@@ -14,7 +14,7 @@ _fences_init :: proc "contextless" () {
 
 @(private = "file")
 _fences_world :: proc(w: ^World) {
-	if w.cfg.crash_rate == 0 {
+	if w.cfg.crash_rate == 0 || env_u64("SIM_FENCE_CRASH", 0) == 0 {
 		return
 	}
 	for n in w.nodes {
