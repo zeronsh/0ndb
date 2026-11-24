@@ -119,8 +119,8 @@
  *                 19 members_changed, 20 epoch_changed, 21 access_revoked,
  *                 22 runner_enrolled, 23 runner_anomaly, 24 approval_requested,
  *                 25 login_done, 26 login_failed, 27 lease_lapsed, 28 space_left,
- *                 29 line_switched, 30 replica_redacted, 31 rename_offered,
- *                 32 redact_unreached, 33 models_changed, 34 authors_resolved
+ *                 29 line_switched, 30 reserved, 31 rename_offered,
+ *                 32 reserved, 33 models_changed, 34 authors_resolved
  *   owner         0 person, 1 agent, 2 unresolved (the author's record has
  *                 not reached this device)
  *   member_kind   0 device, 1 account, 2 recovery, 3 custodian, 4 pool,
@@ -320,11 +320,6 @@
  *                 object and detail "<source path>\n<destination path>"
  *                 when edits to a file another device renamed onto an
  *                 existing name are offered on the destination;
- *                 redact_unreached carries the redacted object (zero for
- *                 a scrub resumed at open) and detail
- *                 "<reason>\n<blob>\n<ref>\n<commit>\n<place>" for each
- *                 copy a redaction could not remove (reason protected,
- *                 shared, pinned, repository or left);
  *                 caught_up carries space and length the relay feed
  *                 position the device has read up to; indexer_wanted
  *                 carries the space a search wanted a full indexer in

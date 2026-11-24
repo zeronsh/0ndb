@@ -168,6 +168,10 @@ The engine is designed so that none of these has an exception:
   (its tree for that writer is not loaded) reads as `Need_Keys`, surfaced as
   `Missing`. Every derived reader (the map table, the conversation view and
   index) stops there, keeps how far it got, and resumes on the rekey.
+- **Upgrade: redaction is removed.** Content already hidden on a device stays
+  hidden there, nothing new can be redacted, and a redaction a device had not
+  applied before it upgraded is not applied afterwards, so that device's copy
+  stays readable.
 - **Each participant has its own view.** The leaf is per participant (in its
   own segment); the thread's shared head is the newest sent message. Browsing
   an old branch on one device never moves anyone else.

@@ -739,26 +739,3 @@ _sub_drafts :: proc(e: ^Engine, s: ^Sub, h: ^Handle, out: ^[dynamic]Delta) {
 	}
 }
 
-@(private)
-_draft_redact_own :: proc(e: ^Engine, h: ^Handle, msg: i64) {
-	_drafts_drop(h, e.self, msg)
-	if h.w_open && h.kind == .Conversation {
-		if convo.writer_draft_redact(&h.cw, msg) != .None {
-			_log(e, .Warn, "draft redaction failed")
-		}
-	}
-	t := h.own_tree
-	if t == nil {
-		return
-	}
-	k, ok := osync.draft_key(osync.keytree_provider(&t.tree), msg)
-	crypto.zero_explicit(&k, size_of(k))
-	if !ok {
-		return
-	}
-	if osync.draft_puncture(&t.tree, msg) != .None {
-		return
-	}
-	_own_tree_punctured(e, t)
-	_dirty_keys(e, h.sp, h.id, h.kind, h.scope, t)
-}
