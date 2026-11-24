@@ -23,18 +23,28 @@ NV_TOOL :: "tool line\n"
 @(private = "file")
 NV_EDIT :: "edit line\n"
 
+@(private = "file")
+NV_MORE :: "more line\n"
+
 Named_Edit_Arm :: struct {
 	elsewhere: bool,
 	edit:      bool,
 	named:     bool,
+	again:     bool,
+	more:      bool,
+	process:   bool,
 }
 
 Named_Edit_Result :: struct {
 	named: bool,
 	behind: bool,
+	crashed: bool,
+	typed: bool,
+	events: u64,
+	conflict: bool,
 }
 
-named_edit_run :: proc(seed: u64, arm: Named_Edit_Arm) -> (failures: [dynamic]string, res: Named_Edit_Result) {
+named_edit_run :: proc(seed: u64, arm: Named_Edit_Arm, crash_at: u64 = 0) -> (failures: [dynamic]string, res: Named_Edit_Result) {
 	failures = make([dynamic]string)
 	cfg := default_config(seed)
 	cfg.nodes = 1
@@ -50,7 +60,7 @@ named_edit_run :: proc(seed: u64, arm: Named_Edit_Arm) -> (failures: [dynamic]st
 	cfg.verbose = env_u64("SIM_VERBOSE", 0) != 0
 	w := new(World)
 	world_init(w, cfg)
-	res = _named_edit(w, arm)
+	res = _named_edit(w, arm, crash_at)
 	for f in w.failures {
 		append(&failures, fmt.aprintf("%s", f))
 	}
@@ -93,7 +103,7 @@ _nv_scoped :: proc(w: ^World, n: ^Node, sm: ^Sim_Mount, scope: ^fs.Scope, data: 
 }
 
 @(private = "file")
-_named_edit :: proc(w: ^World, arm: Named_Edit_Arm) -> (res: Named_Edit_Result) {
+_named_edit :: proc(w: ^World, arm: Named_Edit_Arm, crash_at: u64) -> (res: Named_Edit_Result) {
 	n := w.nodes[0]
 	if !node_start(n) {
 		world_fail(w, "named edit: node start")
@@ -195,17 +205,67 @@ _named_edit :: proc(w: ^World, arm: Named_Edit_Arm) -> (res: Named_Edit_Result) 
 		line, _ := eng.tree_read(&n.e, tree, "a.txt", context.temp_allocator, {}, "main")
 		res.behind = strings.contains(string(line), NV_KEPT) && strings.contains(string(line), NV_TOOL) && !strings.contains(disk, NV_KEPT)
 	}
+	crashes := w.stats.crashes
+	if crash_at > 0 {
+		n.disk.force_process = arm.process
+		n.disk.crash_at = n.disk.stats.ops + crash_at
+	}
 	if arm.edit {
 		if _nv_write(vfs, NV_ROOT + "/a.txt", strings.concatenate({disk, NV_EDIT}, w.allocator)) != .None {
-			world_fail(w, "named edit: the person's edit")
-			return
+			if !n.disk.dead {
+				world_fail(w, "named edit: the person's edit")
+				return
+			}
 		}
 		typed: {
 			context = instance_context(&n.inst)
 			node_after(n)
 		}
 	}
+	if arm.again {
+		for text in ([]string{disk, strings.concatenate({disk, NV_EDIT}, w.allocator)}) {
+			run_until(w, w.now + 2_000_000_000, true)
+			if _nv_write(vfs, NV_ROOT + "/a.txt", text) != .None {
+				world_fail(w, "named edit: the edit made again")
+				return
+			}
+			again: {
+				context = instance_context(&n.inst)
+				node_after(n)
+			}
+		}
+	}
+	if arm.more {
+		for limit := w.now + 20_000_000_000; w.now < limit && !res.typed; {
+			t, ok := next_time(w)
+			if !ok {
+				break
+			}
+			run_until(w, t, false)
+			if w.stats.crashes > crashes && n.alive && n.e_open {
+				context = instance_context(&n.inst)
+				n.disk.probe += 1
+				have, herr := prim.read_file(vfs, NV_ROOT + "/a.txt", context.temp_allocator)
+				n.disk.probe -= 1
+				if herr == .None && strings.contains(string(have), NV_EDIT) {
+					res.typed = _nv_write(vfs, NV_ROOT + "/a.txt", strings.concatenate({string(have), NV_MORE}, context.temp_allocator)) == .None
+					node_after(n)
+				}
+			}
+		}
+	}
 	run_until(w, w.now + 20_000_000_000, true)
+	n.disk.crash_at = 0
+	n.disk.force_process = false
+	res.crashed = w.stats.crashes > crashes
+	run_until(w, w.now + 20_000_000_000, true)
+	if !n.alive {
+		world_fail(w, "named edit: node did not come back")
+		return
+	}
+	if sm := _nv_mount(n); sm != nil {
+		res.events = sm.m.event_actors
+	}
 	context = instance_context(&n.inst)
 	defer node_after(n)
 	data, rerr := eng.tree_read(&n.e, tree, "a.txt", context.temp_allocator, {}, "main")
@@ -213,13 +273,23 @@ _named_edit :: proc(w: ^World, arm: Named_Edit_Arm) -> (res: Named_Edit_Result) 
 		world_fail(w, "named edit: tree_read: %v", rerr)
 		return
 	}
-	for line in ([]string{NV_BASE, NV_KEPT, NV_TOOL, NV_EDIT}) {
+	n.disk.probe += 1
+	shown, _ := prim.read_file(vfs, NV_ROOT + "/a.txt", context.temp_allocator)
+	n.disk.probe -= 1
+	edited := crash_at == 0 || strings.contains(string(shown), NV_EDIT)
+	if !edited && strings.contains(string(data), NV_EDIT) {
+		world_fail(w, "named edit: %v: the line has an edit the disk does not (%q, disk %q), at disk op %d", arm, string(data), string(shown), crash_at)
+	}
+	for line in ([]string{NV_BASE, NV_KEPT, NV_TOOL, NV_EDIT, NV_MORE}) {
+		if (line == NV_EDIT && !edited) || (line == NV_MORE && !res.typed) {
+			continue
+		}
 		want := 1
 		if (line == NV_KEPT && !arm.named) || (line == NV_EDIT && !arm.edit) {
 			want = 0
 		}
 		if c := strings.count(string(data), line); c != want {
-			world_fail(w, "named edit: %v: %q appears %d times in a.txt on main, want %d (%q)", arm, strings.trim_space(line), c, want, string(data))
+			world_fail(w, "named edit: %v: %q appears %d times in a.txt on main, want %d (%q), at disk op %d", arm, strings.trim_space(line), c, want, string(data), crash_at)
 		}
 	}
 	return
@@ -249,5 +319,47 @@ named_version_edit :: proc(t: ^testing.T) {
 		}
 		fmt.eprintf("named_version_edit: elsewhere=%v edit=%v named=%v: %d of 20 named, %d behind, %d failed\n", arm.elsewhere, arm.edit, arm.named, named, behind, bad)
 		testing.expect(t, !arm.named || (named > 0 && behind > 0), fmt.tprintf("named_version_edit %v: no run had a named version with the disk behind", arm))
+	}
+	for bits in 0 ..< 2 {
+		arm := Named_Edit_Arm{elsewhere = true, edit = true, named = true, again = true, process = bits != 0}
+		bad := 0
+		events: u64
+		for seed in u64(1) ..= 20 {
+			failures, res := named_edit_run(seed, arm)
+			for f in failures {
+				fmt.eprintf("named_version_edit again seed %d: %s\n", seed, f)
+				delete(f)
+			}
+			bad += 1 if len(failures) > 0 else 0
+			events = max(events, res.events)
+			delete(failures)
+		}
+		fmt.eprintf("named_version_edit: again: %d of 20 failed, most event actors %d\n", bad, events)
+		testing.expect(t, bad == 0, "named_version_edit: the same edit made again")
+	}
+	for more in ([]bool{false, true}) {
+		for process in ([]bool{false, true}) {
+			arm := Named_Edit_Arm{elsewhere = true, edit = true, named = true, more = more, process = process}
+			points, typed, bad := 0, 0, 0
+			events: u64
+			for k in u64(1) ..= 3000 {
+				failures, res := named_edit_run(1, arm, k)
+				for f in failures {
+					fmt.eprintf("named_version_edit crash: %s\n", f)
+					delete(f)
+				}
+				bad += 1 if len(failures) > 0 else 0
+				typed += 1 if res.typed else 0
+				events = max(events, res.events)
+				delete(failures)
+				if !res.crashed {
+					break
+				}
+				points += 1
+			}
+			fmt.eprintf("named_version_edit: crash more=%v process=%v: points=%d typed_after=%d failed=%d most event actors=%d\n", more, process, points, typed, bad, events)
+			testing.expect(t, bad == 0, fmt.tprintf("named_version_edit crash more=%v process=%v failed", more, process))
+			testing.expect(t, !more || typed > 0, "named_version_edit: nobody typed after a crash")
+		}
 	}
 }
