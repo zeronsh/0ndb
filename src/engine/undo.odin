@@ -238,6 +238,16 @@ convo_warm :: proc(e: ^Engine, o: Object, ready: Ready = {}) -> Error {
 	return _pending_result(e, h, .Missing, ready)
 }
 
+convo_cold :: proc(e: ^Engine, o: Object) -> bool {
+	context = context_for(e)
+	h, herr := _handle_get(e, o, .Conversation)
+	if herr != .None || !_handle_waiting(h) {
+		return false
+	}
+	st, serr := convo_status(e, o)
+	return serr == .Missing || serr == .None && obj.rid_none(st.head)
+}
+
 @(private)
 _space_cut_off :: proc(e: ^Engine, sp: ^Space) -> bool {
 	return sp.repl_on && !sp.connected && (sp.offline || !_link_possible(e, sp))

@@ -589,7 +589,7 @@ _cmd_run :: proc(e: ^Engine, cmd: Command, st: ^Cmd_State) -> (res: Result, h: ^
 	case Cmd_Send:
 		h = _convo_writable(e, c.object) or_return
 		if st.stage == 0 && !c.root && _handle_waiting(h) {
-			if cs, serr := convo_status(e, c.object); serr == .Missing || serr == .None && obj.rid_none(cs.head) {
+			if convo_cold(e, c.object) {
 				return res, h, .Offline if _space_cut_off(e, h.sp) else .Missing
 			}
 		}
