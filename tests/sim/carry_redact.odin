@@ -43,7 +43,7 @@ _cr_write :: proc(vfs: prim.Vfs, path: string, data: []u8) -> prim.Error {
 	return err if err != .None else cerr
 }
 
-carry_redact_run :: proc(seed: u64, known: bool) -> (failures: [dynamic]string) {
+carry_redact_run :: proc(seed: u64, known: bool, carry: bool) -> (failures: [dynamic]string) {
 	failures = make([dynamic]string)
 	cfg := default_config(seed)
 	cfg.nodes = 2
@@ -58,7 +58,7 @@ carry_redact_run :: proc(seed: u64, known: bool) -> (failures: [dynamic]string) 
 	cfg.verbose = env_u64("SIM_VERBOSE", 0) != 0
 	w := new(World)
 	world_init(w, cfg)
-	_carry_redact(w, known)
+	_carry_redact(w, known, carry)
 	for f in w.failures {
 		append(&failures, fmt.aprintf("%s", f))
 	}
@@ -68,7 +68,7 @@ carry_redact_run :: proc(seed: u64, known: bool) -> (failures: [dynamic]string) 
 }
 
 @(private = "file")
-_carry_redact :: proc(w: ^World, known: bool) {
+_carry_redact :: proc(w: ^World, known: bool, carry: bool) {
 	a, b := w.nodes[0], w.nodes[1]
 	if !relay_start(&w.relay) {
 		world_fail(w, "carry redact: relay start")
@@ -193,7 +193,8 @@ _carry_redact :: proc(w: ^World, known: bool) {
 		_cr_cut(a, true)
 	}
 	back := make([dynamic]Git_Change, context.temp_allocator)
-	if res, err := git_checkout(va, CARRY_REDACT_ROOT, "main", false, when_s, node_clock(&a.clock), rng_random(&w.rng), &back); res != .Done || err != .None {
+	if !carry {
+	} else if res, err := git_checkout(va, CARRY_REDACT_ROOT, "main", false, when_s, node_clock(&a.clock), rng_random(&w.rng), &back); res != .Done || err != .None {
 		world_fail(w, "carry redact: checkout main: %v %v", res, err)
 		return
 	}
@@ -204,6 +205,13 @@ _carry_redact :: proc(w: ^World, known: bool) {
 	run_until(w, w.now + 20_000_000_000, true)
 	at_carry: [dynamic]u8
 	carried: {
+		if !carry {
+			if werr := _cr_write(va, CARRY_REDACT_ROOT + "/a.txt", transmute([]u8)string("shared a\nperson line\n")); werr != .None {
+				world_fail(w, "carry redact: person rewrite: %v", werr)
+				return
+			}
+			break carried
+		}
 		context = instance_context(&a.inst)
 		defer node_after(a)
 		vc, verr := eng.tree_version(&a.e, tree, "main", context.temp_allocator)
@@ -291,8 +299,8 @@ _carry_redact :: proc(w: ^World, known: bool) {
 				at += sp.len
 			}
 		}
-		old, oerr := eng.tree_read(&n.e, tree, "a.txt", context.temp_allocator, {}, "main", at_carry[:])
-		if oerr != .None {
+		if !carry {
+		} else if old, oerr := eng.tree_read(&n.e, tree, "a.txt", context.temp_allocator, {}, "main", at_carry[:]); oerr != .None {
 			world_fail(w, "carry redact: %s read a.txt at the carry: %v", n.name, oerr)
 		} else if strings.contains(string(old), string(secret)) || !strings.has_prefix(string(old), "shared a\n") || len(old) != len("shared a\n") + len(CARRY_REDACT_LINE) {
 			world_fail(w, "carry redact: %s reads a.txt at the carry as %q (known %v), not the carried line redacted", n.name, string(old), known)
@@ -317,13 +325,17 @@ carry_redact :: proc(t: ^testing.T) {
 	}
 	test_begin(t)
 	defer test_end(t)
-	for known in ([]bool{true, false}) {
-		failures := carry_redact_run(1, known)
+	Case :: struct {
+		known: bool,
+		carry: bool,
+	}
+	for c in ([]Case{{true, true}, {false, true}, {true, false}}) {
+		failures := carry_redact_run(1, c.known, c.carry)
 		for f in failures {
-			fmt.eprintf("carry_redact (known %v): %s\n", known, f)
+			fmt.eprintf("carry_redact (known %v, carry %v): %s\n", c.known, c.carry, f)
 			delete(f)
 		}
-		testing.expect(t, len(failures) == 0, fmt.tprintf("carry_redact (known %v) failed", known))
+		testing.expect(t, len(failures) == 0, fmt.tprintf("carry_redact (known %v, carry %v) failed", c.known, c.carry))
 		delete(failures)
 	}
 }
