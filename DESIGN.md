@@ -3449,8 +3449,27 @@ Relay cost tracks the reachable information, not the activity. Items marked
   plus anything the manifest does not cover contiguously from the stream's
   base, and only then punches that prefix out of the pack (a crash between
   the two leaves bytes in both places, never in neither). An open stream
-  builds its cold index (watermark and `Seg` records) from the manifest on
-  first use and keeps it current while open; reads below the watermark are
+  builds its cold index (watermark and `Seg` records) on first use and
+  keeps it current while open. It does not read the space's manifest for
+  that: each stream has a sidecar in the pack (a tier-reserved stream)
+  holding copies of its `Seg`, `Evict` and `Drop` records, each slot being
+  the 64-byte record, its manifest offset and a checksum, and an index
+  mark stream records how far into the manifest every sidecar is
+  complete, with the sidecars' bytes, which space usage excludes like the
+  manifest's. The manifest stays authoritative and the sidecars are
+  derived: after each manifest commit the tier appends the commit's
+  records to their sidecars and only then advances the mark (a
+  commit with nothing to index advances the mark in memory, and durably once it
+  lags 64 KiB). A reader takes its sidecar's slots below the mark and
+  scans the manifest past it. Opening a space copies the manifest past the
+  durable mark into the sidecars, skipping slots already there by
+  manifest offset, so a crash between the two writes is caught up, never
+  trusted. A torn sidecar tail is padded to a slot boundary and its
+  invalid slot skipped. Opening a stream therefore reads its own records
+  and the unindexed tail, not the space's history (sim `tier_index`: 480 B
+  per open in a space of 96 streams, against 37 KB from the whole
+  manifest, and a crash sweep across a flush and its indexing). Reads
+  below the watermark are
   ranged GETs from the batch objects (asynchronous: `Object_Store.read`
   completes later, the connection that needs the block is parked and
   resumed through `Relay_Storage.on_ready`, concurrent reads of a 256 KiB
