@@ -1671,6 +1671,8 @@ mat_snapshot_named :: proc(m: ^Mount, it: ^Mat_Item, at: []fstree.Op_Id, base, p
 	e := it.entry
 	e.stat = st
 	e.oid = oid
+	named: fstree.Op_Id
+	reloading := false
 	if string(old) != string(data) {
 		who := a.actor if attributed else base
 		if !attributed {
@@ -1683,6 +1685,7 @@ mat_snapshot_named :: proc(m: ^Mount, it: ^Mat_Item, at: []fstree.Op_Id, base, p
 		}
 		if known := crdt.graph_known(&h.g, actor); blocked && known > 0 {
 			head = crdt.Op_Id{actor, known - 1}
+			named = op_inode(h, head)
 		} else {
 			b: Builder
 			builder_init(&b, h, actor)
@@ -1692,6 +1695,7 @@ mat_snapshot_named :: proc(m: ^Mount, it: ^Mat_Item, at: []fstree.Op_Id, base, p
 					builder_opaque(&b, mk)
 				}
 			}
+			named = op_inode(h, crdt.Op_Id{b.actor, b.seq0 + u64(b.n)})
 			ch, has, cerr := builder_commit_at(m, &b, v)
 			if cerr != .None && cerr != .Reloading {
 				return {}, cerr
@@ -1700,8 +1704,9 @@ mat_snapshot_named :: proc(m: ^Mount, it: ^Mat_Item, at: []fstree.Op_Id, base, p
 				return {}, .None
 			}
 			head = ch
+			reloading = cerr == .Reloading
 		}
-		one := [1]fstree.Op_Id{op_inode(h, head)}
+		one := [1]fstree.Op_Id{named}
 		e.ver = shadow_version_add(&m.shadow, one[:]) or_return
 	}
 	shadow_put(&m.shadow, it.path, e) or_return
@@ -1710,7 +1715,7 @@ mat_snapshot_named :: proc(m: ^Mount, it: ^Mat_Item, at: []fstree.Op_Id, base, p
 		attrib_set(m, it.old, a.actor, true, {}, a.scope)
 		_base_note(m, it.old, .Current, a.actor)
 	}
-	return head, .None
+	return head, .Reloading if reloading else .None
 }
 
 @(private)
@@ -1732,6 +1737,8 @@ mat_snapshot_writer :: proc(m: ^Mount, it: ^Mat_Item, a: Attrib, st: Stat, data:
 	e := it.entry
 	e.stat = st
 	e.oid = oid
+	named: fstree.Op_Id
+	reloading := false
 	if string(old) != string(data) {
 		actor := a.actor
 		blocked := _chain_blocks(h, actor, v)
@@ -1740,6 +1747,7 @@ mat_snapshot_writer :: proc(m: ^Mount, it: ^Mat_Item, a: Attrib, st: Stat, data:
 		}
 		if known := crdt.graph_known(&h.g, actor); blocked && known > 0 {
 			head = crdt.Op_Id{actor, known - 1}
+			named = op_inode(h, head)
 		} else {
 			b: Builder
 			builder_init(&b, h, actor)
@@ -1747,6 +1755,7 @@ mat_snapshot_writer :: proc(m: ^Mount, it: ^Mat_Item, a: Attrib, st: Stat, data:
 			if mk := scope_marker(a.actor, a.scope); mk != nil {
 				builder_opaque(&b, mk)
 			}
+			named = op_inode(h, crdt.Op_Id{b.actor, b.seq0 + u64(b.n)})
 			ch, has, cerr := builder_commit_at(m, &b, v)
 			if cerr != .None && cerr != .Reloading {
 				return {}, cerr
@@ -1755,15 +1764,16 @@ mat_snapshot_writer :: proc(m: ^Mount, it: ^Mat_Item, a: Attrib, st: Stat, data:
 				return {}, .None
 			}
 			head = ch
+			reloading = cerr == .Reloading
 		}
-		one := [1]fstree.Op_Id{op_inode(h, head)}
+		one := [1]fstree.Op_Id{named}
 		e.ver = shadow_version_add(&m.shadow, one[:]) or_return
 	}
 	shadow_put(&m.shadow, it.path, e) or_return
 	it.entry = e
 	attrib_set(m, it.old, a.actor, true, {}, a.scope)
 	_base_note(m, it.old, .Current, a.actor)
-	return head, .None
+	return head, .Reloading if reloading else .None
 }
 
 @(private)
@@ -1830,6 +1840,7 @@ mat_snapshot_dirty :: proc(m: ^Mount, items: []Mat_Item, target: Version) -> (ou
 	if len(plain) > 0 && (changed || len(parents) > 0) {
 		vids := make([dynamic]fstree.Op_Id, context.temp_allocator)
 		head: crdt.Op_Id
+		reloading := false
 		if changed {
 			history_register_actor(h, base, pseudo) or_return
 			actor := base
@@ -1851,6 +1862,7 @@ mat_snapshot_dirty :: proc(m: ^Mount, items: []Mat_Item, target: Version) -> (ou
 			}
 			if known := crdt.graph_known(&h.g, actor); blocked && known > 0 {
 				head = crdt.Op_Id{actor, known - 1}
+				append(&vids, op_inode(h, head))
 			} else {
 				b: Builder
 				builder_init(&b, h, actor)
@@ -1859,6 +1871,7 @@ mat_snapshot_dirty :: proc(m: ^Mount, items: []Mat_Item, target: Version) -> (ou
 						emit_text_edits(m, &b, items[x.i].inode, items[x.i].path, x.old, x.data) or_return
 					}
 				}
+				append(&vids, op_inode(h, crdt.Op_Id{b.actor, b.seq0 + u64(b.n)}))
 				ch, has, cerr := builder_commit_at(m, &b, parents)
 				if cerr != .None && cerr != .Reloading {
 					return nil, false, cerr
@@ -1867,8 +1880,8 @@ mat_snapshot_dirty :: proc(m: ^Mount, items: []Mat_Item, target: Version) -> (ou
 					return nil, false, .None
 				}
 				head = ch
+				reloading = cerr == .Reloading
 			}
-			append(&vids, op_inode(h, head))
 		} else {
 			head = parents[len(parents) - 1]
 			for q in parents {
@@ -1884,6 +1897,9 @@ mat_snapshot_dirty :: proc(m: ^Mount, items: []Mat_Item, target: Version) -> (ou
 			shadow_put(&m.shadow, items[x.i].path, e) or_return
 		}
 		append(&heads, head)
+		if reloading {
+			return heads[:], true, .Reloading
+		}
 	}
 	for x in named {
 		ev := mat_snapshot_named(m, &items[x.i], x.at, base, pseudo, x.stat, x.data, x.oid) or_return
