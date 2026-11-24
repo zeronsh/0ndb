@@ -2192,7 +2192,13 @@ live runner by default:
   this device fails the run at once with an error block named
   `not_signed_in` whose text says how to sign in, and never spawns the CLI.
   The model list reports `signed_in` and the provider's `login` hint, so a
-  client can grey a provider out before the user picks it.
+  client can grey a provider out before the user picks it. A provider
+  whose auth files exist but whose session the provider rejects (claude's
+  `authentication_failed`) fails its run the same way and is marked not
+  signed in: the runner directory and the model list report it so, and later
+  runs fail at once without spawning it, until a run succeeds or its auth
+  files change after a settling window (the CLI rewrites them itself when a
+  refresh fails), which is what signing in again does.
 - **Model list.** `models` answers at once from each provider's last known
   list (persisted per provider under the work root's `.models/`) plus the
   native models, with `refreshing` set while probes run. A stale list

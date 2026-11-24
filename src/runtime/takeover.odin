@@ -306,7 +306,7 @@ _providers_signed_in :: proc(r: ^Runtime, installed: string) -> string {
 			}
 			continue
 		}
-		if d, ok := _descriptor(r, id); ok && _descriptor_signed_in(r, d) {
+		if d, ok := _descriptor(r, id); ok && _descriptor_signed_in(r, d) && !_auth_marked(r, d) {
 			append(&out, id)
 		}
 	}
@@ -340,7 +340,81 @@ provider_signed_in :: proc(r: ^Runtime, id: string) -> bool {
 		return strings.contains(_providers_signed_in(r, id), id)
 	}
 	d, ok := _descriptor(r, id)
-	return ok && _descriptor_signed_in(r, d)
+	return ok && _descriptor_signed_in(r, d) && !_auth_marked(r, d)
+}
+
+@(private)
+_auth_signature :: proc(r: ^Runtime, d: agent.Provider_Descriptor) -> string {
+	b := strings.builder_make(context.temp_allocator)
+	for f in d.auth_files {
+		if len(r.cfg.home_dir) == 0 {
+			break
+		}
+		st, err := prim.stat(prim.os_vfs(), concat(r.cfg.home_dir, "/", f.path))
+		strings.write_string(&b, f.path)
+		if err == .None {
+			strings.write_byte(&b, ':')
+			strings.write_i64(&b, st.mtime_ns)
+			strings.write_byte(&b, ':')
+			strings.write_i64(&b, st.size)
+		}
+		strings.write_byte(&b, '\n')
+	}
+	return strings.to_string(b)
+}
+
+AUTH_SETTLE_MS :: 10_000
+
+Auth_Mark :: struct {
+	sig: string,
+	at:  i64,
+}
+
+@(private)
+_auth_marked :: proc(r: ^Runtime, d: agent.Provider_Descriptor) -> bool {
+	mk, marked := &r.auth_marks[d.id]
+	if !marked {
+		return false
+	}
+	sig := _auth_signature(r, d)
+	if mk.sig == sig {
+		return true
+	}
+	if prim.now_ms() - mk.at < AUTH_SETTLE_MS {
+		delete(mk.sig, r.allocator)
+		mk.sig = strings.clone(sig, r.allocator)
+		return true
+	}
+	provider_auth_ok(r, d.id)
+	return false
+}
+
+provider_auth_failed :: proc(r: ^Runtime, id: string) {
+	d, ok := _descriptor(r, id)
+	if !ok {
+		return
+	}
+	if r.auth_marks == nil {
+		r.auth_marks = make(map[string]Auth_Mark, r.allocator)
+	}
+	mk := Auth_Mark{sig = strings.clone(_auth_signature(r, d), r.allocator), at = prim.now_ms()}
+	if old, had := &r.auth_marks[id]; had {
+		delete(old.sig, r.allocator)
+		old^ = mk
+	} else {
+		r.auth_marks[strings.clone(id, r.allocator)] = mk
+	}
+	readvertise_all(r)
+}
+
+provider_auth_ok :: proc(r: ^Runtime, id: string) {
+	if id not_in r.auth_marks {
+		return
+	}
+	k, v := delete_key(&r.auth_marks, id)
+	delete(k, r.allocator)
+	delete(v.sig, r.allocator)
+	readvertise_all(r)
 }
 
 runner_directory :: proc(r: ^Runtime, space: prim.Id, o: Object = {}, allocator := context.allocator) -> []Runner_Entry {

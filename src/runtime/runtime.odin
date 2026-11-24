@@ -247,6 +247,7 @@ Eval_Wait :: struct {
 }
 
 Runtime :: struct {
+	auth_marks:  map[string]Auth_Mark,
 	e:           ^eng.Engine,
 	cfg:         Config,
 	allocator:   runtime.Allocator,
@@ -432,6 +433,12 @@ close :: proc(r: ^Runtime) {
 		return
 	}
 	r.closing = true
+	for k, v in r.auth_marks {
+		delete(k, r.allocator)
+		delete(v.sig, r.allocator)
+	}
+	delete(r.auth_marks)
+	r.auth_marks = nil
 	eng.set_tick_hook(r.e, {})
 	l := eng.loop(r.e)
 	if r.hooked && r.e.cfg.events.data == r {
