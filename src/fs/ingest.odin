@@ -1147,7 +1147,7 @@ adopt_one :: proc(p: ^Pass, snap: ^fstree.Snapshot, ll: []crdt.Lv, line: Version
 		return false, .Corrupt
 	}
 	if c.kind == .Remove {
-		if c.old.kind != .File || (at_line && ino == c.old.inode) {
+		if (c.old.kind != .File && c.old.kind != .Dir) || (at_line && ino == c.old.inode) {
 			return false, .None
 		}
 		shadow_remove(&m.shadow, c.path) or_return
