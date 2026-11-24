@@ -2,6 +2,7 @@ package sim
 
 import "core:fmt"
 import "core:sync"
+import "core:time"
 import "core:testing"
 
 regions_mapped: int
@@ -42,8 +43,17 @@ sim_globals_set :: proc(g: Sim_Globals) {
 	members_world_set(g.mw)
 }
 
+@(private = "file", thread_local)
+_test_start: time.Tick
+
+@(private = "file", thread_local)
+_test_wait: time.Duration
+
 test_begin :: proc(t: ^testing.T, loc := #caller_location) {
+	asked := time.tick_now()
 	sync.mutex_lock(&serial)
+	_test_wait = time.tick_since(asked)
+	_test_start = time.tick_now()
 	if g := sim_globals(); g != SIM_GLOBALS_DEFAULT {
 		testing.expect(t, false, fmt.tprintf("sim package state is not the default when %s starts: %v", loc.procedure, g))
 		sim_globals_set(SIM_GLOBALS_DEFAULT)
@@ -54,6 +64,9 @@ test_end :: proc(t: ^testing.T, loc := #caller_location) {
 	if g := sim_globals(); g != SIM_GLOBALS_DEFAULT {
 		testing.expect(t, false, fmt.tprintf("%s left sim package state changed: %v", loc.procedure, g))
 		sim_globals_set(SIM_GLOBALS_DEFAULT)
+	}
+	if env_u64("SIM_TEST_TIMES", 0) != 0 {
+		fmt.eprintf("test time %s %.1fs (waited %.1fs)\n", loc.procedure, time.duration_seconds(time.tick_since(_test_start)), time.duration_seconds(_test_wait))
 	}
 	sync.mutex_unlock(&serial)
 }
