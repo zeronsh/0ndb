@@ -447,6 +447,7 @@ Mount :: struct {
 	has_placed:  bool,
 	mat_ready:   bool,
 	mat_fast:    bool,
+	fork_rejected: int,
 	dirty:       map[string]^Scope,
 	dirty_at:    map[string]i64,
 	closed:      map[string]i64,
