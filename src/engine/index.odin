@@ -117,6 +117,10 @@ _index_all :: proc(e: ^Engine) {
 		_index_item_add(x, rec.space, id, rec.kind)
 		return true
 	}
+	for k, v in e.reg.staged {
+		key := k
+		visit(e, key[:], v)
+	}
 	omap.db_scan(&e.reg.db, ROOT_OBJECTS, nil, nil, e, visit)
 	_touch(e)
 }
