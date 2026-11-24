@@ -1060,6 +1060,154 @@ branch_remote :: proc(t: ^testing.T) {
 	testing.expect(t, bad == 0, fmt.tprintf("branch_remote: %d failures", bad))
 }
 
+@(private = "file")
+_br_redo_leaf :: proc(w: ^World, arena: ^virtual.Arena, rounds: int, by_switch: bool) {
+	if virtual.arena_init_growing(arena, 1 << 20) != nil {
+		return
+	}
+	alloc := virtual.arena_allocator(arena)
+	c, ok := _br_setup(w, alloc)
+	if !ok {
+		return
+	}
+	n := c.n
+	u1, _, ok1 := _br_turn(c, true, {{"a.txt", "<b1>\n<A1>\n<b3>\n"}})
+	if !ok1 {
+		return
+	}
+	u2, r2, ok2 := _br_turn(c, true, {{"a.txt", "<b1>\n<A2>\n<b3>\n"}, {"k.txt", "<K>\n"}})
+	if !ok2 {
+		return
+	}
+	want := _br_disk(c)
+	step :: proc(c: ^Br_Ctx, err: eng.Error, what: string) -> bool {
+		if err != .None && err != .Pending {
+			world_fail(c.w, "branch redo leaf: %s: %v", what, err)
+			return false
+		}
+		run_until(c.w, c.w.now + 5_000_000_000, true)
+		return true
+	}
+	other: obj.Rid
+	if by_switch {
+		res: eng.Result
+		err: eng.Error
+		{
+			context = instance_context(&n.inst)
+			res, err = eng.exec(&n.e, eng.Cmd_Send{object = c.conv, text = "other root", root = true})
+			node_after(n)
+		}
+		other = res.item
+		if !step(c, err, "root send first") {
+			return
+		}
+		b2: {
+			context = instance_context(&n.inst)
+			_, err = eng.convo_switch(&n.e, c.conv, u1)
+			node_after(n)
+		}
+		if !step(c, err, "switch to turn 2") {
+			return
+		}
+	}
+	for _ in 0 ..< rounds {
+		undo: prim.Id
+		err: eng.Error
+		{
+			context = instance_context(&n.inst)
+			undo, err = eng.convo_undo(&n.e, c.conv, u2)
+			node_after(n)
+		}
+		if !step(c, err, "undo") {
+			return
+		}
+		b3: {
+			context = instance_context(&n.inst)
+			_, err = eng.convo_redo(&n.e, c.conv, undo)
+			node_after(n)
+		}
+		if !step(c, err, "redo") {
+			return
+		}
+	}
+	root :: proc(c: ^Br_Ctx) -> (u: obj.Rid, err: eng.Error) {
+		n := c.n
+		context = instance_context(&n.inst)
+		defer node_after(n)
+		res := eng.exec(&n.e, eng.Cmd_Send{object = c.conv, text = "other root", root = true}) or_return
+		return res.item, .None
+	}
+	if by_switch {
+		context = instance_context(&n.inst)
+		_, err := eng.convo_switch(&n.e, c.conv, other)
+		node_after(n)
+		if !step(c, err, "leave by switch") {
+			return
+		}
+	} else {
+		u, err := root(c)
+		other = u
+		if !step(c, err, "root send") {
+			return
+		}
+	}
+	for k in 0 ..< 2 {
+		{
+			context = instance_context(&n.inst)
+			_, err := eng.convo_switch(&n.e, c.conv, u1)
+			node_after(n)
+			if !step(c, err, "switch back") {
+				return
+			}
+		}
+		if pos, _ := _br_position(c, n); pos != r2 {
+			world_fail(w, "branch redo leaf: %d rounds, switch %d: the position is off %d, not turn 2's reply off %d", rounds, k, pos.off, r2.off)
+		}
+		if got := _br_disk(c); !_br_same_disk(got, want) {
+			world_fail(w, "branch redo leaf: %d rounds, switch %d: the tree holds %v, not %v", rounds, k, got, want)
+		}
+		b4: {
+			context = instance_context(&n.inst)
+			_, err := eng.convo_switch(&n.e, c.conv, other)
+			node_after(n)
+			if !step(c, err, "switch away") {
+				return
+			}
+		}
+	}
+}
+
+@(test)
+branch_redo_leaf :: proc(t: ^testing.T) {
+	if s, ok := os.lookup_env("SIM_SEED", context.temp_allocator); ok && len(s) > 0 {
+		return
+	}
+	test_begin(t)
+	defer test_end(t)
+	bad := 0
+	count := env_u64("BR_LEAF_SEEDS", 5)
+	for seed in u64(1) ..= count {
+		for k in 0 ..< 6 {
+			w := _br_world(seed)
+			a: virtual.Arena
+			_br_redo_leaf(w, &a, k % 3, k >= 3)
+			for f in w.failures {
+				if bad < 30 {
+					fmt.eprintf("branch_redo_leaf seed %d: %s\n", seed, f)
+				}
+			}
+			if len(w.failures) > 0 {
+				bad += 1
+			}
+			world_destroy(w)
+			free(w)
+			virtual.arena_destroy(&a)
+		}
+	}
+	fmt.eprintf("branch_redo_leaf: %d seeds, %d failed\n", count, bad)
+	testing.expect(t, bad == 0, fmt.tprintf("branch_redo_leaf: %d failures", bad))
+}
+
 @(test)
 branch_concurrent :: proc(t: ^testing.T) {
 	if s, ok := os.lookup_env("SIM_SEED", context.temp_allocator); ok && len(s) > 0 {
