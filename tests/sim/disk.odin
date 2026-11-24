@@ -720,6 +720,9 @@ _d_read_at :: proc(data: rawptr, fd: prim.Fd, buf: []u8, off: i64) -> (int, prim
 	if off < 0 {
 		return 0, .Invalid
 	}
+	if ferr := run_disk_fault(d, of.path); ferr != .None {
+		return 0, ferr
+	}
 	if off >= i64(len(n.data)) {
 		return 0, .None
 	}
