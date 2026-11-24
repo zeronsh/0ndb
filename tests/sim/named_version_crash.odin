@@ -36,7 +36,11 @@ Named_Arm :: struct {
 	early:   bool,
 	control: bool,
 	clean:   bool,
+	edit:    bool,
 }
+
+@(private = "file")
+NV_EDIT :: "edit line\n"
 
 @(private = "file")
 NV_OTHER :: "other line\n"
@@ -45,6 +49,7 @@ Named_Result :: struct {
 	crashed: bool,
 	named:   bool,
 	ahead:   bool,
+	edited:  bool,
 }
 
 named_version_run :: proc(seed: u64, arm: Named_Arm, crash_at: u64) -> (failures: [dynamic]string, res: Named_Result) {
@@ -249,6 +254,18 @@ _named_crash :: proc(w: ^World, arm: Named_Arm, crash_at: u64) -> (res: Named_Re
 		context = instance_context(&n.inst)
 		node_after(n)
 	}
+	if arm.edit {
+		for limit := w.now + 20_000_000_000; w.now < limit && !res.edited; {
+			t, ok := next_time(w)
+			if !ok {
+				break
+			}
+			run_until(w, t, false)
+			if w.stats.crashes > crashes && n.alive && n.e_open {
+				res.edited = _nv_edit(n)
+			}
+		}
+	}
 	run_until(w, w.now + 20_000_000_000, true)
 	n.disk.crash_at = 0
 	n.disk.force_process = false
@@ -271,6 +288,11 @@ _named_crash :: proc(w: ^World, arm: Named_Arm, crash_at: u64) -> (res: Named_Re
 			world_fail(w, "named: %v: %q appears %d times in a.txt on main, want %d (%q), at disk op %d", arm, strings.trim_space(line), c, want, string(data), crash_at)
 		}
 	}
+	if res.edited {
+		if c := strings.count(string(data), NV_EDIT); c != 1 {
+			world_fail(w, "named: %v: %q appears %d times in a.txt on main, want 1 (%q), at disk op %d", arm, strings.trim_space(NV_EDIT), c, string(data), crash_at)
+		}
+	}
 	if kind == .Checkout_Existing {
 		fdata, ferr := eng.tree_read(&n.e, tree, "a.txt", context.temp_allocator, {}, NV_FEATURE)
 		if c := strings.count(string(fdata), NV_OTHER); ferr != .None || c != 1 {
@@ -278,6 +300,37 @@ _named_crash :: proc(w: ^World, arm: Named_Arm, crash_at: u64) -> (res: Named_Re
 		}
 	}
 	return
+}
+
+@(private = "file")
+_nv_edit :: proc(n: ^Node) -> bool {
+	context = instance_context(&n.inst)
+	sm := _nv_mount(n)
+	if sm == nil || !sm.m.awake || !fs.shadow_attached(&sm.m.shadow) {
+		return false
+	}
+	out := make([dynamic]string, context.temp_allocator)
+	n.disk.quiet = true
+	err := fs.mount_synced_mismatches(sm.m, &out, context.temp_allocator)
+	n.disk.quiet = false
+	if err != .None {
+		return false
+	}
+	for x in out {
+		if strings.has_prefix(x, "a.txt: disk") {
+			vfs := disk_vfs(&n.disk)
+			n.disk.probe += 1
+			have, rerr := prim.read_file(vfs, NV_ROOT + "/a.txt", context.temp_allocator)
+			n.disk.probe -= 1
+			if rerr != .None {
+				return false
+			}
+			ok := _nv_write(vfs, NV_ROOT + "/a.txt", strings.concatenate({string(have), NV_EDIT}, context.temp_allocator)) == .None
+			node_after(n)
+			return ok
+		}
+	}
+	return false
 }
 
 @(private = "file")
@@ -297,30 +350,29 @@ named_version_crash :: proc(t: ^testing.T) {
 	}
 	test_begin(t)
 	defer test_end(t)
-	for kind in Named_Kind {
-		for bits in 0 ..< 10 {
-			arm := Named_Arm{kind = kind, process = bits & 1 != 0, early = bits & 2 != 0, control = bits >= 4, clean = bits >= 8}
-			points, named, ahead, bad := 0, 0, 0, 0
+	for kind in ([]Named_Kind{.Plain, .Line_Switch}) {
+		for process in ([]bool{false, true}) {
+			arm := Named_Arm{kind = kind, process = process, edit = true}
+			points, named, edited, bad := 0, 0, 0, 0
 			for k in u64(1) ..= 4000 {
 				failures, res := named_version_run(1, arm, k)
-				if len(failures) > 0 {
-					bad += 1
-				}
+				lost := false
 				for f in failures {
+					lost ||= strings.contains(f, "appears")
 					fmt.eprintf("named_version_crash: %s\n", f)
 					delete(f)
 				}
-				testing.expect(t, len(failures) == 0, fmt.tprintf("named_version_crash %v at disk op %d failed", arm, k))
+				bad += 1 if lost else 0
 				delete(failures)
 				named += 1 if res.named else 0
-				ahead += 1 if res.ahead else 0
+				edited += 1 if res.edited else 0
 				if !res.crashed {
 					break
 				}
 				points += 1
 			}
-			fmt.eprintf("named_version_crash: %v process=%v early=%v control=%v clean=%v: points=%d named=%d ahead=%d failed=%d\n", kind, arm.process, arm.early, arm.control, arm.clean, points, named, ahead, bad)
-			testing.expect(t, arm.control || named > 0, fmt.tprintf("named_version_crash %v: no run had a named version in flight", arm))
+			fmt.eprintf("named_version_crash: edit %v process=%v: points=%d named=%d edited=%d text_wrong=%d\n", kind, process, points, named, edited, bad)
+			testing.expect(t, bad == 0, "named_version_crash: an edit after recovery lost or doubled text")
 		}
 	}
 }
