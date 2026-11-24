@@ -204,7 +204,12 @@ The engine is designed so that none of these has an exception:
   any-check, a unique lookup, a collection sorted afterwards) says so with
   `prim.unordered`. The gate checks every map loop in `src` and `tests/sim`
   for one or the other, and reruns seeds with the sim's allocation regions
-  shifted, requiring identical traces and disk images.
+  shifted, requiring identical traces and disk images. A seed also replays
+  identically on every platform: a step that only one operating system
+  needs (the Windows probe for symlink support, writeout and `syncfs`
+  batching) runs only against the OS file system, never the simulated one,
+  so it cannot shift the simulator's crash points or temp names (sim
+  `link_probe`).
 - **Every platform claim is verified on that platform.** CI runs the
   simulator and real-process checks on Linux and macOS hardware.
 

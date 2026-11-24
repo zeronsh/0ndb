@@ -295,7 +295,7 @@ mount_symlinks :: proc(m: ^Mount) -> bool {
 		return false
 	}
 	when ODIN_OS == .Windows {
-		if m.link_mode == .Unknown {
+		if m.link_mode == .Unknown && m.vfs.procs == prim.os_vfs().procs {
 			probe_path, _ := path_join(m.root, "x", context.temp_allocator)
 			tmp := temp_name(m, probe_path, context.temp_allocator)
 			prim.remove(m.vfs, tmp)
