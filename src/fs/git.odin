@@ -279,9 +279,9 @@ path_parent_abs :: proc(p: string) -> string {
 	return p[:i]
 }
 
-clean_path :: proc(path: string, allocator := context.allocator) -> string {
+clean_path :: proc(path: string, allocator := context.allocator, windows := ODIN_OS == .Windows) -> string {
 	p := path
-	when ODIN_OS == .Windows {
+	if windows {
 		w := make([]u8, len(path), context.temp_allocator)
 		for c, i in transmute([]u8)path {
 			w[i] = '/' if c == '\\' else c
@@ -304,7 +304,7 @@ clean_path :: proc(path: string, allocator := context.allocator) -> string {
 	b := strings.builder_make(allocator)
 	if len(p) > 0 && p[0] == '/' {
 		strings.write_byte(&b, '/')
-		if ODIN_OS == .Windows && len(p) > 1 && p[1] == '/' {
+		if windows && len(p) > 1 && p[1] == '/' {
 			strings.write_byte(&b, '/')
 		}
 	}
@@ -315,6 +315,37 @@ clean_path :: proc(path: string, allocator := context.allocator) -> string {
 		strings.write_string(&b, part)
 	}
 	return strings.to_string(b)
+}
+
+clean_root :: proc(path: string, allocator := context.allocator, windows := ODIN_OS == .Windows) -> string {
+	c := clean_path(path, allocator, windows)
+	if windows && len(c) == 2 && c[1] == ':' {
+		out := strings.concatenate({c, "/"}, allocator)
+		delete(c, allocator)
+		return out
+	}
+	return c
+}
+
+path_rel :: proc(path, root: string, windows := ODIN_OS == .Windows) -> (rel: string, ok: bool) {
+	p := clean_path(path, context.temp_allocator, windows)
+	r := clean_path(root, context.temp_allocator, windows)
+	if len(r) == 0 || len(p) < len(r) {
+		return "", false
+	}
+	if p[:len(r)] != r && !(windows && strings.equal_fold(p[:len(r)], r)) {
+		return "", false
+	}
+	if len(p) == len(r) {
+		return "", true
+	}
+	if r == "/" {
+		return p[1:], true
+	}
+	if p[len(r)] != '/' {
+		return "", false
+	}
+	return p[len(r) + 1:], true
 }
 
 git_reflog_olds :: proc(vfs: prim.Vfs, g: Git_Dirs, from: i64, allocator := context.allocator) -> []string {

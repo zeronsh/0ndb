@@ -36,10 +36,7 @@ mount_open :: proc(a: ^Api, ob: Object, root: string) -> (m: ^Mounted, st: Statu
 	if !prim.is_abs(root) {
 		return nil, .Invalid
 	}
-	clean := strings.trim_right(root, "/")
-	if len(clean) == 0 || (len(clean) == 2 && clean[1] == ':') {
-		clean = root[:len(clean) + 1]
-	}
+	clean := fs.clean_root(root, context.temp_allocator)
 	if x := mount_find(a, ob, clean); x != nil {
 		return x, .Ok
 	}

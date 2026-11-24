@@ -289,7 +289,7 @@ verify_node :: proc(c: ^api.Call, m: ^api.Mounted, rel, disk: string, st: prim.S
 }
 
 op_verify :: proc(c: ^api.Call, o: ^api.Out) -> api.Status {
-	root := trim_slash(api.a_str(c, "root"))
+	root := fs.clean_root(api.a_str(c, "root"), context.temp_allocator)
 	m: ^api.Mounted
 	for x in c.api.mounts {
 		if x.root == root {

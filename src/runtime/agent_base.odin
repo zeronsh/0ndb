@@ -1,6 +1,5 @@
 package rt
 
-import "core:strings"
 import "../agent"
 import "../fs"
 
@@ -20,9 +19,7 @@ _run_file :: proc(run: ^Run, path: string) -> (m: ^fs.Mount, rel: string, ok: bo
 		if mb.m == nil {
 			continue
 		}
-		root := mb.m.root
-		if len(path) > len(root) + 1 && strings.has_prefix(path, root) && (path[len(root)] == '/' || path[len(root)] == '\\') {
-			r, _ := strings.replace_all(path[len(root) + 1:], "\\", "/", context.temp_allocator)
+		if r, under := fs.path_rel(path, mb.m.root); under && len(r) > 0 {
 			return mb.m, r, true
 		}
 	}
