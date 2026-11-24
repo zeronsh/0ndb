@@ -583,18 +583,24 @@ kv_find :: proc(kv: ^Kv, key: []u8) -> (index: u64, off: u64, found: bool, err: 
 	for _ in 0 ..< kv.cap {
 		sh, so := kv_slot_read(kv, i) or_return
 		if sh == 0 {
+			if found {
+				return index, off, true, .None
+			}
 			return i, 0, false, .None
 		}
-		if sh == h {
+		if sh == h && (!found || so > off) {
 			r, rerr := kv_read(kv, so, &kv.probe)
 			if rerr != .None && rerr != .Corrupt {
 				return 0, 0, false, rerr
 			}
 			if rerr == .None && string(r.key) == string(key) {
-				return i, so, true, .None
+				index, off, found = i, so, true
 			}
 		}
 		i = (i + 1) & mask
+	}
+	if found {
+		return index, off, true, .None
 	}
 	return 0, 0, false, .Corrupt
 }
