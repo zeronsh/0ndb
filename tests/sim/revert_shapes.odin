@@ -830,8 +830,32 @@ _rs_case :: proc(w: ^World, cs: Rs_Case, alloc: runtime.Allocator) {
 	}
 }
 
+Rs_Arm :: enum {
+	Power,
+	Touch,
+	Fault,
+}
+
 @(private = "file")
-_rs_crash_case :: proc(w: ^World, cs: Rs_Case, k: u64, fault: bool, alloc: runtime.Allocator) -> (crashed: bool) {
+_rs_touch :: proc(c: ^Rs_Ctx) {
+	now := _rs_read(c, c.alloc)
+	for p in prim.sorted_keys(now) {
+		e := now[p]
+		if e.kind != .File {
+			continue
+		}
+		fd, oerr := prim.open_file(c.vfs, _rs_abs(p))
+		if oerr != .None {
+			continue
+		}
+		prim.fchmod(c.vfs, fd, 0o755 if e.exec else 0o644)
+		prim.close_file(c.vfs, fd)
+	}
+}
+
+@(private = "file")
+_rs_crash_case :: proc(w: ^World, cs: Rs_Case, k: u64, arm: Rs_Arm, alloc: runtime.Allocator) -> (crashed: bool) {
+	fault := arm == .Fault
 	c, cok := _rs_setup(w, cs, alloc)
 	if !cok {
 		return
@@ -847,6 +871,8 @@ _rs_crash_case :: proc(w: ^World, cs: Rs_Case, k: u64, fault: bool, alloc: runti
 		n.disk.fail_nth = k
 	} else {
 		n.disk.crash_at = n.disk.stats.ops + k
+		n.disk.force_process = arm != .Power
+		n.disk.force_power = arm == .Power
 	}
 	undo: prim.Id
 	start: {
@@ -866,8 +892,20 @@ _rs_crash_case :: proc(w: ^World, cs: Rs_Case, k: u64, fault: bool, alloc: runti
 			node_crash_now(n, .Power, k)
 		}
 	}
+	if arm == .Touch {
+		at := w.now
+		for i := 0; i < 4000 && w.stats.crashes == crashes; i += 1 {
+			at += 5_000_000
+			run_until(w, at, true)
+		}
+		if w.stats.crashes > crashes {
+			_rs_touch(c)
+		}
+	}
 	run_until(w, w.now + 20_000_000_000, true)
 	n.disk.crash_at = 0
+	n.disk.force_process = false
+	n.disk.force_power = false
 	crashed = w.stats.crashes > crashes
 	run_until(w, w.now + 20_000_000_000, true)
 	if !n.alive {
@@ -918,7 +956,7 @@ _rs_crash_case :: proc(w: ^World, cs: Rs_Case, k: u64, fault: bool, alloc: runti
 	return
 }
 
-revert_shapes_crash_run :: proc(seed: u64, only: string, stride: u64, limit: u64, fault: bool) -> (failures: [dynamic]string, points: int) {
+revert_shapes_crash_run :: proc(seed: u64, only: string, stride: u64, limit: u64, arm: Rs_Arm) -> (failures: [dynamic]string, points: int) {
 	failures = make([dynamic]string)
 	arena: virtual.Arena
 	if virtual.arena_init_growing(&arena, 1 << 20) != nil {
@@ -930,7 +968,7 @@ revert_shapes_crash_run :: proc(seed: u64, only: string, stride: u64, limit: u64
 			continue
 		}
 		for k := env_u64("SHAPES_FROM", 1); k <= limit; k += stride {
-			cfg := default_config(seed)
+			cfg := default_config(seed + k if arm == .Touch else seed)
 			cfg.nodes = 1
 			cfg.spaces = 0
 			cfg.ops = 0
@@ -946,7 +984,7 @@ revert_shapes_crash_run :: proc(seed: u64, only: string, stride: u64, limit: u64
 			ca: virtual.Arena
 			crashed := false
 			if virtual.arena_init_growing(&ca, 1 << 20) == nil {
-				crashed = _rs_crash_case(w, cs, k, fault, virtual.arena_allocator(&ca))
+				crashed = _rs_crash_case(w, cs, k, arm, virtual.arena_allocator(&ca))
 				virtual.arena_destroy(&ca)
 			}
 			for f in w.failures {
@@ -1010,7 +1048,8 @@ revert_shapes :: proc(t: ^testing.T) {
 	}
 	test_begin(t)
 	defer test_end(t)
-	only, _ := os.lookup_env("SHAPES_ONLY", context.temp_allocator)
+	only, _ := os.lookup_env("SHAPES_ONLY", context.allocator)
+	defer delete(only)
 	failures, cases := revert_shapes_run(1, only)
 	for f in failures {
 		fmt.eprintf("revert_shapes: %s\n", f)
@@ -1029,22 +1068,23 @@ revert_shapes_crash :: proc(t: ^testing.T) {
 	}
 	test_begin(t)
 	defer test_end(t)
-	only, _ := os.lookup_env("SHAPES_ONLY", context.temp_allocator)
-	for fault in ([2]bool{false, true}) {
-		_rs_sweep(t, only, fault)
+	only, _ := os.lookup_env("SHAPES_ONLY", context.allocator)
+	defer delete(only)
+	for arm in Rs_Arm {
+		_rs_sweep(t, only, arm)
 	}
 }
 
 @(private = "file")
-_rs_sweep :: proc(t: ^testing.T, only: string, fault: bool) {
-	failures, points := revert_shapes_crash_run(1, only, env_u64("SHAPES_STRIDE", 11 if fault else 37), env_u64("SHAPES_LIMIT", 4000), fault)
+_rs_sweep :: proc(t: ^testing.T, only: string, arm: Rs_Arm) {
+	failures, points := revert_shapes_crash_run(1, only, env_u64("SHAPES_STRIDE", 11 if arm == .Fault else 37), env_u64("SHAPES_LIMIT", 4000), arm)
 	for f, i in failures {
 		if u64(i) < env_u64("SHAPES_PRINT", 40) {
-			fmt.eprintf("revert_shapes_crash: %s\n", f)
+			fmt.eprintf("revert_shapes_crash: %v %s\n", arm, f)
 		}
 		delete(f)
 	}
-	fmt.eprintf("revert_shapes_crash: %d %s points, %d failures\n", points, "fault" if fault else "crash", len(failures))
+	fmt.eprintf("revert_shapes_crash: %v %d points, %d failures\n", arm, points, len(failures))
 	testing.expect(t, points > 0, "revert_shapes_crash: nothing crashed")
 	testing.expect(t, len(failures) == 0, "revert_shapes_crash failed")
 	delete(failures)

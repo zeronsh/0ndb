@@ -3319,7 +3319,7 @@ emit_modify :: proc(p: ^Pass, b: ^Builder, c: ^Change, e: Entry) -> Error {
 	ne := e
 	ne.stat = c.stat
 	ne.oid = oid
-	old_flags := tree_flags(h, e.inode)
+	old_flags := synced_flags(m, e.inode) or_return
 	exec := exec_bit(m, c.stat, .Exec in old_flags)
 	if exec != (.Exec in old_flags) {
 		builder_tree(b, fstree.Op_Set_Flags{inode = e.inode, mask = {.Exec}, value = {.Exec} if exec else {}})
@@ -3667,6 +3667,23 @@ tree_flags :: proc(h: ^History, inode: fstree.Inode_Id) -> fstree.Flags {
 		return {}
 	}
 	return n.flags
+}
+
+@(private)
+synced_flags :: proc(m: ^Mount, inode: fstree.Inode_Id) -> (flags: fstree.Flags, err: Error) {
+	h := m.history
+	lvs := make([dynamic]crdt.Lv, context.temp_allocator)
+	if crdt.graph_version_lvs(&h.g, m.synced[:], &lvs) != .None {
+		return {}, .Corrupt
+	}
+	if crdt.frontier_eq(lvs[:], h.g.heads[:]) {
+		return tree_flags(h, inode), .None
+	}
+	at, ok, ferr := fstree.flags_in(&h.tree, version_view(h, lvs[:]), inode)
+	if ferr != nil {
+		return {}, .Corrupt
+	}
+	return at if ok else tree_flags(h, inode), .None
 }
 
 @(private)

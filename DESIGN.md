@@ -893,7 +893,10 @@ equal in both directions.
   While a materialization is held, the image keeps its journal position, so
   recovery replays an own batch the held `synced` does not contain. Disk
   only ever holds content history can name after any crash. Ingest never reads an owed path that is missing on disk
-  as a delete, and the next pass that completes drains `absent`. A removal
+  as a delete, and the next pass that completes drains `absent`. A
+  changed file's mode is compared with its flags at `synced`, not in the
+  current tree, so a file the materialization has not reached yet (a racy
+  entry reread after a crash) never records the mode it is about to lose. A removal
   whose unlink fails fails its item, so its entry is never dropped while the
   file is still on disk. A pass whose line version is ahead of `synced`
   adopts a changed file whose content is its text at the line version (what
