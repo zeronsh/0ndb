@@ -262,6 +262,7 @@ _commit_write :: proc(p: ^Pack) -> (wrote: bool, err: Error) {
 	if p.poisoned {
 		return false, .Io
 	}
+	_img_settle_all(p) or_return
 	_emit_dirty(p) or_return
 	_collect_externals(p) or_return
 	if len(p.fl.fds) > 0 || p.dirsync_pending {
@@ -794,7 +795,7 @@ sync_async :: proc(p: ^Pack, done: Sync_Done, data: rawptr) -> Error {
 		return .None
 	}
 	urgent := _has_urgent(p) || _urgent_inflight(p) || len(p.cscan) > 0
-	pending := p.nrec > 0 || len(p.dirty) > 0 || len(p.ext_dirty) > 0 || _ext_open_dirty(p) || p.dirsync_pending
+	pending := p.nrec > 0 || p.img_dirty > 0 || len(p.dirty) > 0 || len(p.ext_dirty) > 0 || _ext_open_dirty(p) || p.dirsync_pending
 	target := p.seq if pending else (p.fl.seq if p.fl.on else 0)
 	if !urgent && (target == 0 || target <= p.durable_seq) {
 		if done != nil {
@@ -818,7 +819,7 @@ hold_unclean :: proc "contextless" (p: ^Pack, on: bool) {
 }
 
 pending :: proc(p: ^Pack) -> bool {
-	return p.nrec > 0 || len(p.dirty) > 0 || len(p.ext_dirty) > 0 || _ext_open_dirty(p) || p.dirsync_pending || len(p.zeros) > 0
+	return p.nrec > 0 || p.img_dirty > 0 || len(p.dirty) > 0 || len(p.ext_dirty) > 0 || _ext_open_dirty(p) || p.dirsync_pending || len(p.zeros) > 0
 }
 
 @(private)
