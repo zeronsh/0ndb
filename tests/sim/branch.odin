@@ -436,14 +436,33 @@ _br_watch :: proc(c: ^Br_Ctx) {
 }
 
 @(private = "file")
-_br_person_ops :: proc(c: ^Br_Ctx) -> u64 {
+_br_person_actor :: proc(c: ^Br_Ctx) -> prim.Id {
+	m := _br_mount(c)
+	if m == nil {
+		return {}
+	}
+	return m.actor
+}
+
+@(private = "file")
+_br_person_ops :: proc(c: ^Br_Ctx, actors: ..prim.Id) -> u64 {
 	m := _br_mount(c)
 	if m == nil || m.history == nil {
 		return 0
 	}
 	context = instance_context(&c.n.inst)
 	defer node_after(c.n)
-	return crdt.graph_known(&m.history.g, m.actor)
+	if fs.history_ready(m.history) != .None {
+		return 0
+	}
+	total: u64
+	for a, i in actors {
+		if a == {} || slice.contains(actors[:i], a) {
+			continue
+		}
+		total += crdt.graph_known(&m.history.g, a)
+	}
+	return total
 }
 
 @(private = "file")
@@ -481,6 +500,7 @@ _br_case :: proc(w: ^World, crash_switch: int, k: u64, arena: ^virtual.Arena, wa
 	c := _br_build(w, alloc) or_return
 	n := c.n
 	moves := 0
+	seen := make([dynamic]prim.Id, alloc)
 	for s in 0 ..< BR_SWITCHES {
 		to := c.u_b if s % 2 == 0 else c.u_a
 		if s == 0 {
@@ -506,7 +526,13 @@ _br_case :: proc(w: ^World, crash_switch: int, k: u64, arena: ^virtual.Arena, wa
 			run_until(w, w.now + 2_000_000_000, true)
 		}
 		crashes := w.stats.crashes
-		person := _br_person_ops(c)
+		if a := _br_person_actor(c); a != {} && !slice.contains(seen[:], a) {
+			append(&seen, a)
+		}
+		person := make([]u64, len(seen), alloc)
+		for a, i in seen {
+			person[i] = _br_person_ops(c, a)
+		}
 		if s == crash_switch && k > 0 {
 			n.disk.crash_at = n.disk.stats.ops + k
 		}
@@ -528,8 +554,16 @@ _br_case :: proc(w: ^World, crash_switch: int, k: u64, arena: ^virtual.Arena, wa
 			}
 			run_until(w, w.now + 10_000_000_000, true)
 		}
-		if after := _br_person_ops(c); after != person {
-			world_fail(w, "branch: after switch %d (crash at disk op %d of switch %d, answered %v) the mount wrote %d ops of its own: the materialized disk was ingested as a person's edit", s, k, crash_switch, _br_answer.set, after - person)
+		for a, i in seen {
+			if after := _br_person_ops(c, a); after != person[i] {
+				world_fail(w, "branch: after switch %d (crash at disk op %d of switch %d, answered %v) the mount's actor %v went from %d to %d ops: the materialized disk was taken as a person's edit", s, k, crash_switch, _br_answer.set, a, person[i], after)
+			}
+		}
+		if a := _br_person_actor(c); a != {} && !slice.contains(seen[:], a) {
+			if ops := _br_person_ops(c, a); ops > 0 {
+				world_fail(w, "branch: after switch %d (crash at disk op %d of switch %d) the mount's new actor %v has %d ops of its own", s, k, crash_switch, a, ops)
+			}
+			append(&seen, a)
 		}
 		st := _br_state(c) or_return
 		if record {

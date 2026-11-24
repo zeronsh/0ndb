@@ -446,6 +446,7 @@ Mount :: struct {
 	placed:      [dynamic]crdt.Op_Id,
 	has_placed:  bool,
 	mat_ready:   bool,
+	mat_fast:    bool,
 	dirty:       map[string]^Scope,
 	dirty_at:    map[string]i64,
 	rescan:      bool,
@@ -1111,6 +1112,11 @@ mount_placed :: proc(m: ^Mount) -> Version {
 		return m.placed[:]
 	}
 	return mount_synced(m)
+}
+
+mount_materialize_soon :: proc(m: ^Mount) {
+	m.mat_fast = true
+	mount_schedule(m, 0)
 }
 
 mount_take_ready :: proc(m: ^Mount) -> bool {
@@ -2283,7 +2289,7 @@ mount_durable_now :: proc(m: ^Mount) -> bool {
 		h.mark_fp = fp
 		h.content_mark = h.mark
 	}
-	if h.content_mark <= h.durable {
+	if (h.content_mark if m.mat_fast else h.mark) <= h.durable {
 		return true
 	}
 	if !m.mat_wait {
@@ -2374,7 +2380,7 @@ mount_settle :: proc(m: ^Mount) -> Error {
 @(private)
 mount_ack :: proc(m: ^Mount) -> Error {
 	h := m.history
-	if m.mat_wait && h.content_mark <= h.durable {
+	if m.mat_wait && (h.content_mark if m.mat_fast else h.mark) <= h.durable {
 		m.mat_wait = false
 		m.mat_ready = true
 		mount_schedule(m, 0)

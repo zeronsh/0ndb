@@ -102,6 +102,7 @@ _mount_materialize :: proc(m: ^Mount) -> (done: bool, err: Error) {
 	if merr != .None {
 		return false, merr
 	}
+	m.mat_fast = false
 	_mat_fire(m)
 	return true, mount_settle(m)
 }
