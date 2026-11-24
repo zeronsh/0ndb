@@ -68,6 +68,34 @@ _compact_blocked :: proc "contextless" (p: ^Pack) -> bool {
 }
 
 @(private)
+RECLAIM_WINDOWS :: 2
+
+@(private)
+RECLAIM_SLICE :: i64(256 * 1024)
+
+@(private)
+RECLAIM_SLICES :: 64
+
+@(private)
+_reclaim_owed :: proc "contextless" (p: ^Pack) -> bool {
+	if p.opts.compact_ratio <= 0 {
+		return false
+	}
+	owed: i64
+	for c, i in p.conts {
+		if i == p.active || c.id >= p.ck_cont {
+			continue
+		}
+		data := c.size - CONT_HDR
+		dead := data - max(c.live, 0)
+		if data > 0 && f64(dead) >= p.opts.compact_ratio * f64(data) {
+			owed += dead
+		}
+	}
+	return owed >= p.opts.log_window * RECLAIM_WINDOWS
+}
+
+@(private)
 _relocate :: proc(p: ^Pack, inum: u64, ino: ^Inode, src: Phys, src_bytes: []u8) -> Error {
 	if ino.kind != .File || ino.n == 0 {
 		return .None
@@ -254,6 +282,14 @@ step :: proc(p: ^Pack, budget: i64 = 4 * 1024 * 1024) -> (more: bool, err: Error
 	if p.fl.on {
 		return !_async(p) || _polled(p), .None
 	}
+	if _reclaim_owed(p) {
+		if _async(p) && !_polled(p) {
+			_reclaim(p) or_return
+		} else {
+			_compact_work(p, budget, false) or_return
+		}
+		return true, .None
+	}
 	if _mem_bytes(&p.mem) >= p.opts.mem_budget / 8 || p.log_since_ck >= p.opts.log_window / 8 || _compact_blocked(p) {
 		if _async(p) {
 			_flush_start(p) or_return
@@ -336,7 +372,7 @@ _shrink :: proc(p: ^Pack) {
 	}
 	p.filters_cold = true
 	for &c, i in p.conts {
-		if i != p.active && c.fd >= 0 && !c.dirty {
+		if i != p.active && c.fd >= 0 && !c.dirty && !c.lent {
 			prim.close_file(p.base, c.fd)
 			c.fd = prim.INVALID_FD
 		}
