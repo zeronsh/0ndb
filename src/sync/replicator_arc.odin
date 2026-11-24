@@ -528,7 +528,6 @@ _arc_want :: proc(r: ^Replicator, rm: ^Remote, from, to: i64) {
 	}
 	for &w in a.wants {
 		if w.from <= from && w.to >= to {
-			_arc_drive(r, rm)
 			return
 		}
 		if w.from <= to && from <= w.to {
@@ -911,32 +910,14 @@ _arc_apply :: proc(r: ^Replicator, rm: ^Remote, e: arc.Seal_Entry, body: []u8, k
 		return false
 	}
 	defer crypto.zero_explicit(raw_data(raw), len(raw))
-	chain := journal.Chain{keys = keys}
-	verr := arc.group_verify(&g, raw, &chain)
-	if verr != .None {
-		return false
-	}
 	if g.end == rm.arc.base && g.head_after != rm.arc.head {
 		return false
 	}
 	out := make([dynamic]u8, 0, int(g.end - g.first), context.temp_allocator)
-	cur: arc.Cursor
-	arc.cursor_init(&cur, &g, raw)
-	defer arc.cursor_destroy(&cur)
-	en: arc.Entry
-	for {
-		more, cerr := arc.cursor_next(&cur, &en)
-		if cerr != .None {
-			return false
-		}
-		if !more {
-			break
-		}
-		at := len(out)
-		resize(&out, at + int(journal.record_size(en.len)))
-		if arc.entry_record(&en, out[at:], keys, sealed) != .None {
-			return false
-		}
+	defer crypto.zero_explicit(raw_data(out[:]), len(out))
+	chain := journal.Chain{keys = keys}
+	if arc.group_records(&g, raw, &chain, keys, sealed, &out) != .None {
+		return false
 	}
 	if i64(len(out)) != g.end - g.first {
 		return false
@@ -944,7 +925,6 @@ _arc_apply :: proc(r: ^Replicator, rm: ^Remote, e: arc.Seal_Entry, body: []u8, k
 	if _stage_write(r, rm, g.first, out[:]) != .None {
 		return false
 	}
-	crypto.zero_explicit(raw_data(out[:]), len(out))
 	journal.replica_trust(&rm.rep, g.first, g.end)
 	_verified_add(rm, g.first, g.end)
 	_emit(r, Repl_Event{kind = .Grew, device = rm.device, name = rm.name, epoch = rm.epoch, stream = rm.id, from = g.first, to = g.end, length = rm.relay_len})

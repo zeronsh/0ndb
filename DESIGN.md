@@ -2953,7 +2953,9 @@ signs and unwraps on request, so the backend never holds raw key bytes.
   Attestation is a future `attest` plug in enrollment, not part of the
   default path.
 - **Threat model.** Relay or storage compromise reads nothing (content keys
-  never reach them; the log they see is identities and roles). Compromise of
+  never reach them; the log they see is identities and roles, and an
+  archive group's header shows what Segment archives lists as
+  relay-visible, including reseed boundaries inside the group). Compromise of
   the host plus the pool key reads what the pool can read (spaces with access
   Everything or its scope) and nothing else, and can enroll runners, which
   every device sees. A runner key outlives its sandbox by at most one lease:
@@ -3443,10 +3445,11 @@ Relay cost tracks the reachable information, not the activity. Items marked
   exists: offsets stay the record ids, and the archive reproduces every
   archived record's exact stored body at its original offset and length.
   The format (`src/arc`, built):
-  - *Group* record: kind 1, version, `first`, `end`, record count, the
+  - *Group* record: kind 1, version 2, `first`, `end`, record count, the
     segment chain heads before `first` and after `end`, mode (plain for
-    transparent spaces, sealed otherwise), the key-tree cell shift and a
-    16-byte random salt, then one zstd frame (level 19), sealed with
+    transparent spaces, sealed otherwise); when sealed, the key-tree cell
+    shift, a 16-byte random salt, the holes and the block tiling (below),
+    then one zstd frame (level 19), sealed with
     ChaCha20-Poly1305 under the group key with the header as associated
     data. The frame holds a metadata section (per record: kind and stored
     length; for a redacted record its 32-byte chain commitment; for a
@@ -3459,16 +3462,29 @@ Relay cost tracks the reachable information, not the activity. Items marked
     elided (kind and length only): they are not part of the chain, and the
     writer-signed archive replaces their role. Groups close at 1 MiB of
     raw content.
-  - *Group key*: BLAKE2b over the domain, `first`, `end` and the key of
-    every key-tree cell in `[first, end)` except the cells listed in the
-    header as already punctured when the group was built ("holes"), then
-    keyed BLAKE2b of the salt. Why redaction stays exact: (1) a redaction
-    of a record punctures every cell of its byte range in the writer's
-    tree (`keytree_puncture_except`, keeping only signature cells), and
-    puncturing is one-way: the punctured leaves and every GGM node above
-    them are deleted, so no state derived after the puncture can produce
-    them; (2) a group built before the redaction did not list those cells
-    as holes, so its key input includes their keys; (3) hence anyone who
+  - *Group key*: the header tiles the cells of `[first, end)` exactly with
+    the holes (cells already punctured when the group was built) and a list
+    of blocks, each an aligned power-of-two run of cells (start cell and
+    size in bits) that lies inside one node of the writer's key tree, so a
+    block never straddles a reseed boundary. The writer takes the maximal
+    such blocks of its held cells (`group_cover`), and a reader rejects a
+    header whose holes and blocks do not tile the range. The key is BLAKE2b
+    over the domain, `first`, `end` and, per block in order, its start,
+    size and GGM seed, then keyed BLAKE2b of the salt. A key tree is always
+    the aligned decomposition of the cells it holds within each seed
+    region (punctures, puncture-except and range grants keep that shape),
+    so a holder can derive a block's seed exactly when it holds every cell
+    of the block: the key is derivable by exactly the holders of every
+    non-hole cell, as when it folded every cell's key, at about 2·log₂(cells)
+    seeds per group instead of one per 16-byte cell (a 520 KB group: 19
+    blocks instead of 32,500 leaf keys). Why redaction stays exact: (1) a
+    redaction of a record punctures every cell of its byte range in the
+    writer's tree (`keytree_puncture_except`, keeping only signature
+    cells), and puncturing is one-way: the punctured leaves and every GGM
+    node above them are deleted, so no state derived after the puncture can
+    produce them, nor the seed of any block containing them; (2) a group
+    built before the redaction did not list those cells as holes, so one of
+    its blocks contains them; (3) hence anyone who
     only holds post-puncture state (every device once it follows the
     writer's keys stream, and the relay, which never held keys) cannot
     derive the group key, and the group's ciphertext is as dead as a
@@ -3486,6 +3502,14 @@ Relay cost tracks the reachable information, not the activity. Items marked
     design: a key from "the group's record keys" cannot be derived without
     knowing which records the group holds; the cell grid needs nothing but
     the range.
+  - *Relay-visible*: everything in a group's header is visible to the
+    relay and to anyone holding the archive stream: `first`, `end`, the
+    record count, the chain heads, the mode, shift and salt, the holes (the
+    relay already sees which ranges were redacted) and the block tiling.
+    The tiling also reveals where the writer's key tree was reseeded inside
+    the group, that is, at which byte offset the writer first appended in a
+    new epoch. Nothing about content, record boundaries inside the group or
+    keys.
   - *Seal* record: kind 2, `B`, the segment chain head at `B`, and the group
     index (first, end, archive offset per group, delta coded). A seal holds
     every entry since the last full seal and is full again once its delta
@@ -3512,7 +3536,11 @@ Relay cost tracks the reachable information, not the activity. Items marked
     a replacement of any redacted record. The replica persists the range
     as archive-verified (a trusted list in its `.have` sidecar) so chain
     checks there use the archive, not the elided signatures. Paging both
-    ways is unchanged.
+    ways is unchanged. Verification and materialization are one pass over
+    the group: each entry is folded into the chain and written out in wire
+    form as the cursor reaches it, so a per-record zstd body is rebuilt
+    once, and the replica is written only if the fold reaches
+    `head_after`.
   - Measured on a 4.16 MB synthetic tool-heavy transcript (2,769 messages,
     sequential repository source and agent text; zstd -3 1.03 MB, -19
     0.77 MB) recorded through `0ndb record`: the conversation segment's
@@ -3558,7 +3586,13 @@ Relay cost tracks the reachable information, not the activity. Items marked
   archive wants: the reader tails the writer's archive stream (an ordinary
   remote, chain-verified with the writer's identity and no keys), reads
   the last seal and the last full seal, fetches each covering group by
-  its offset and length, verifies and materializes it. A group that
+  its offset and length, verifies and materializes it. As on the relay
+  path, a want below the base covers the whole run the replica does not
+  hold from the wanted offset (up to the next held byte or the base), so
+  one missing record asks for every group of that run at once and they
+  are fetched together instead of one per record; an archive want already
+  covered by a pending one is not driven again (arrivals and every new
+  session drive it). A group that
   cannot be opened or verified (its key punctured, its record
   zero-filled, a forged fold) marks the range broken and the reader pulls
   it from peers. Measured end to end on the corpus above (2,769 `0ndb

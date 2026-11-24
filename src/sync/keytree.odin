@@ -433,11 +433,55 @@ keytree_open_record :: proc(t: ^Key_Tree, rec: []u8, off: i64) -> Error {
 }
 
 keytree_provider :: proc(t: ^Key_Tree) -> journal.Key_Provider {
-	return journal.Key_Provider{data = t, key = _keytree_provide, loaded = _keytree_loaded}
+	return journal.Key_Provider{data = t, key = _keytree_provide, loaded = _keytree_loaded, block = _keytree_block_provide, cover = _keytree_cover_provide}
 }
 
 static_provider :: proc(key: ^journal.Key) -> journal.Key_Provider {
-	return journal.Key_Provider{data = key, key = _static_provide}
+	return journal.Key_Provider{data = key, key = _static_provide, block = _static_block, cover = _static_cover}
+}
+
+keytree_block :: proc(t: ^Key_Tree, cell: u64, bits: u8) -> (key: [32]u8, ok: bool) {
+	if bits > t.depth || bits >= 63 {
+		return
+	}
+	size := u64(1) << bits
+	if cell & (size - 1) != 0 || (t.depth < 64 && (cell + size - 1) >> t.depth != 0) {
+		return
+	}
+	i := _keytree_find(t, cell)
+	if i < 0 {
+		return
+	}
+	n := t.nodes[i]
+	depth := int(t.depth)
+	target := depth - int(bits)
+	if int(n.level) > target || _node_last(t, n) < cell + size - 1 {
+		return
+	}
+	key = n.seed
+	for l in int(n.level) ..< target {
+		bit := (cell >> u64(depth - 1 - l)) & 1
+		left, right := _ggm(&key)
+		key = right if bit == 1 else left
+		crypto.zero_explicit(&left, size_of(left))
+		crypto.zero_explicit(&right, size_of(right))
+	}
+	return key, true
+}
+
+keytree_cover :: proc(t: ^Key_Tree, lo, hi: u64, out: ^[dynamic]journal.Cell_Run) {
+	if hi <= lo {
+		return
+	}
+	for n in t.nodes {
+		last := _node_last(t, n)
+		if last < lo || n.start >= hi {
+			continue
+		}
+		a := max(lo, n.start)
+		b := hi if last >= hi - 1 else last + 1
+		append(out, journal.Cell_Run{a, b})
+	}
 }
 
 object_position :: proc(sc: ^Scope, oid: []u8) -> u64 {
@@ -458,6 +502,36 @@ object_tree_key :: proc(t: ^Key_Tree, sc: ^Scope, oid: []u8) -> (key: [32]u8, ok
 object_tree_shred :: proc(t: ^Key_Tree, sc: ^Scope, oid: []u8) -> Error {
 	p := object_position(sc, oid)
 	return keytree_puncture_cells(t, p, p)
+}
+
+@(private)
+_keytree_block_provide :: proc(data: rawptr, cell: u64, bits: u8, out: ^journal.Key) -> bool {
+	k, ok := keytree_block(cast(^Key_Tree)data, cell, bits)
+	if ok {
+		out^ = k
+	}
+	crypto.zero_explicit(&k, size_of(k))
+	return ok
+}
+
+@(private)
+_keytree_cover_provide :: proc(data: rawptr, lo, hi: u64, out: ^[dynamic]journal.Cell_Run) -> bool {
+	keytree_cover(cast(^Key_Tree)data, lo, hi, out)
+	return true
+}
+
+@(private)
+_static_block :: proc(data: rawptr, cell: u64, bits: u8, out: ^journal.Key) -> bool {
+	out^ = (cast(^journal.Key)data)^
+	return true
+}
+
+@(private)
+_static_cover :: proc(data: rawptr, lo, hi: u64, out: ^[dynamic]journal.Cell_Run) -> bool {
+	if hi > lo {
+		append(out, journal.Cell_Run{lo, hi})
+	}
+	return true
 }
 
 @(private)
