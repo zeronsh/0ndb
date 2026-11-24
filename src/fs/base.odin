@@ -722,6 +722,19 @@ rebase_commit :: proc(p: ^Pass, c: ^Change, v: []crdt.Op_Id, inode: fstree.Inode
 	old := history_text_at(h, inode, v, context.temp_allocator) or_return
 	actor := who
 	landed: crdt.Op_Id
+	if event && c.kind == .Modify && c.old.inode == inode && string(old) == string(data) {
+		ne := c.old
+		ne.stat = c.stat
+		ne.oid = oid
+		vids := make([]fstree.Op_Id, len(v), context.temp_allocator)
+		for id, i in v {
+			vids[i] = op_inode(h, id)
+		}
+		ne.ver = shadow_version_add(&m.shadow, vids) or_return
+		shadow_put(&m.shadow, c.path, ne) or_return
+		attrib_set(m, c.path, who, true, {}, c.scope_id)
+		return true, .None
+	}
 	if event {
 		actor = event_actor(m, who, v, _event_digest(inode_op(h, inode), data)) or_return
 		if known := crdt.graph_known(&h.g, actor); known > 0 {
