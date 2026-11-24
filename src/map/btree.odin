@@ -62,6 +62,7 @@ Db :: struct {
 	mu:        sync.Mutex,
 	published: u64,
 	pub_slot:  int,
+	pub_ordered: bool,
 	pub_wait:  int,
 }
 
@@ -545,27 +546,40 @@ db_publish_take :: proc(db: ^Db) -> (m: Meta, ok: bool) {
 	return db.meta, ok
 }
 
-db_publish_run :: proc(db: ^Db, m: ^Meta) -> Error {
+db_publish_run :: proc(db: ^Db, m: ^Meta, order_only := false) -> Error {
 	sync.mutex_lock(&db.mu)
 	defer sync.mutex_unlock(&db.mu)
-	return _publish_locked(db, m)
+	return _publish_locked(db, m, order_only)
 }
 
-db_publish_done :: proc(db: ^Db, ok: bool) {
+db_publish_done :: proc(db: ^Db, ok: bool, durable := true) {
 	if db.pub_wait > 0 {
 		db.pub_wait -= 1
 	}
 	if !ok {
 		db.poisoned = true
+		return
 	}
+	if !durable {
+		return
+	}
+	sync.mutex_lock(&db.mu)
+	db.pub_ordered = false
+	sync.mutex_unlock(&db.mu)
 }
 
 @(private)
-_publish_locked :: proc(db: ^Db, m: ^Meta) -> Error {
+_publish_locked :: proc(db: ^Db, m: ^Meta, order_only := false) -> Error {
 	if db.fd < 0 {
 		return .Io
 	}
 	if m.txn <= db.published {
+		if !order_only && db.pub_ordered {
+			if err := prim.datasync(db.vfs, db.fd); err != .None {
+				return obj.perr(err)
+			}
+			db.pub_ordered = false
+		}
 		return .None
 	}
 	if err := prim.barrier(db.vfs, db.fd); err != .None {
@@ -573,11 +587,13 @@ _publish_locked :: proc(db: ^Db, m: ^Meta) -> Error {
 	}
 	slot := 1 - db.pub_slot
 	_meta_write_slot(db.vfs, db.fd, m, slot) or_return
-	if err := prim.datasync(db.vfs, db.fd); err != .None {
-		return obj.perr(err)
+	serr := prim.barrier(db.vfs, db.fd) if order_only else prim.datasync(db.vfs, db.fd)
+	if serr != .None {
+		return obj.perr(serr)
 	}
 	db.published = m.txn
 	db.pub_slot = slot
+	db.pub_ordered = order_only
 	return .None
 }
 
