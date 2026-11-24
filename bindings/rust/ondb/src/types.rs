@@ -372,33 +372,6 @@ pub struct Event {
     pub last_runner: Option<Id>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct RedactUnreached {
-    pub reason: String,
-    pub blob: String,
-    pub ref_name: String,
-    pub commit: String,
-    pub place: String,
-}
-
-impl Event {
-    pub fn redact_unreached(&self) -> Option<RedactUnreached> {
-        if self.kind != "redact_unreached" {
-            return None;
-        }
-        let mut it = self.detail.split('\n');
-        let reason = it.next()?.to_string();
-        let blob = it.next()?.to_string();
-        Some(RedactUnreached {
-            reason,
-            blob,
-            ref_name: it.next().unwrap_or("").to_string(),
-            commit: it.next().unwrap_or("").to_string(),
-            place: it.next().unwrap_or("").to_string(),
-        })
-    }
-}
-
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Placement {
