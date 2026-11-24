@@ -203,6 +203,11 @@ _named_crash :: proc(w: ^World, arm: Named_Arm, crash_at: u64) -> (res: Named_Re
 			world_fail(w, "named: register the agent: %v", err)
 			return
 		}
+		at, _ := eng.tree_version(&n.e, tree, "main", context.temp_allocator)
+		if err := eng.tree_write(&n.e, tree, "d.txt", transmute([]u8)string("d\n"), at, "main"); err != .None {
+			world_fail(w, "named: write after the registration: %v", err)
+			return
+		}
 		node_after(n)
 	}
 	run_until(w, w.now + 2_000_000_000, true)
