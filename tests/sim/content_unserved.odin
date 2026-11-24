@@ -11,6 +11,8 @@ STAT_CU_RUNS: Stat
 STAT_CU_REFUSED: Stat
 @(private = "file")
 STAT_CU_DONE: Stat
+@(private = "file")
+STAT_CU_QUIET: Stat
 
 @(private = "file")
 _cu_served :: proc(n: ^Node, allocator := context.temp_allocator) -> map[odb.Oid]bool {
@@ -192,27 +194,31 @@ check_content_unserved :: proc(w: ^World) {
 		}
 		node_after(h)
 	}
-	for c in h.conns {
-		conn_reset(c, true)
-	}
-	run_until(w, w.now + 30_000_000_000, true)
+	presence := w.stats.resets
+	fetched := false
 	for _ in 0 ..< 6 {
-		{
-			context = instance_context(&r.inst)
-			got, rerr := eng.tree_read(&r.e, o, name, context.temp_allocator, {}, line)
-			if rerr == .None {
-				if string(got) != want {
-					world_fail(w, "content unserved: %s read %d bytes of %s/%s, %d written", r.name, len(got), id_short(o.id), name, len(want))
-				}
-				stat_add(w, STAT_CU_DONE)
-				return
-			}
-		}
 		run_until(w, w.now + 30_000_000_000, true)
+		context = instance_context(&r.inst)
+		if waiting, _ := _cu_waiting(r, fresh[:]); !waiting {
+			fetched = true
+			break
+		}
 	}
 	context = instance_context(&r.inst)
-	_, inflight := _cu_waiting(r, fresh[:])
-	world_fail(w, "content unserved: %s never read %s/%s after its only holder %s became servable (wait inflight %v)", r.name, id_short(o.id), name, h.name, inflight)
+	if !fetched {
+		_, inflight := _cu_waiting(r, fresh[:])
+		world_fail(w, "content unserved: %s's parked wait on %s/%s never completed after its only holder %s became servable with no presence change and no new read (wait inflight %v)", r.name, id_short(o.id), name, h.name, inflight)
+		return
+	}
+	got, rerr := eng.tree_read(&r.e, o, name, context.temp_allocator, {}, line)
+	if rerr != .None || string(got) != want {
+		world_fail(w, "content unserved: %s read %d bytes of %s/%s (%v) after its wait completed, %d written", r.name, len(got), id_short(o.id), name, rerr, len(want))
+		return
+	}
+	if w.stats.resets == presence {
+		stat_add(w, STAT_CU_QUIET)
+	}
+	stat_add(w, STAT_CU_DONE)
 }
 
 @(init)
@@ -222,4 +228,5 @@ _content_unserved_register :: proc "contextless" () {
 	STAT_CU_RUNS = register_stat(35, 0, "runs")
 	STAT_CU_REFUSED = register_stat(35, 1, "refused")
 	STAT_CU_DONE = register_stat(35, 2, "done")
+	STAT_CU_QUIET = register_stat(35, 3, "quiet")
 }

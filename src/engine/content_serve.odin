@@ -37,6 +37,7 @@ _serve_register :: proc(e: ^Engine, h: ^Handle, refs: []fs.Content_Ref) {
 		_reg_fail(e, _oerr(terr))
 		return
 	}
+	served := make([dynamic]osync.Object_Key, context.temp_allocator)
 	for ref in refs {
 		_, size, herr := odb.read_header(db, ref.oid)
 		if herr != .None {
@@ -60,15 +61,20 @@ _serve_register :: proc(e: ^Engine, h: ^Handle, refs: []fs.Content_Ref) {
 			buf[49] = u8(ref.len)
 			copy(buf[50:], oid[:ref.len])
 			w := 50 + ref.len
-			k := _serve_key(osync.object_part_index(key, p))
+			pk := osync.object_part_index(key, p)
+			k := _serve_key(pk)
 			if omap.txn_put(t, ROOT_OWNED, k[:], buf[:w]) != .None {
 				omap.txn_abort(t)
 				_reg_fail(e, .Io)
 				return
 			}
+			append(&served, pk)
 		}
 	}
 	_reg_commit(e, t)
+	if h.sp.repl_on {
+		osync.replicator_objects_servable(&h.sp.repl, served[:])
+	}
 }
 
 @(private)
