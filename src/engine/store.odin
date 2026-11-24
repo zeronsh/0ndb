@@ -1,5 +1,9 @@
 package engine
 
+import "core:time"
+
+import "core:fmt"
+
 import "base:runtime"
 import "core:crypto"
 import "core:slice"
@@ -660,6 +664,7 @@ _batch_complete :: proc(e: ^Engine, b: ^Durable_Batch, err: Error) {
 		_fatal(e, err)
 	} else {
 		e.durable_seq = max(e.durable_seq, b.seq)
+		fmt.eprintfln("TIMING durable %d %d", b.seq, time.tick_now()._nsec / 1000)
 		if e.fatal == .None {
 			for _, h in e.handles {
 				_table_publish(e, h)

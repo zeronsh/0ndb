@@ -1,5 +1,9 @@
 package engine
 
+import "core:time"
+
+import "core:fmt"
+
 import "base:runtime"
 import "core:slice"
 import "core:strings"
@@ -49,6 +53,7 @@ _move_waits_run :: proc(e: ^Engine) {
 	for i := 0; i < len(e.move_waits); {
 		mw := e.move_waits[i]
 		done, err := _cu_on_disk(e, mw.o, mw.move)
+		fmt.eprintfln("TIMING ondisk check %v %d", done, time.tick_now()._nsec / 1000)
 		if err != .None || done {
 			ordered_remove(&e.move_waits, i)
 			append(&fire, Move_Wait{o = mw.o, move = mw.move, ready = Ready{data = mw.ready.data, call = mw.ready.call, fresh = err == .None}})
@@ -440,6 +445,8 @@ _cu_drive_new :: proc(e: ^Engine, o: Object, move: prim.Id) -> Error {
 
 convo_undo_drive :: proc(e: ^Engine, o: Object, undo: prim.Id) -> Error {
 	context = context_for(e)
+	fmt.eprintfln("TIMING drive start %d", time.tick_now()._nsec / 1000)
+	defer fmt.eprintfln("TIMING drive end %d", time.tick_now()._nsec / 1000)
 	st, found := _cu_undo_state(e, o, undo) or_return
 	if !found {
 		return .Not_Found

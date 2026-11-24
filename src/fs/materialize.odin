@@ -1,5 +1,9 @@
 package fs
 
+import "core:time"
+
+import "core:fmt"
+
 import "base:runtime"
 import "core:crypto/blake2b"
 import "core:slice"
@@ -86,7 +90,9 @@ _mount_materialize :: proc(m: ^Mount) -> (done: bool, err: Error) {
 		return false, .None
 	}
 	m.mat_ingest = true
+	t0 := time.tick_now()
 	merr := materialize_to(m, target, false)
+	fmt.eprintfln("TIMING materialize_to %v took %v at %d", merr, time.tick_diff(t0, time.tick_now()), time.tick_now()._nsec / 1000)
 	m.mat_ingest = false
 	if merr == .Deferred {
 		return false, .None
@@ -94,7 +100,10 @@ _mount_materialize :: proc(m: ^Mount) -> (done: bool, err: Error) {
 	if merr != .None {
 		return false, merr
 	}
-	return true, mount_settle(m)
+	t1 := time.tick_now()
+	serr := mount_settle(m)
+	fmt.eprintfln("TIMING settle took %v", time.tick_diff(t1, time.tick_now()))
+	return true, serr
 }
 
 @(private)
