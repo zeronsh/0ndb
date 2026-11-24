@@ -114,6 +114,7 @@ M_Op :: struct {
 	gens:    [dynamic]string,
 	power_crash: bool,
 	line:    string,
+	turns:   [dynamic]prim.Id,
 }
 
 M_Move :: struct {
@@ -348,6 +349,20 @@ new_op :: proc(m: ^Model, kind: Op_Kind, n: ^Node, obj: int) -> ^M_Op {
 	op.tokens = make([dynamic]string, a)
 	op.deletes = make([dynamic]string, a)
 	op.gens = make([dynamic]string, a)
+	op.turns = make([dynamic]prim.Id, a)
+	if kind == .Disk_Person && n.e_open {
+		for x in n.mounts {
+			if x.oi != obj || x.m == nil {
+				continue
+			}
+			#reverse for s in n.reg.scopes {
+				if s.mount == x.m && !s.closed {
+					append(&op.turns, s.actor)
+					break
+				}
+			}
+		}
+	}
 	if obj >= 0 && obj < len(m.objs) && m.objs[obj].kind == .Tree && n.e_open {
 		op.line = strings.clone(line_norm(eng.tree_line(&n.e, m.objs[obj].o)), a)
 	}

@@ -184,7 +184,7 @@ _to_tool :: proc(c: ^To_Ctx, name, data: string, named: bool) {
 		defer node_after(n)
 		tool = fs.scope_open(n.reg, m, prim.id_new_with(node_clock(&n.clock), rng_random(&c.w.rng)), c.agent, nil, fs.Observe_Since{mono = prim.clock_mono_ns(n.e.cfg.clock), wall = prim.clock_wall_ns(n.e.cfg.clock)})
 		if named {
-			n.writers[abs] = Writer_Info{scope = tool, agent = true}
+			_writer_set(c.w, n, abs, Writer_Info{scope = tool, agent = true})
 			fs.mount_observe_begin(m, name, tool)
 		}
 	}

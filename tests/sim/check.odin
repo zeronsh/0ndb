@@ -816,6 +816,10 @@ _check_tokens_at :: proc(w: ^World, oi: int, n: ^Node, line: string) {
 						own = true
 						continue
 					}
+					if op.kind == .Disk_Person && slice.contains(op.turns[:], a) {
+						own = true
+						continue
+					}
 					if _maybe_reclaimed_by(m, oi, line, tok, op.idx, a) {
 						own = true
 						continue

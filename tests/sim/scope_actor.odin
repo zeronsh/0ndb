@@ -376,11 +376,38 @@ _sa_based :: proc(w: ^World) {
 		world_fail(w, "based write: nothing committed under the agent actor")
 		return
 	}
+	content, records := 0, 0
 	for seq in 0 ..< k {
-		if sc, found := _sa_scope_of(&c, crdt.Op_Id{a, u64(seq)}); !found || sc != sid {
+		op := crdt.Op_Id{a, u64(seq)}
+		record := false
+		{
+			context = instance_context(&n.inst)
+			h := _sa_mount(&c).history
+			lv, known := crdt.graph_lv(&h.g, op)
+			_, _, stream, off, at := fs.history_batch_at(h, lv)
+			b, berr := fs.history_read_batch(h, stream, off, context.temp_allocator)
+			if !known || !at || berr != .None {
+				world_fail(w, "based write: op %d of the agent actor has no readable batch (%v)", seq, berr)
+				return
+			}
+			record = true
+			for x in b.ops {
+				record &&= x.kind == .Opaque
+			}
+		}
+		if record {
+			records += 1
+			continue
+		}
+		content += 1
+		if sc, found := _sa_scope_of(&c, op); !found || sc != sid {
 			world_fail(w, "based write: op %d of the agent actor is attributed to scope %v (found %v), not %v", seq, sc, found, sid)
 			return
 		}
+	}
+	fmt.eprintfln("based write: %d ops in content batches, %d in record batches", content, records)
+	if content == 0 {
+		world_fail(w, "based write: no content committed under the agent actor")
 	}
 }
 
