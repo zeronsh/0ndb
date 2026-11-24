@@ -1436,7 +1436,7 @@ attribute_changes :: proc(p: ^Pass) -> Error {
 		matched, broken, gone := false, false, false
 		replayed := false
 		cur := c.old.oid if c.kind == .Modify else odb.Oid{}
-		for st in steps {
+		for st in steps_pending(steps[:], cur) {
 			if st.oid == cur {
 				continue
 			}
@@ -1509,7 +1509,19 @@ attrib_chain_settle :: proc(p: ^Pass) {
 }
 
 @(private)
-replay_departing :: proc(m: ^Mount, long: runtime.Allocator) -> Error {
+steps_pending :: proc(steps: []Attrib_Step, shown: odb.Oid) -> []Attrib_Step {
+	if shown != {} {
+		#reverse for st, i in steps {
+			if st.oid == shown {
+				return steps[i + 1:]
+			}
+		}
+	}
+	return steps
+}
+
+@(private)
+replay_departing :: proc(m: ^Mount, long: runtime.Allocator, replayed: ^map[fstree.Inode_Id]bool) -> Error {
 	if m.history == nil || m.db == nil || len(m.attrib_chain) == 0 {
 		return .None
 	}
@@ -1536,7 +1548,7 @@ replay_departing :: proc(m: ^Mount, long: runtime.Allocator) -> Error {
 		}
 		c := Change{kind = .Modify, path = path, disk = .File, old = e}
 		cur := e.oid
-		for st in steps {
+		for st in steps_pending(steps, e.oid) {
 			if st.oid == cur {
 				continue
 			}
@@ -1547,6 +1559,10 @@ replay_departing :: proc(m: ^Mount, long: runtime.Allocator) -> Error {
 				break
 			}
 			cur = st.oid
+			replayed[e.inode] = true
+		}
+		if a, has := m.attrib[path]; has && !a.used && a.oid == cur {
+			attrib_set(m, path, a.actor, true, a.oid, a.scope, a.base)
 		}
 	}
 	return .None
@@ -1840,8 +1856,9 @@ mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> (err: Error) {
 			delete(m.branch, m.allocator)
 			m.branch, _ = clone_string(key, m.allocator)
 			if follow {
-				replay_departing(m, p.long) or_return
-				line_follow(m, key) or_return
+				replayed := make(map[fstree.Inode_Id]bool, p.long)
+				replay_departing(m, p.long, &replayed) or_return
+				line_follow(m, key, replayed) or_return
 				p.git_wrote = true
 			}
 		}
@@ -2071,7 +2088,7 @@ shown_with_own :: proc(m: ^Mount, line: string, row: Version) -> (v: Version, er
 }
 
 @(private)
-line_follow :: proc(m: ^Mount, key: string) -> Error {
+line_follow :: proc(m: ^Mount, key: string, replayed: map[fstree.Inode_Id]bool) -> Error {
 	h := m.history
 	shown_put(&m.shown, m.line, m.synced[:], m.allocator)
 	v, found := history_line(h, key, context.temp_allocator) or_return
@@ -2082,7 +2099,7 @@ line_follow :: proc(m: ^Mount, key: string) -> Error {
 		if row, ok := shown_version(m, key, v); ok {
 			target = shown_with_own(m, key, row) or_return
 		}
-		line_retarget(m, target) or_return
+		line_retarget(m, target, replayed) or_return
 	}
 	delete(m.line, m.allocator)
 	m.line, _ = clone_string(key, m.allocator)
@@ -2090,18 +2107,21 @@ line_follow :: proc(m: ^Mount, key: string) -> Error {
 }
 
 @(private)
-line_retarget :: proc(m: ^Mount, target: Version) -> Error {
+line_retarget :: proc(m: ^Mount, target: Version, replayed: map[fstree.Inode_Id]bool) -> Error {
 	h := m.history
 	sl := make([dynamic]crdt.Lv, context.temp_allocator)
 	tl := make([dynamic]crdt.Lv, context.temp_allocator)
 	if crdt.graph_version_lvs(&h.g, m.synced[:], &sl) != .None || crdt.graph_version_lvs(&h.g, target, &tl) != .None {
 		return .Corrupt
 	}
-	if !crdt.frontier_eq(sl[:], tl[:]) {
+	if !crdt.frontier_eq(sl[:], tl[:]) || len(replayed) > 0 {
 		only_a := make([dynamic]crdt.Lv_Span, context.temp_allocator)
 		only_b := make([dynamic]crdt.Lv_Span, context.temp_allocator)
 		crdt.graph_diff(&h.g, sl[:], tl[:], &only_a, &only_b)
 		touched := make(map[fstree.Inode_Id]bool, context.temp_allocator)
+		for ino in replayed {
+			touched[ino] = true
+		}
 		spans_touched(h, only_a[:], &touched) or_return
 		spans_touched(h, only_b[:], &touched) or_return
 		snap := version_snapshot(h, tl[:]) or_return
