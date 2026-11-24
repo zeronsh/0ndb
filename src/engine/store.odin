@@ -350,7 +350,7 @@ _rec_put :: proc(e: ^Engine, id: prim.Id, rec: ^Obj_Rec) -> Error {
 	delete_key(&e.reg.early, id)
 	if !rec.own {
 		delete_key(&e.reg.hold, id)
-	} else if !was_own {
+	} else if !was_own && false {
 		if _, held := e.reg.hold[id]; !held {
 			e.reg.hold[id] = e.batch_seq + 1
 		}

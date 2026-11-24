@@ -396,7 +396,7 @@ _map_table :: proc(e: ^Engine, h: ^Handle) -> Error {
 	} else {
 		_oerr(omap.table_open(&h.table, e.vfs, path, nil, e.allocator)) or_return
 	}
-	h.table.db.tag_of = _table_tag
+	h.table.db.tag_of = nil
 	h.table.db.tag_data = e
 	h.table_open = true
 	return .None
