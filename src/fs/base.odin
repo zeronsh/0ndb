@@ -14,7 +14,7 @@ Base_Note :: enum u8 {
 	Not_Text,
 }
 
-Base_Proc :: #type proc(m: ^Mount, rel: string, note: Base_Note, data: rawptr)
+Base_Proc :: #type proc(m: ^Mount, rel: string, note: Base_Note, actor: prim.Id, data: rawptr)
 
 registry_set_base_note :: proc(reg: ^Registry, cb: Base_Proc, data: rawptr) {
 	reg.on_base = cb
@@ -369,9 +369,9 @@ scope_unhold :: proc(s: ^Scope) -> (released: bool) {
 }
 
 @(private)
-_base_note :: proc(m: ^Mount, rel: string, note: Base_Note) {
+_base_note :: proc(m: ^Mount, rel: string, note: Base_Note, actor: prim.Id) {
 	if m.reg != nil && m.reg.on_base != nil {
-		m.reg.on_base(m, rel, note, m.reg.base_data)
+		m.reg.on_base(m, rel, note, actor, m.reg.base_data)
 	}
 }
 
@@ -556,7 +556,7 @@ rebase_changes :: proc(p: ^Pass) -> Error {
 		}
 		if c.disk != .File || c.moved != "" || (c.kind != .Modify && c.kind != .Create) || (c.kind == .Modify && c.old.kind != .File) {
 			_change_pin_drop(m, &c, observed)
-			_base_note(m, c.path, .Mismatch)
+			_base_note(m, c.path, .Mismatch, actor)
 			append(&keep, c)
 			continue
 		}
@@ -587,13 +587,13 @@ rebase_changes :: proc(p: ^Pass) -> Error {
 			}
 			if fell {
 				_change_pin_drop(m, &c, observed)
-				_base_note(m, c.path, .Mismatch)
+				_base_note(m, c.path, .Mismatch, actor)
 			}
 		}
 		if v == nil {
 			if pinned {
 				_change_pin_drop(m, &c, observed)
-				_base_note(m, c.path, .Mismatch)
+				_base_note(m, c.path, .Mismatch, actor)
 			}
 			append(&keep, c)
 			continue
@@ -602,19 +602,19 @@ rebase_changes :: proc(p: ^Pass) -> Error {
 		sl := make([dynamic]crdt.Lv, context.temp_allocator)
 		if crdt.graph_version_lvs(&h.g, v, &vl) != .None || crdt.graph_version_lvs(&h.g, m.synced[:], &sl) != .None {
 			_change_pin_drop(m, &c, observed)
-			_base_note(m, c.path, .Mismatch)
+			_base_note(m, c.path, .Mismatch, actor)
 			append(&keep, c)
 			continue
 		}
 		if c.kind == .Modify && inode == c.old.inode && crdt.frontier_eq(vl[:], sl[:]) {
 			_change_pin_drop(m, &c, observed)
-			_base_note(m, c.path, .Current)
+			_base_note(m, c.path, .Current, actor)
 			append(&keep, c)
 			continue
 		}
 		if _off_line(m, vl[:], sl[:]) {
 			_change_pin_drop(m, &c, observed)
-			_base_note(m, c.path, .Mismatch)
+			_base_note(m, c.path, .Mismatch, actor)
 			append(&keep, c)
 			continue
 		}
@@ -629,7 +629,7 @@ rebase_changes :: proc(p: ^Pass) -> Error {
 				continue
 			}
 			_change_pin_drop(m, &c, observed)
-			_base_note(m, c.path, .Mismatch)
+			_base_note(m, c.path, .Mismatch, actor)
 			append(&keep, c)
 			continue
 		}
@@ -641,11 +641,11 @@ rebase_changes :: proc(p: ^Pass) -> Error {
 		}
 		_change_pin_drop(m, &c, observed)
 		if !done {
-			_base_note(m, c.path, .Not_Text)
+			_base_note(m, c.path, .Not_Text, actor)
 			append(&keep, c)
 			continue
 		}
-		_base_note(m, c.path, .Merged)
+		_base_note(m, c.path, .Merged, actor)
 	}
 	clear(&p.changes)
 	append(&p.changes, ..keep[:])
