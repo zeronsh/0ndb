@@ -377,16 +377,6 @@ _registry_drop_space :: proc(e: ^Engine, space: prim.Id, objs: map[prim.Id]bool)
 	s := space
 	_oerr(omap.db_scan(&e.reg.db, ROOT_OWNED, s[:], s[:], &owned, collect)) or_return
 	_oerr(omap.db_scan(&e.reg.db, ROOT_GRANTS, s[:], s[:], &grants, collect)) or_return
-	seals := Keys{keys = make([dynamic][]u8, context.temp_allocator)}
-	for oid in objs {
-		for tag in ([]u8{SEAL_KEY, SEAL_COVER}) {
-			pfx: [17]u8
-			o := oid
-			pfx[0] = tag
-			copy(pfx[1:], o[:])
-			_oerr(omap.db_scan(&e.reg.db, ROOT_CKPT, pfx[:], pfx[:], &seals, collect)) or_return
-		}
-	}
 	t, terr := omap.txn_begin(&e.reg.db)
 	if terr != .None {
 		return _oerr(terr)
@@ -409,11 +399,6 @@ _registry_drop_space :: proc(e: ^Engine, space: prim.Id, objs: map[prim.Id]bool)
 	}
 	for k in grants.keys {
 		if _, derr := omap.txn_delete(t, ROOT_GRANTS, k); derr != .None {
-			ok = false
-		}
-	}
-	for k in seals.keys {
-		if _, derr := omap.txn_delete(t, ROOT_CKPT, k); derr != .None {
 			ok = false
 		}
 	}

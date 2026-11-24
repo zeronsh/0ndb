@@ -460,9 +460,9 @@ pub const EVENT_NAMES: [&str; 35] = [
     "lease_lapsed",
     "space_left",
     "line_switched",
-    "replica_redacted",
+    "reserved",
     "rename_offered",
-    "redact_unreached",
+    "reserved",
     "models_changed",
     "authors_resolved",
 ];

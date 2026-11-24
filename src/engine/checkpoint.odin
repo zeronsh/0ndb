@@ -111,58 +111,6 @@ checkpoint_tree :: proc(scope: ^osync.Scope, id: prim.Id, t: ^osync.Key_Tree) ->
 }
 
 @(private)
-_ckpt_del :: proc(e: ^Engine, id: prim.Id) {
-	k := id
-	t, terr := omap.txn_begin(&e.reg.db)
-	if terr != .None {
-		_reg_fail(e, _oerr(terr))
-		return
-	}
-	if _, derr := omap.txn_delete(t, ROOT_CKPT, k[:]); derr != .None {
-		omap.txn_abort(t)
-		_reg_fail(e, .Io)
-		return
-	}
-	_reg_commit(e, t)
-	e.reg.meta = true
-}
-
-@(private)
-_ckpt_purge :: proc(e: ^Engine, h: ^Handle) {
-	dir, derr := _obj_dir(e, h.id)
-	if derr != .None {
-		return
-	}
-	if p, jerr := _join(context.temp_allocator, dir, "bundle.tmp"); jerr == .None {
-		prim.remove(e.vfs, p)
-	}
-	if !_ckpt_waiting(h) {
-		if p, jerr := _join(context.temp_allocator, dir, "bundle.in"); jerr == .None {
-			prim.remove(e.vfs, p)
-		}
-	}
-	_, oid, found := _ckpt_get(e, h.id)
-	if !found {
-		return
-	}
-	if oid != {} {
-		ph := _oid_name(oid)
-		if p, jerr := _join(context.temp_allocator, dir, string(ph[:])); jerr == .None {
-			prim.remove(e.vfs, p)
-		}
-		if h.sp.repl_on {
-			tree: osync.Key_Tree
-			if _ckpt_tree(&h.scope, h.id, &tree) == .None {
-				o := oid
-				osync.replicator_shred_object(&h.sp.repl, &h.scope, &tree, o[:])
-				osync.keytree_destroy(&tree)
-			}
-		}
-	}
-	_ckpt_del(e, h.id)
-}
-
-@(private)
 _checkpoints_write :: proc(e: ^Engine) {
 	for h in e.lru {
 		if (h.kind != .Text && h.kind != .File_Tree) || !h.w_open || h.hist == nil || !h.hist.awake || !h.sp.repl_on || !h.sp.connected {
