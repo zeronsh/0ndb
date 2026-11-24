@@ -63,9 +63,6 @@ builtin_defs :: proc(r: ^Runtime, a: ^Agent_Info, out: ^[dynamic]model.Tool_Def,
 	if .History in a.builtins {
 		tools += {.History_Search}
 	}
-	if .Redact in a.builtins {
-		tools += {.Redact}
-	}
 	for t in mcp.Catalog_Tool {
 		if t in tools {
 			e := mcp.catalog_entry(t)
