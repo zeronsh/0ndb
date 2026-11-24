@@ -699,12 +699,14 @@ history_ahead :: proc(h: ^History, fix: bool) -> (ahead: bool, err: Error) {
 			hi = mid
 		}
 	}
-	if lo == 0 {
-		return end > 0, .None
-	}
-	got, rerr := prim.read_at(h.vfs, h.lvidx, b[:], i64((lo - 1) * LVIDX_REC))
-	if rerr != .None || got != LVIDX_REC || prim.get_u64le(b[0:8]) + u64(prim.get_u32le(b[12:16])) != end {
+	if lo == 0 && end > 0 {
 		return true, .None
+	}
+	if lo > 0 {
+		got, rerr := prim.read_at(h.vfs, h.lvidx, b[:], i64((lo - 1) * LVIDX_REC))
+		if rerr != .None || got != LVIDX_REC || prim.get_u64le(b[0:8]) + u64(prim.get_u32le(b[12:16])) != end {
+			return true, .None
+		}
 	}
 	if lo < h.lvidx_n {
 		if !fix {
