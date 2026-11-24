@@ -94,7 +94,7 @@ buffer_cursors :: proc(e: ^Engine, id: Buffer_Id, rev: u64, ranges: []Cursor_Ran
 @(private)
 _cursors_publish :: proc(e: ^Engine, b: ^Buffer, h: ^Handle, ranges: [][2]Anchor) {
 	b.mine_seq += 1
-	_cursors_local(e, b.object.id, b.id, e.self, b.actor, b.mine_seq, ranges)
+	_cursors_local(e, b.object.id, b.id, e.self, b.base, b.mine_seq, ranges)
 	if !h.sp.repl_on {
 		return
 	}
@@ -105,7 +105,7 @@ _cursors_publish :: proc(e: ^Engine, b: ^Buffer, h: ^Handle, ranges: [][2]Anchor
 	}
 	plain := make([dynamic]u8, context.temp_allocator)
 	w := prim.writer(&plain)
-	prim.write_id(&w, b.actor)
+	prim.write_id(&w, b.base)
 	prim.write_uvarint(&w, b.mine_seq)
 	prim.write_uvarint(&w, u64(len(ranges)))
 	for r in ranges {

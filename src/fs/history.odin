@@ -3182,6 +3182,15 @@ apply_actor_record :: proc(h: ^History, device: prim.Id, body: []u8) -> Error {
 		}
 		return .None
 	}
+	if ea, base, eok := fshist.decode_epoch_actor_record(body, device); eok {
+		b := base
+		kv_put(&h.kv, fshist.actor_key(ea), b[:]) or_return
+		kv_put(&h.kv, epoch_key(ea), b[:]) or_return
+		if owner, owned := history_owner_of(h, base); owned {
+			return owned_add(h, owner, ea)
+		}
+		return .None
+	}
 	a, owner, ok := fshist.decode_actor_record(body, device)
 	if !ok {
 		return .None
@@ -3359,7 +3368,9 @@ Span_Owner :: struct {
 history_span_owner :: proc(h: ^History, op: crdt.Op_Id, devices: []prim.Id) -> (o: Span_Owner, err: Error) {
 	history_ready(h) or_return
 	a := op.actor
+	epoch := false
 	for _ in 0 ..< 4 {
+		epoch ||= history_epoch_base(h, a) != a
 		if o.conversation == {} {
 			o.conversation, _ = history_owner_of(h, a)
 		}
@@ -3370,7 +3381,7 @@ history_span_owner :: proc(h: ^History, op: crdt.Op_Id, devices: []prim.Id) -> (
 		a = next
 	}
 	o.device = a
-	known := author_known(h, a)
+	known := epoch || author_known(h, a)
 	for d in devices {
 		known ||= d == a
 	}
@@ -3382,7 +3393,7 @@ history_span_owner :: proc(h: ^History, op: crdt.Op_Id, devices: []prim.Id) -> (
 	if !known {
 		return Span_Owner{kind = .Unresolved}, .None
 	}
-	if lv, ok := crdt.graph_lv(&h.g, op if a == op.actor else crdt.Op_Id{a, 0}); ok {
+	if lv, ok := crdt.graph_lv(&h.g, op if epoch || a == op.actor else crdt.Op_Id{a, 0}); ok {
 		if _, _, stream, _, found := history_batch_at(h, lv); found && int(stream) < len(h.stream_ids) {
 			o.device = h.stream_ids[stream]
 		}
@@ -3430,6 +3441,49 @@ history_present_actor :: proc(h: ^History, actor: prim.Id) -> prim.Id {
 		a = o
 	}
 	return a
+}
+
+@(private)
+epoch_key :: proc(actor: prim.Id) -> []u8 {
+	k := make([]u8, 3 + 16, context.temp_allocator)
+	copy(k, "ep:")
+	a := actor
+	copy(k[3:], a[:])
+	return k
+}
+
+history_epoch_base :: proc(h: ^History, actor: prim.Id) -> prim.Id {
+	if h == nil || !h.awake {
+		return actor
+	}
+	v, found, err := kv_get(&h.kv, epoch_key(actor), context.temp_allocator)
+	if err != .None || !found || len(v) != 16 {
+		return actor
+	}
+	base: prim.Id
+	copy(base[:], v)
+	return base
+}
+
+history_register_epoch_actor :: proc(h: ^History, base: prim.Id, epoch: u64) -> Error {
+	history_ready(h) or_return
+	if _, known := history_actor_owner(h, fshist.epoch_actor(h.self, base, epoch)); known {
+		return .None
+	}
+	clear(&h.io)
+	fshist.encode_epoch_actor_record(&h.io, base, epoch, h.self)
+	if _, jerr := journal.journal_append(&h.journal, h.io[:]); jerr != .None {
+		return .Io
+	}
+	if journal.journal_commit(&h.journal) != .None {
+		return .Io
+	}
+	h.applied[0] = journal.journal_durable_len(&h.journal)
+	apply_actor_record(h, h.self, h.io[:]) or_return
+	if h.persist_due {
+		return admit_persist(h)
+	}
+	return kv_commit(&h.kv)
 }
 
 history_register_line_actor :: proc(h: ^History, actor, pseudo, base: prim.Id) -> Error {

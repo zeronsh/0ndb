@@ -16,6 +16,9 @@ LIVE_BUFFER_MSG :: i64(osync.DRAFT_MSG_MAX - 1)
 LIVE_FRAME_V2 :: u8(2)
 
 @(private)
+LIVE_FRAME_V3 :: u8(3)
+
+@(private)
 LIVE_HEADER :: 1 + 16 + 8
 
 @(private)
@@ -717,11 +720,17 @@ _live_aad :: proc(stream: osync.Stream_Id, object: prim.Id, hdr: []u8) -> []u8 {
 @(private)
 _buffer_live_send :: proc(e: ^Engine, b: ^Buffer, h: ^Handle, batch: ^crdt.Batch, off: i64, ff: []crdt.Op_Id, flen: int) {
 	sp := h.sp
-	if !sp.repl_on || e.cfg.buffer_live_off || !osync.replicator_live_on(&sp.repl) {
+	if e.closing || !sp.repl_on || e.cfg.buffer_live_off || !osync.replicator_live_on(&sp.repl) {
+		return
+	}
+	if !_live_arm(e) {
 		return
 	}
 	body := make([dynamic]u8, context.temp_allocator)
 	w := prim.writer(&body)
+	if b.actor != b.base {
+		prim.write_id(&w, b.base)
+	}
 	prim.write_uvarint(&w, u64(len(ff)))
 	for id in ff {
 		prim.write_id(&w, id.actor)
@@ -749,7 +758,7 @@ _buffer_live_send :: proc(e: ^Engine, b: ^Buffer, h: ^Handle, batch: ^crdt.Batch
 	}
 	e.live_sent[h.id] = off
 	hdr: [LIVE_HEADER]u8
-	hdr[0] = LIVE_FRAME_V2
+	hdr[0] = LIVE_FRAME_V2 if b.actor == b.base else LIVE_FRAME_V3
 	boot := e.live_boot
 	copy(hdr[1:17], boot[:])
 	prim.put_u64le(hdr[17:], u64(off))
@@ -777,6 +786,7 @@ _buffer_live_send :: proc(e: ^Engine, b: ^Buffer, h: ^Handle, batch: ^crdt.Batch
 	if len(frame) > osync.LIVE_MAX {
 		return
 	}
+	_live_note(e, b, batch.seq + u64(crdt.batch_len(batch)))
 	if osync.replicator_live_send(&sp.repl, &h.scope, h.name, 0, LIVE_BUFFER_MSG, off, frame) {
 		e.stats.buffer_live_sent += 1
 	}
@@ -784,7 +794,7 @@ _buffer_live_send :: proc(e: ^Engine, b: ^Buffer, h: ^Handle, batch: ^crdt.Batch
 
 @(private)
 _buffer_live_rx :: proc(e: ^Engine, sp: ^Space, ev: ^osync.Repl_Event) {
-	if e.cfg.buffer_live_off || len(ev.meta) < LIVE_HEADER || ev.meta[0] != LIVE_FRAME_V2 {
+	if e.cfg.buffer_live_off || len(ev.meta) < LIVE_HEADER || (ev.meta[0] != LIVE_FRAME_V2 && ev.meta[0] != LIVE_FRAME_V3) {
 		return
 	}
 	scratch := virtual.arena_temp_begin(&e.temp)
@@ -870,6 +880,10 @@ _buffer_live_rx :: proc(e: ^Engine, sp: ^Space, ev: ^osync.Repl_Event) {
 		body = out
 	}
 	r := prim.reader(body)
+	base: prim.Id
+	if ev.meta[0] == LIVE_FRAME_V3 {
+		base = prim.read_id(&r)
+	}
 	nff := int(prim.read_uvarint(&r))
 	if nff > LIVE_FF_WINDOW {
 		return
@@ -907,7 +921,7 @@ _buffer_live_rx :: proc(e: ^Engine, sp: ^Space, ev: ^osync.Repl_Event) {
 	}
 	for b in list {
 		if slice.contains(e.buffers[:], b) {
-			_ovl_apply(e, b, h, &batch, ff, flen, dev, boot, acks)
+			_ovl_apply(e, b, h, &batch, base if base != {} else batch.actor, ff, flen, dev, boot, acks)
 		}
 	}
 }
@@ -1020,7 +1034,7 @@ _pend_fits :: proc(b: ^Buffer, batch: ^crdt.Batch, dev: prim.Id, flen: int, seen
 }
 
 @(private)
-_ovl_apply :: proc(e: ^Engine, b: ^Buffer, h: ^Handle, batch: ^crdt.Batch, ff: []crdt.Op_Id, flen: int, dev: prim.Id, boot: [16]u8, acks: []Ack) {
+_ovl_apply :: proc(e: ^Engine, b: ^Buffer, h: ^Handle, batch: ^crdt.Batch, who: prim.Id, ff: []crdt.Op_Id, flen: int, dev: prim.Id, boot: [16]u8, acks: []Ack) {
 	if b.hist != h.hist || b.view == nil || b.view.stale || len(batch.ops) == 0 {
 		return
 	}
@@ -1085,7 +1099,7 @@ _ovl_apply :: proc(e: ^Engine, b: ^Buffer, h: ^Handle, batch: ^crdt.Batch, ff: [
 				return
 			}
 			_bpush(&d, crdt.Delta_Op{kind = .Retain, n = dpos - consumed})
-			_bpush(&d, crdt.Delta_Op{kind = .Insert, n = r.len, text = r.content, author = batch.actor})
+			_bpush(&d, crdt.Delta_Op{kind = .Insert, n = r.len, text = r.content, author = who})
 			append(&seqs, cur)
 			consumed = dpos
 			shift += r.len

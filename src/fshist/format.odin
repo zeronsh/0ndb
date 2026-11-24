@@ -720,6 +720,7 @@ text_targets :: proc(b: ^crdt.Batch, allocator := context.temp_allocator) -> []c
 ACTOR_INGEST :: u8(1)
 ACTOR_OWNED :: u8(2)
 ACTOR_LINE :: u8(3)
+ACTOR_EPOCH :: u8(4)
 
 ingestion_actor :: proc(device, mount: prim.Id) -> (id: prim.Id) {
 	ctx: blake2b.Context
@@ -773,6 +774,43 @@ decode_line_actor_record :: proc(body: []u8, device: prim.Id) -> (actor: prim.Id
 		return {}, {}, false
 	}
 	return a, base, true
+}
+
+epoch_actor :: proc(device, base: prim.Id, epoch: u64) -> prim.Id {
+	ctx: blake2b.Context
+	blake2b.init(&ctx, 16)
+	tag := "0ndb buffer epoch"
+	blake2b.update(&ctx, transmute([]u8)tag)
+	b := base
+	blake2b.update(&ctx, b[:])
+	eb: [8]u8
+	prim.put_u64le(eb[:], epoch)
+	blake2b.update(&ctx, eb[:])
+	pseudo: prim.Id
+	blake2b.final(&ctx, pseudo[:])
+	return ingestion_actor(device, pseudo)
+}
+
+encode_epoch_actor_record :: proc(buf: ^[dynamic]u8, base: prim.Id, epoch: u64, device: prim.Id) {
+	w := prim.writer(buf)
+	prim.write_u8(&w, REC_ACTOR)
+	prim.write_u8(&w, ACTOR_EPOCH)
+	prim.write_id(&w, base)
+	prim.write_uvarint(&w, epoch)
+	prim.write_id(&w, device)
+}
+
+decode_epoch_actor_record :: proc(body: []u8, device: prim.Id) -> (actor: prim.Id, base: prim.Id, ok: bool) {
+	if len(body) < 2 || body[0] != REC_ACTOR || body[1] != ACTOR_EPOCH {
+		return
+	}
+	r := prim.reader(body[2:])
+	base = prim.read_id(&r)
+	epoch := prim.read_uvarint(&r)
+	if prim.read_id(&r) != device || base == {} || !prim.reader_ok(&r) || prim.reader_remaining(&r) != 0 {
+		return {}, {}, false
+	}
+	return epoch_actor(device, base, epoch), base, true
 }
 
 decode_actor_record :: proc(body: []u8, device: prim.Id) -> (actor: prim.Id, owner: prim.Id, ok: bool) {

@@ -114,6 +114,7 @@ Buffer :: struct {
 	inode:      fstree.Inode_Id,
 	line:       string,
 	units:      Units,
+	base:       prim.Id,
 	actor:      prim.Id,
 	cb:         Buffer_Proc,
 	data:       rawptr,
@@ -330,7 +331,8 @@ buffer_open :: proc(e: ^Engine, o: Object, opts: Buffer_Options, allocator := co
 		line = tree_at.line
 	}
 	b.line = _clone(line, e.allocator) or_return
-	b.actor = opts.actor if opts.actor != {} else editor_actor(e, b.line)
+	b.base = opts.actor if opts.actor != {} else editor_actor(e, b.line)
+	b.actor = _live_actor(e, b.base)
 	b.version = make([dynamic]crdt.Op_Id, e.allocator)
 	b.sent = make([dynamic]Sent, e.allocator)
 	b.undo = make([dynamic]Undo_Group, e.allocator)
@@ -356,7 +358,7 @@ buffer_open :: proc(e: ^Engine, o: Object, opts: Buffer_Options, allocator := co
 	_buffer_live_follow(e, h, true)
 	info.id = b.id
 	info.length = _length(b)
-	info.actor = b.actor
+	info.actor = b.base
 	info.line = _clone(b.line, allocator) or_return
 	n := info.length if opts.page <= 0 else min(opts.page, info.length)
 	end := _to_bytes(b, n)
@@ -498,6 +500,8 @@ _buffers_free_all :: proc(e: ^Engine) {
 	e.live_boots = nil
 	delete(e.live_sent)
 	e.live_sent = nil
+	delete(e.live_ids)
+	e.live_ids = nil
 	delete(e.buffer_wakes)
 	e.buffer_wakes = nil
 }
@@ -564,7 +568,8 @@ _sent_push :: proc(e: ^Engine, b: ^Buffer, ops: []crdt.Delta_Op, gone: []Gone = 
 
 @(private)
 Sink_State :: struct {
-	db: crdt.Delta_Builder,
+	db:   crdt.Delta_Builder,
+	hist: ^fs.History,
 }
 
 @(private)
@@ -575,7 +580,7 @@ _sink :: proc(st: ^Sink_State) -> crdt.Text_Sink {
 			s := (^Sink_State)(data)
 			c := make([]u8, len(bytes), context.temp_allocator)
 			copy(c, bytes)
-			crdt.delta_step_insert(&s.db, pos, c, author.actor)
+			crdt.delta_step_insert(&s.db, pos, c, fs.history_epoch_base(s.hist, author.actor))
 		},
 		delete = proc(data: rawptr, pos: int, bytes: []u8) {
 			s := (^Sink_State)(data)
@@ -604,7 +609,7 @@ _buffer_view_ready :: proc(e: ^Engine, b: ^Buffer, h: ^Handle) -> Error {
 		return .Closed
 	}
 	if b.view.stale {
-		st: Sink_State
+		st := Sink_State{hist = h.hist}
 		crdt.delta_builder_init(&st.db, context.temp_allocator)
 		if aerr := fs.history_view_advance(h.hist, b.view, b.version[:], _sink(&st)); aerr != .None {
 			return _buffer_unavailable(e, b, h)
@@ -633,7 +638,7 @@ _buffer_advance :: proc(e: ^Engine, b: ^Buffer, h: ^Handle) -> Error {
 	_hist_caught_up(e, h) or_return
 	_buffer_live_follow(e, h, true)
 	target := _buffer_target(b, h) or_return
-	st: Sink_State
+	st := Sink_State{hist = h.hist}
 	crdt.delta_builder_init(&st.db, context.temp_allocator)
 	if aerr := fs.history_view_advance(h.hist, b.view, target, _sink(&st)); aerr != .None {
 		return _buffer_unavailable(e, b, h)
@@ -665,7 +670,7 @@ _buffer_emit :: proc(e: ^Engine, b: ^Buffer, st: ^Sink_State) -> Error {
 		author = proc(data: rawptr, pos: int) -> prim.Id {
 			b := (^View_Reader)(data).b
 			a, _, _ := crdt.text_author(&b.view.text, &b.hist.g, pos)
-			return a.actor
+			return fs.history_epoch_base(b.hist, a.actor)
 		},
 		len = crdt.text_len(&b.view.text),
 	}
@@ -768,6 +773,7 @@ buffer_ack :: proc(e: ^Engine, id: Buffer_Id, rev: u64) -> Error {
 _buffer_sync :: proc(e: ^Engine, b: ^Buffer, h: ^Handle) -> Error {
 	_buffer_advance(e, b, h) or_return
 	b.dirty = false
+	_buffer_actor(e, b, h.hist) or_return
 	next := fs.history_next_seq(h.hist, b.actor)
 	if next == 0 || fs.history_contains(h.hist, b.version[:], crdt.Op_Id{b.actor, next - 1}) {
 		return .None
@@ -922,6 +928,7 @@ _delta_runs :: proc(b: ^Buffer, ops: []crdt.Delta_Op, seq0: u64, x: ^Built) -> E
 @(private)
 _commit_runs :: proc(e: ^Engine, b: ^Buffer, h: ^Handle, x: ^Built, seq0: u64) -> (last: crdt.Op_Id, err: Error) {
 	hist := h.hist
+	_buffer_actor_register(e, b, hist) or_return
 	batch := crdt.Batch {
 		actor   = b.actor,
 		seq     = seq0,

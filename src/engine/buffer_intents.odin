@@ -66,7 +66,7 @@ _dlog_record :: proc(e: ^Engine, b: ^Buffer, hits: []crdt.Op_Span) -> Error {
 		kind        = u8(b.kind),
 		inode_actor = inode.actor,
 		inode_seq   = inode.seq,
-		actor       = b.actor,
+		actor       = b.base,
 		line        = b.line,
 		spans       = spans,
 	}
@@ -177,7 +177,10 @@ _dlog_apply :: proc(e: ^Engine, x: dl.Entry) -> Dlog_Step {
 	b.inode = fs.op_inode(hist, crdt.Op_Id{x.inode_actor, x.inode_seq})
 	b.units = .Bytes
 	b.hist = hist
-	b.actor = x.actor
+	b.base = x.actor
+	if aerr := _buffer_actor(e, b, hist); aerr != .None {
+		return _dlog_busy(aerr)
+	}
 	line, lerr := _clone(x.line, e.allocator)
 	if lerr != .None {
 		return .Retry
@@ -188,7 +191,7 @@ _dlog_apply :: proc(e: ^Engine, x: dl.Entry) -> Dlog_Step {
 	if terr != .None {
 		return _dlog_busy(terr)
 	}
-	v := _dlog_chain(hist, target, x.actor)
+	v := _dlog_chain(hist, target, b.actor)
 	view, verr := fs.history_view_open(hist, b.inode, v)
 	if verr != .None {
 		return _dlog_busy(_ferr(verr))

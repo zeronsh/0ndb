@@ -363,6 +363,9 @@ Engine :: struct {
 	live_booted:  bool,
 	live_boots:   map[prim.Id][16]u8,
 	live_sent:    map[prim.Id]i64,
+	live_epoch:   u64,
+	live_armed:   bool,
+	live_ids:     map[Live_Ids]u64,
 	buffer_wakes: [dynamic]Ready,
 	tick:         u64,
 	tick_timer:   prim.Timer,
@@ -530,6 +533,7 @@ open :: proc(e: ^Engine, cfg: Config, allocator := context.allocator) -> (err: E
 	e.identity = osync.keyring_identity(&e.keyring)
 	e.self = e.identity.id
 	_registry_open(e) or_return
+	_live_epoch_load(e) or_return
 	_unclean_mark_registry(e) or_return
 	_registry_recover(e) or_return
 	_dlog_open(e)
@@ -551,6 +555,9 @@ close :: proc(e: ^Engine) -> Error {
 	}
 	e.closing = true
 	err := flush(e)
+	if err == .None {
+		_live_disarm(e)
+	}
 	_teardown(e)
 	return err
 }
