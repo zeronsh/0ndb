@@ -41,6 +41,7 @@ Event_Crash_Arm :: struct {
 	agent:   bool,
 	process: bool,
 	more:    bool,
+	read:    int,
 }
 
 Event_Crash_Result :: struct {
@@ -50,6 +51,7 @@ Event_Crash_Result :: struct {
 	empty:   int,
 	landed:  bool,
 	open:    bool,
+	fired:   bool,
 }
 
 @(private = "file")
@@ -284,6 +286,16 @@ _event_crash :: proc(w: ^World, arm: Event_Crash_Arm, crash_at: u64) -> (res: Ev
 		n.disk.crash_at = n.disk.stats.ops + crash_at
 		node_after(n)
 	}
+	for limit := w.now + 20_000_000_000; arm.read > 0 && w.now < limit && w.stats.crashes == crashes; {
+		t, more := next_time(w)
+		if !more {
+			break
+		}
+		run_until(w, t, false)
+	}
+	if arm.read > 0 && w.stats.crashes > crashes {
+		read_fault_arm(&n.disk, "/", arm.read)
+	}
 	for limit := w.now + 20_000_000_000; arm.more && w.now < limit && !res.typed; {
 		t, more := next_time(w)
 		if !more {
@@ -304,6 +316,11 @@ _event_crash :: proc(w: ^World, arm: Event_Crash_Arm, crash_at: u64) -> (res: Ev
 	run_until(w, w.now + 20_000_000_000, true)
 	n.disk.crash_at = 0
 	n.disk.force_process = false
+	if arm.read > 0 {
+		fired, path := read_fault_disarm(w.allocator)
+		res.fired = fired
+		_ = path
+	}
 	res.crashed = w.stats.crashes > crashes
 	run_until(w, w.now + 20_000_000_000, true)
 	if !n.alive {
@@ -506,5 +523,42 @@ event_two_mounts :: proc(t: ^testing.T) {
 		fmt.eprintf("event_two_mounts: blocked=%v: %d of 20 used an event actor, %d failed\n", blocked, used, bad)
 		testing.expect(t, bad == 0, "event_two_mounts failed")
 		testing.expect(t, !blocked || used > 0, "event_two_mounts: no blocked run used an event actor")
+	}
+}
+
+@(test)
+event_recover_read :: proc(t: ^testing.T) {
+	if s, ok := os.lookup_env("SIM_SEED", context.temp_allocator); ok && len(s) > 0 {
+		return
+	}
+	test_begin(t)
+	defer test_end(t)
+	for more in ([]bool{false, true}) {
+		for k := u64(5); k <= 705; k += 100 {
+			runs, bad, refused := 0, 0, 0
+			for nth in 1 ..= 4000 {
+				failures, res := event_crash_run(1, Event_Crash_Arm{process = true, more = more, read = nth}, k)
+				wrong, closed := false, false
+				for f in failures {
+					if strings.contains(f, "appears") || strings.contains(f, "the undo left") {
+						fmt.eprintf("event_recover_read: crash at %d, read %d: %s\n", k, nth, f)
+						wrong = true
+					} else {
+						closed = true
+					}
+					delete(f)
+				}
+				bad += 1 if wrong else 0
+				refused += 1 if closed && !wrong else 0
+				delete(failures)
+				if !res.fired {
+					break
+				}
+				runs += 1
+			}
+			fmt.eprintf("event_recover_read: crash at %d more=%v: %d reads failed once each, %d runs wrong, %d did not reopen or could not be read\n", k, more, runs, bad, refused)
+			testing.expect(t, bad == 0, "event_recover_read: one failing read in recovery left the text wrong")
+			testing.expect(t, runs > 0, "event_recover_read: no read failed")
+		}
 	}
 }
