@@ -87,14 +87,47 @@ mount_revert_pseudo :: proc(mount: prim.Id, line: string, owner: prim.Id) -> (ps
 	return
 }
 
+Pending_Revert :: struct {
+	before: [dynamic]crdt.Op_Id,
+	after:  [dynamic]crdt.Op_Id,
+	owner:  prim.Id,
+}
+
 mount_revert :: proc(m: ^Mount, before: Version, after: Version, owner: prim.Id) -> Error {
+	if err := mount_sync(m); err == .Deferred {
+		p := Pending_Revert{before = make([dynamic]crdt.Op_Id, m.allocator), after = make([dynamic]crdt.Op_Id, m.allocator), owner = owner}
+		append(&p.before, ..before)
+		append(&p.after, ..after)
+		append(&m.reverts, p)
+		mount_schedule(m, max(m.opts.settle_ms, 1))
+		return .None
+	} else if err != .None {
+		return err
+	}
+	return _mount_revert(m, before, after, owner)
+}
+
+@(private)
+mount_reverts_run :: proc(m: ^Mount) -> Error {
+	for len(m.reverts) > 0 {
+		p := m.reverts[0]
+		ordered_remove(&m.reverts, 0)
+		err := _mount_revert(m, p.before[:], p.after[:], p.owner)
+		delete(p.before)
+		delete(p.after)
+		err or_return
+	}
+	return .None
+}
+
+@(private)
+_mount_revert :: proc(m: ^Mount, before: Version, after: Version, owner: prim.Id) -> Error {
 	arena: virtual.Arena
 	if virtual.arena_init_growing(&arena, 256 << 10) != nil {
 		return .No_Memory
 	}
 	defer virtual.arena_destroy(&arena)
 	context.temp_allocator = virtual.arena_allocator(&arena)
-	mount_sync(m) or_return
 	h := m.history
 	bl := make([dynamic]crdt.Lv, context.temp_allocator)
 	al := make([dynamic]crdt.Lv, context.temp_allocator)

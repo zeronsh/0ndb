@@ -502,6 +502,7 @@ Mount :: struct {
 	nonce:       prim.Id,
 	mat_wait:    bool,
 	mat_waits:   [dynamic]Mat_Wait,
+	reverts:     [dynamic]Pending_Revert,
 	mat_held:    bool,
 	mat_ingest:  bool,
 	copy:        ^Copy_Map,
@@ -956,6 +957,11 @@ mount_close :: proc(m: ^Mount) {
 	delete(m.open_scopes)
 	delete(m.synced)
 	delete(m.placed)
+	for p in m.reverts {
+		delete(p.before)
+		delete(p.after)
+	}
+	delete(m.reverts)
 	delete(m.saved_synced)
 	git_head_destroy(&m.head, m.allocator)
 	if m.has_git {
@@ -1035,7 +1041,7 @@ mount_hibernate :: proc(m: ^Mount) -> Error {
 	if !m.awake {
 		return .None
 	}
-	if len(m.dirty) > 0 || m.rescan || len(m.waits) > 0 {
+	if len(m.dirty) > 0 || m.rescan || len(m.waits) > 0 || len(m.reverts) > 0 {
 		return .Busy
 	}
 	err := shadow_flush(m)
@@ -1728,6 +1734,9 @@ mount_step :: proc(m: ^Mount) -> Error {
 	if err == .Deferred {
 		mount_touch(m)
 		return err
+	}
+	if err == .None && len(m.reverts) > 0 {
+		err = mount_reverts_run(m)
 	}
 	if err == .None {
 		err = mount_materialize(m)
