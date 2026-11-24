@@ -834,7 +834,7 @@ _redact_zeroed :: proc(data: rawptr) {
 
 _persist_fail :: proc(data: rawptr) -> bool {
 	n := (^Node)(data)
-	if n.persist_outage && n.w.phase != .Quiesce {
+	if outage_active(n) {
 		stat_add(n.w, STAT_PERSIST_FAULTS)
 		return true
 	}

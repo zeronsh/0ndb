@@ -19,6 +19,10 @@ _persist_outage_init :: proc "contextless" () {
 	STAT_DEFERRED_CLOSES = register_stat(54, 1, "deferred_closes")
 }
 
+outage_active :: proc(n: ^Node) -> bool {
+	return n.persist_outage && n.w.phase != .Quiesce
+}
+
 op_persist_outage :: proc(w: ^World, n: ^Node) {
 	if n.persist_outage || !n.alive {
 		return
