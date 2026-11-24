@@ -7,7 +7,7 @@ REPO = os.path.dirname(os.path.dirname(HERE))
 WINDOWS = os.name == "nt"
 MARKER = b"ondb-soak-no-provider"
 DATA = os.environ.get("SOAK_DATA_KB", "4000000")
-LIMIT = [] if WINDOWS else ["bash", "-c", 'ulimit -d %s 2>/dev/null; exec "$@"' % DATA, "x"]
+LIMIT = [] if WINDOWS else ["bash", "--norc", "--noprofile", "-c", 'ulimit -d %s 2>/dev/null; exec "$@"' % DATA, "x"]
 TRACE = os.environ.get("SOAK_TRACE", "")
 MODEL = "claude-opus-5-5"
 AGENT_PATHS = 24
@@ -171,7 +171,7 @@ class Daemon:
     def start(self):
         group = dict(creationflags=subprocess.CREATE_NEW_PROCESS_GROUP) if WINDOWS else dict(start_new_session=True)
         self.log = open(os.path.join(self.dir, "daemon.log"), "a")
-        self.proc = subprocess.Popen(LIMIT + (["strace", "-f", "-tt", "-o", TRACE] if TRACE else []) + [self.bin, "daemon"], cwd=self.dir, env=self.env, stdout=self.log, stderr=subprocess.STDOUT, **group)
+        self.proc = subprocess.Popen(LIMIT + (["strace", "-f", "-tt", "-o", TRACE] if TRACE else []) + [self.bin, "daemon"], cwd=self.dir, env=self.env, stdin=subprocess.DEVNULL, stdout=self.log, stderr=subprocess.STDOUT, **group)
         self.sock = os.path.join(self.rt, "daemon.sock")
         for _ in range(800):
             if os.path.exists(self.sock):
@@ -215,7 +215,7 @@ class Daemon:
         self.log.close()
 
     def cli(self, *args):
-        p = subprocess.run(LIMIT + [self.bin] + list(args) + ["--json"], cwd=self.dir, env=self.env, capture_output=True, text=True, timeout=120)
+        p = subprocess.run(LIMIT + [self.bin] + list(args) + ["--json"], cwd=self.dir, env=self.env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=120)
         if p.returncode != 0:
             raise RuntimeError("0ndb %s -> %d %s%s" % (" ".join(args), p.returncode, p.stdout, p.stderr))
         return json.loads(p.stdout or "{}")

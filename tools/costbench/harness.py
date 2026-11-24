@@ -9,7 +9,7 @@ BIN_LEASE = os.environ.get("ONDB_BIN_LEASE", os.path.join(REPO, "bin", "0ndb-lea
 PACKLIVE = os.environ.get("COST_PACKLIVE", os.path.join(REPO, "bin", "packlive"))
 OUT = os.environ.get("COST_OUT", os.path.join(tempfile.gettempdir(), "costbench"))
 TRANSCRIPT = os.environ.get("COST_TRANSCRIPT", "")
-LIMIT = ["bash", "-c", 'ulimit -v 4000000; exec "$@"', "x"]
+LIMIT = ["bash", "--norc", "--noprofile", "-c", 'ulimit -v 4000000; exec "$@"', "x"]
 
 
 def run(args, cwd, env=None, stdin=None, timeout=120, check=True):
