@@ -71,7 +71,6 @@ node_start :: proc(n: ^Node) -> bool {
 	cfg.ids = eng.Id_Source{data = n, next = _next_id}
 	cfg.log = eng.Log{data = n, write = _on_log}
 	cfg.events = eng.Event_Hook{data = n, event = _on_event}
-	cfg.purge = eng.Purge_Hook{data = n, purge = _on_purge}
 	cfg.credentials = eng.Credentials_Source{data = n, produce = node_credentials}
 	cfg.write_observer = sim_observer(n)
 	cfg.fs_exec = fs.Sync_Exec{run = proc(data: rawptr, job: proc(arg: rawptr), done: proc(arg: rawptr), arg: rawptr) {
@@ -401,12 +400,6 @@ _on_log :: proc(data: rawptr, level: eng.Log_Level, msg: string) {
 	if level >= .Warn {
 		world_note(n.w, "%s log %v: %s", n.name, level, msg)
 	}
-}
-
-@(private = "file")
-_on_purge :: proc(data: rawptr, e: ^eng.Engine, req: ^eng.Purge_Request) {
-	n := (^Node)(data)
-	world_note(n.w, "%s purge %s", n.name, req.provider)
 }
 
 @(private = "file")
