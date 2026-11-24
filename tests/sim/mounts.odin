@@ -1320,6 +1320,24 @@ _carry_token :: proc(w: ^World, n: ^Node, oi: int, line: string, path: string, t
 	}
 }
 
+@(private = "file")
+_mount_wrote :: proc(m: ^Model, n: ^Node, oi: int, line: string, tok: string) -> bool {
+	for o in m.ops {
+		if o.obj != oi || o.node != n.idx || o.line != line || !(o.kind == .Disk_Agent || o.kind == .Disk_Person || o.kind == .Git_Mount) {
+			continue
+		}
+		if o.status != .Acked && o.status != .Observed && o.status != .Done {
+			continue
+		}
+		for t in o.tokens {
+			if t == tok {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 op_git_switch :: proc(w: ^World, n: ^Node) {
 	r := &w.rng
 	if !n.alive || !n.e_open {
@@ -1472,12 +1490,43 @@ op_git_switch :: proc(w: ^World, n: ^Node) {
 		return
 	}
 	obj_add_line(m, sm.oi, key)
-	if cerr == .None && !n.disk.dead {
+	after_git := make(map[string][]u8, context.temp_allocator)
+	unread := false
+	if cerr == .None {
+		for p in paths {
+			d, rerr := prim.read_file(vfs, strings.concatenate({sm.root, "/", p}, context.temp_allocator), context.temp_allocator)
+			if n.disk.dead || (rerr != .None && rerr != .Not_Found) {
+				unread = true
+				break
+			}
+			if rerr == .None {
+				after_git[p] = d
+			}
+		}
+		for ch in changes {
+			if unread {
+				break
+			}
+			d, rerr := prim.read_file(vfs, strings.concatenate({sm.root, "/", ch.name}, context.temp_allocator), context.temp_allocator)
+			if n.disk.dead || (rerr != .None && rerr != .Not_Found) {
+				unread = true
+				break
+			}
+			if rerr == .None {
+				after_git[ch.name] = d
+			}
+		}
+	}
+	if cerr == .None && !n.disk.dead && !unread {
 		git_gone := make(map[string]bool, context.temp_allocator)
 		for ch in changes {
 			if ch.gone {
 				git_gone[ch.name] = true
 			}
+		}
+		git_touched := make(map[string]bool, context.temp_allocator)
+		for ch in changes {
+			git_touched[ch.name] = true
 		}
 		{
 			files := make([dynamic]Disk_File, context.temp_allocator)
@@ -1504,15 +1553,24 @@ op_git_switch :: proc(w: ^World, n: ^Node) {
 			}
 		}
 		for ch in changes {
-			got, gerr := prim.read_file(vfs, strings.concatenate({sm.root, "/", ch.name}, context.temp_allocator), context.temp_allocator)
-			if ch.gone != (gerr == .Not_Found) || (!ch.gone && string(got) != string(ch.new)) {
-				world_fail(w, "%s git checkout %s left %s as %q (%v), not %q", n.name, branch, ch.name, string(got), gerr, string(ch.new))
+			got, there := after_git[ch.name]
+			if ch.gone == there || (!ch.gone && string(got) != string(ch.new)) {
+				world_fail(w, "%s git checkout %s left %s as %q (there %v), not %q", n.name, branch, ch.name, string(got), there, string(ch.new))
 			}
 		}
 		for p in paths {
-			after, aerr := prim.read_file(vfs, strings.concatenate({sm.root, "/", p}, context.temp_allocator), context.temp_allocator)
+			after, there := after_git[p]
 			had_base := p in base
-			gone := aerr == .Not_Found
+			gone := !there
+			if !known && !gone && had_base && !git_touched[p] {
+				for t in parse_tokens(base[p]) {
+					if untracked[t.text] || !_mount_wrote(m, n, sm.oi, from_line, t.text) {
+						continue
+					}
+					_carry_token(w, n, sm.oi, key, p, t.text, {})
+				}
+				continue
+			}
 			if (gone && !had_base) || (!gone && had_base && string(after) == string(base[p])) || (gone && !git_gone[p]) {
 				continue
 			}
