@@ -2105,7 +2105,10 @@ _fetch_gap :: proc(r: ^Replicator, rm: ^Remote, gap: journal.Range) {
 		_fetch_run(r, rm, gap)
 		return
 	}
-	_arc_want(r, rm, gap.from, min(gap.to, rm.base))
+	lim := min(gap.to, rm.base)
+	for g, need := _unfetched(rm, gap.from, rm.base, false); need && g.from < lim; g, need = _unfetched(rm, g.to, rm.base, false) {
+		_arc_want(r, rm, g.from, g.to)
+	}
 	for g, need := _unfetched(rm, rm.base, gap.to); need; g, need = _unfetched(rm, g.to, gap.to) {
 		_fetch_run(r, rm, g)
 	}
@@ -2952,6 +2955,11 @@ _repl_on_ready :: proc(r: ^Replicator) {
 	}
 	for _, l in r.locals {
 		_arc_maybe_run(r, l)
+	}
+	for id in _sorted_ids(r.remotes) {
+		if rm, ok := r.remotes[id]; ok && rm.arc != nil && len(rm.arc.wants) > 0 {
+			_arc_drive(r, rm)
+		}
 	}
 	if r.cfg.filtered {
 		_feed_subscribe(r, r.feed_cursor < 0 || r.group_new)

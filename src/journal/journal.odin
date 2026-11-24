@@ -47,10 +47,17 @@ Tag :: [16]u8
 
 Hash :: [HASH_SIZE]u8
 
+Cell_Run :: struct {
+	from: u64,
+	to:   u64,
+}
+
 Key_Provider :: struct {
 	data:   rawptr,
 	key:    proc(data: rawptr, off: i64, out: ^Key) -> bool,
 	loaded: proc(data: rawptr) -> bool,
+	block:  proc(data: rawptr, cell: u64, bits: u8, out: ^Key) -> bool,
+	cover:  proc(data: rawptr, lo, hi: u64, out: ^[dynamic]Cell_Run) -> bool,
 }
 
 Signer :: struct {
