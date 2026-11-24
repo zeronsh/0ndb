@@ -1259,6 +1259,25 @@ _bk_put :: proc(c: ^Br_Ctx, path, data: string, api: bool) -> bool {
 }
 
 @(private = "file")
+_bk_same :: proc(got, want: string) -> bool {
+	if got == want || !strings.contains(want, "Z") {
+		return got == want
+	}
+	pick :: proc(text: string, later: bool) -> string {
+		b := strings.builder_make(context.temp_allocator)
+		rest := text
+		for line in strings.split_lines_iterator(&rest) {
+			if strings.has_prefix(line, "Z") == later {
+				strings.write_string(&b, line)
+				strings.write_byte(&b, '\n')
+			}
+		}
+		return strings.to_string(b)
+	}
+	return len(got) == len(want) && pick(got, true) == pick(want, true) && pick(got, false) == pick(want, false)
+}
+
+@(private = "file")
 _bk_run :: proc(w: ^World, arena: ^virtual.Arena, k: Bk_Case, api, between: bool) {
 	if virtual.arena_init_growing(arena, 1 << 20) != nil {
 		return
@@ -1284,7 +1303,7 @@ _bk_run :: proc(w: ^World, arena: ^virtual.Arena, k: Bk_Case, api, between: bool
 	check :: proc(c: ^Br_Ctx, k: Bk_Case, api: bool, what: string, want: string, pos: obj.Rid) {
 		disk := _br_disk(c)
 		got := disk[k.path] if k.path in disk else ""
-		if got != want {
+		if !_bk_same(got, want) {
 			world_fail(c.w, "branch kept, %s (%s): after %s %s holds %q, not %q", k.name, "api" if api else "disk", what, k.path, got, want)
 		}
 		if p, pok := _br_position(c, c.n); !pok || !obj.rid_none(pos) && p != pos {

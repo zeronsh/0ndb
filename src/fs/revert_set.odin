@@ -228,7 +228,7 @@ history_revert_set :: proc(h: ^History, line: string, base: Version, current: Ve
 		revert_inode(h, &b, ino, ev, &snap_b, &snap_c, bl[:], cl[:], &ctx, &conflicts, drops) or_return
 		history_unload_files(h)
 	}
-	if b.n == 0 {
+	if b.n == 0 && len(conflicts) == 0 {
 		return {}, .None
 	}
 	marker := make([dynamic]u8, context.temp_allocator)
