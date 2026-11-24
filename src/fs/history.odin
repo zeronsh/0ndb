@@ -3182,9 +3182,6 @@ author_known :: proc(h: ^History, actor: prim.Id) -> bool {
 	if _, ok := history_actor_owner(h, actor); ok || actor == h.self {
 		return true
 	}
-	if _, ok := crdt.graph_lv(&h.g, crdt.Op_Id{actor, 0}); ok {
-		return true
-	}
 	for id in h.stream_ids {
 		if id == actor {
 			return true
