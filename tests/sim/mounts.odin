@@ -396,7 +396,7 @@ agent_pending_free :: proc(w: ^World, pa: Agent_Pending) {
 }
 
 @(private = "file")
-_on_base :: proc(m: ^fs.Mount, rel: string, note: fs.Base_Note, data: rawptr) {
+_on_base :: proc(m: ^fs.Mount, rel: string, note: fs.Base_Note, actor: prim.Id, data: rawptr) {
 	n := (^Node)(data)
 	w := n.w
 	switch note {
