@@ -106,7 +106,7 @@ jitter_lane() {
 	lane until-run SIM_STORAGE=until-run 41 60 > "$OUT/l17" &
 	lane until-run SIM_STORAGE=until-run 61 80 > "$OUT/l18" &
 	lane until-run SIM_STORAGE=until-run 81 100 > "$OUT/l19" &
-	( r=$(SIM_MEMBER_SEED=1 SIM_MEMBER_SEEDS=6 timeout 2400 "$OUT/mem.bin" 2>&1); n=$(echo "$r" | grep -c 'membership seed [0-9]*: '); ok_run "$r" || n=$((n+1)); echo "membership 1-6 isolated: $n failure lines $(echo "$r" | grep -E 'membership seed [0-9]+: ' | sort -u | head -2 | tr '\n' ' ')" ) > "$OUT/l7" &
+	( r=$(SIM_MEMBER_SEED=1 SIM_MEMBER_SEEDS=30 timeout 2400 "$OUT/mem.bin" 2>&1); n=$(echo "$r" | grep -c 'membership seed [0-9]*: '); ok_run "$r" || n=$((n+1)); echo "membership 1-30 isolated: $n failure lines $(echo "$r" | grep -E 'membership seed [0-9]+: ' | sort -u | head -2 | tr '\n' ' ')" ) > "$OUT/l7" &
 	( r=$(timeout 2400 "$OUT/sim.bin" 2>&1); echo "scenarios: $(ok_run "$r" && echo 0 || echo 1) failed $(echo "$r" | grep -E 'seed [0-9]+ FAILED|membership seed [0-9]+: |local_first.*FAIL|staged.*FAIL|FATAL' | head -3 | tr '\n' ' ')" ) > "$OUT/l8" &
 	( r=$(timeout 900 "$OUT/cvg.bin" 2>&1 | grep -E "Finished|FAILED|panic|FATAL" | tail -1); echo "convergence: $r" ) > "$OUT/l9" &
 	( r=$(timeout 900 "$OUT/fst.bin" 2>&1 | grep -E "Finished|FAILED|panic|FATAL" | tail -1); echo "fstree: $r" ) > "$OUT/l10" &
