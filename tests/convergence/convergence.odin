@@ -191,6 +191,9 @@ apply_batch :: proc(t: ^testing.T, r: ^Replica, b: ^crdt.Batch, collect: bool) -
 	for f in 0 ..< FILES {
 		file := &r.files[f]
 		v, e := crdt.text_check(&file.text, &r.g, &file.log, b, target_of(f), skip, parents[:])
+		if e == .Missing_Source {
+			return .Missing
+		}
 		testing.expect_value(t, e, crdt.Error.None)
 		valid = min(valid, v)
 	}
@@ -640,9 +643,14 @@ attack :: proc(t: ^testing.T, rs: []Replica, who: int, rng: ^Rng, counter: ^u64)
 		}
 		switch below(rng, 4) {
 		case 3:
-			op.kind = .Insert_Copy
 			victim := &rs[below(rng, len(rs))]
-			op.src = crdt.Op_Id{victim.actor, u64(below(rng, int(victim.seq) + 8))}
+			if victim.seq == 0 {
+				op.kind = .Delete
+				break
+			}
+			op.kind = .Insert_Copy
+			op.len = min(op.len, int(victim.seq))
+			op.src = crdt.Op_Id{victim.actor, u64(below(rng, int(victim.seq) - op.len + 1))}
 		case 0:
 			op.kind = .Insert
 			op.content = content[:op.len]
