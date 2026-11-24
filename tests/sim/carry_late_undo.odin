@@ -32,6 +32,7 @@ Late_Turn_World :: struct {
 	hits: int,
 	reader: int,
 	events: int,
+	tree:   prim.Id,
 }
 
 @(private = "file")
@@ -63,7 +64,9 @@ _late_turn_destroy :: proc(w: ^World) {
 @(private = "file")
 _late_turn_event :: proc(w: ^World, n: ^Node, ev: ^eng.Event) {
 	if _late_turn != nil && _late_turn.reader > 0 && n.idx == _late_turn.reader - 1 {
-		_late_turn.events += 1
+		if ev.kind == .Authors_Resolved && ev.object == _late_turn.tree {
+			_late_turn.events += 1
+		}
 	}
 }
 
@@ -109,7 +112,7 @@ _late_turn_msg :: proc(w: ^World, n: ^Node, conv: eng.Object, role: convo.Role, 
 	return m, true
 }
 
-carry_late_undo_run :: proc(seed: u64) -> (failures: [dynamic]string) {
+carry_late_undo_run :: proc(seed: u64, early: bool) -> (failures: [dynamic]string) {
 	failures = make([dynamic]string)
 	cfg := default_config(seed)
 	cfg.nodes = 3
@@ -124,7 +127,7 @@ carry_late_undo_run :: proc(seed: u64) -> (failures: [dynamic]string) {
 	cfg.verbose = env_u64("SIM_VERBOSE", 0) != 0
 	w := new(World)
 	world_init(w, cfg)
-	_carry_late_undo(w)
+	_carry_late_undo(w, early)
 	for f in w.failures {
 		append(&failures, fmt.aprintf("%s", f))
 	}
@@ -155,7 +158,7 @@ _late_turn_read :: proc(n: ^Node, tree: eng.Object, line: string) -> (string, bo
 }
 
 @(private = "file")
-_carry_late_undo :: proc(w: ^World) {
+_carry_late_undo :: proc(w: ^World, early: bool) {
 	if !relay_start(&w.relay) {
 		world_fail(w, "relay start")
 		return
@@ -423,6 +426,13 @@ _carry_late_undo :: proc(w: ^World) {
 		}
 	}
 	run_until(w, w.now + 10_000_000_000, true)
+	_late_turn.tree = tree.id
+	if o, mok := _late_turn_owner(a, tree); !mok || o.kind != .Agent || o.conversation != conv.id {
+		world_fail(w, "carry late undo: the mount's owner of the carried line is %v, not the turn's conversation %s", o, id_short(conv.id))
+	}
+	if o, rok3 := _late_turn_owner(b, tree); !rok3 || o.kind != .Unresolved {
+		world_fail(w, "carry late undo: before the owner record the reader's owner of the carried line is %v, not unresolved", o)
+	}
 	want, wok := _late_turn_author(a, tree)
 	raw, hok := _late_turn_author(b, tree)
 	fmt.eprintfln("LATETURN agent %s mount-author %s reader-author %s", id_short(agent), id_short(want), id_short(raw))
@@ -456,18 +466,20 @@ _carry_late_undo :: proc(w: ^World) {
 		world_fail(w, "carry late undo: the owner record arrived with the conversation (%s), so the undo proves nothing", id_short(who))
 		return
 	}
-	undo_err := eng.Error.None
-	undo: {
-		context = instance_context(&b.inst)
-		defer node_after(b)
-		eng.undo_hooks_set(&b.e, eng.Undo_Hooks{})
-		_, undo_err = eng.convo_undo(&b.e, conv, user)
-	}
-	run_until(w, w.now + 20_000_000_000, true)
-	mid, _ := _late_turn_read(b, tree, "main")
-	fmt.eprintfln("LATETURN undo before the record: %v; reader main %q", undo_err, mid)
-	if undo_err == .None && strings.contains(mid, LATE_TURN_TEXT) {
-		world_fail(w, "carry late undo: the undo reported success before the owner record but left the carried line on the reader's main: %q", mid)
+	undo_err := eng.Error.Missing
+	if early {
+		undo: {
+			context = instance_context(&b.inst)
+			defer node_after(b)
+			eng.undo_hooks_set(&b.e, eng.Undo_Hooks{})
+			_, undo_err = eng.convo_undo(&b.e, conv, user)
+		}
+		run_until(w, w.now + 20_000_000_000, true)
+		mid, _ := _late_turn_read(b, tree, "main")
+		fmt.eprintfln("LATETURN undo before the record: %v; reader main %q", undo_err, mid)
+		if undo_err == .None && strings.contains(mid, LATE_TURN_TEXT) {
+			world_fail(w, "carry late undo: the undo reported success before the owner record but left the carried line on the reader's main: %q", mid)
+		}
 	}
 	_late_turn.reader = b.idx + 1
 	_late_turn.on = false
@@ -476,14 +488,26 @@ _carry_late_undo :: proc(w: ^World) {
 	}
 	for _ in 0 ..< 60 {
 		run_until(w, w.now + 500_000_000, true)
+		if o, rok5 := _late_turn_owner(b, tree); rok5 && o.kind != .Unresolved && !(o.kind == .Agent && o.conversation == conv.id) {
+			world_fail(w, "carry late undo: while resolving, the reader's owner of the carried line is %v", o)
+			break
+		}
 		if who, got := _late_turn_author(b, tree); got && who != agent && who != want {
 			world_fail(w, "carry late undo: while resolving, the reader credits the carried line to %s, neither the raw actor nor its owner", id_short(who))
 			break
 		}
 	}
 	_late_turn.reader = 0
+	if o, rok4 := _late_turn_owner(b, tree); early && rok4 || !early && (!rok4 || !(o.kind == .Agent && o.conversation == conv.id)) {
+		world_fail(w, "carry late undo: after the owner record the reader's owner of the carried line is %v, not the turn's conversation", o)
+	}
+	if _late_turn.events == 0 {
+		world_fail(w, "carry late undo: the reader's owner resolved without an authors_resolved event")
+	}
+	fmt.eprintfln("LATETURN authors_resolved events %d", _late_turn.events)
 	if undo_err != .None {
 		context = instance_context(&b.inst)
+		eng.undo_hooks_set(&b.e, eng.Undo_Hooks{})
 		_, undo_err = eng.convo_undo(&b.e, conv, user)
 		node_after(b)
 		fmt.eprintfln("LATETURN undo after the record: %v", undo_err)
@@ -498,6 +522,26 @@ _carry_late_undo :: proc(w: ^World) {
 			world_fail(w, "carry late undo: after the undo %s reads main a.txt as %q (%v), want the turn's line gone and the person's kept", n.name, d, rok)
 		}
 	}
+}
+
+@(private = "file")
+_late_turn_owner :: proc(n: ^Node, tree: eng.Object) -> (owner: fs.Span_Owner, ok: bool) {
+	context = instance_context(&n.inst)
+	defer node_after(n)
+	owners: []fs.Span_Owner
+	data, spans, err := eng.tree_blame(&n.e, tree, "a.txt", context.temp_allocator, "main", &owners)
+	if err != .None {
+		return {}, false
+	}
+	lo := strings.index(string(data), LATE_TURN_TEXT)
+	at := 0
+	for sp, k in spans {
+		if lo >= 0 && at <= lo && lo < at + sp.len {
+			return owners[k], true
+		}
+		at += sp.len
+	}
+	return {}, false
 }
 
 @(private = "file")
@@ -526,11 +570,13 @@ carry_late_undo :: proc(t: ^testing.T) {
 	}
 	test_begin(t)
 	defer test_end(t)
-	failures := carry_late_undo_run(1)
-	for f in failures {
-		fmt.eprintf("carry_late_undo: %s\n", f)
-		delete(f)
+	for early in ([2]bool{true, false}) {
+		failures := carry_late_undo_run(1, early)
+		for f in failures {
+			fmt.eprintf("carry_late_undo early=%v: %s\n", early, f)
+			delete(f)
+		}
+		testing.expect(t, len(failures) == 0, "carry_late_undo failed")
+		delete(failures)
 	}
-	testing.expect(t, len(failures) == 0, "carry_late_undo failed")
-	delete(failures)
 }
