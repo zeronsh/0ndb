@@ -778,17 +778,63 @@ rebase_materialize :: proc(m: ^Mount, heads: []crdt.Op_Id, restored: bool) -> Er
 }
 
 @(private)
+Held_Name :: struct {
+	path:  string,
+	inode: fstree.Inode_Id,
+}
+
+@(private)
+in_place :: proc(h: ^History, v: []crdt.Lv, named: ^[dynamic]Held_Name) -> Error {
+	if len(named) == 0 {
+		return .None
+	}
+	snap := version_snapshot(h, v) or_return
+	defer fstree.snapshot_destroy(&snap)
+	for i := 0; i < len(named); {
+		id, ok, lerr := fstree.lookup(&snap, named[i].path)
+		if lerr != nil {
+			return .Corrupt
+		}
+		if !ok || id != named[i].inode {
+			unordered_remove(named, i)
+			continue
+		}
+		i += 1
+	}
+	return .None
+}
+
+@(private)
+hold_moved :: proc(h: ^History, v: []crdt.Lv, named: []Held_Name) -> (moved: bool, err: Error) {
+	snap := version_snapshot(h, v) or_return
+	defer fstree.snapshot_destroy(&snap)
+	for x in named {
+		id, ok, lerr := fstree.lookup(&snap, x.path)
+		if lerr != nil {
+			return false, .Corrupt
+		}
+		if !ok || id != x.inode {
+			return true, .None
+		}
+	}
+	return false, .None
+}
+
+@(private)
 hold_target :: proc(m: ^Mount, tl: []crdt.Lv, sl: []crdt.Lv) -> (out: []crdt.Lv, changed: bool, err: Error) {
 	h := m.history
 	held := make(map[fstree.Inode_Id]bool, context.temp_allocator)
+	named := make([dynamic]Held_Name, context.temp_allocator)
 	for x in m.holds {
 		if ino, ok := _file_inode(m, x.path); ok {
 			held[ino] = true
+			append(&named, Held_Name{x.path, ino})
 		}
 	}
 	if len(held) == 0 {
 		return tl, false, .None
 	}
+	in_place(h, sl, &named) or_return
 	only_a := make([dynamic]crdt.Lv_Span, context.temp_allocator)
 	only_b := make([dynamic]crdt.Lv_Span, context.temp_allocator)
 	crdt.graph_diff(&h.g, sl, tl, &only_a, &only_b)
@@ -837,10 +883,18 @@ hold_target :: proc(m: ^Mount, tl: []crdt.Lv, sl: []crdt.Lv) -> (out: []crdt.Lv,
 					return tl, false, berr
 				}
 			}
+			if !bad {
+				was := slice.clone(keep[:], context.temp_allocator)
+				add(&h.g, &keep, hi - 1)
+				moved := hold_moved(h, keep[:], named[:]) or_return
+				if moved {
+					clear(&keep)
+					append(&keep, ..was)
+					bad = true
+				}
+			}
 			if bad {
 				append(&excluded, crdt.Lv_Span{lv = lv, len = hi - lv})
-			} else {
-				add(&h.g, &keep, hi - 1)
 			}
 			lv = hi
 		}
