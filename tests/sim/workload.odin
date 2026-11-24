@@ -242,9 +242,6 @@ workload_step :: proc(w: ^World) {
 		5,
 		8,
 		1,
-		3,
-		3,
-		2,
 		2,
 		2,
 		2,
@@ -281,11 +278,11 @@ workload_step :: proc(w: ^World) {
 	switch k {
 	case .Create:
 		_op_create(w, n)
-	case .Send, .Queue, .Steer, .Edit, .Cancel, .Interrupt, .Switch, .Back, .Follow, .Answer, .Assign, .Mount, .Unmount, .Redact_Msg:
+	case .Send, .Queue, .Steer, .Edit, .Cancel, .Interrupt, .Switch, .Back, .Follow, .Answer, .Assign, .Mount, .Unmount:
 		_op_convo(w, n, k)
-	case .Map_Set, .Map_Hot, .Map_Add, .Map_Remove, .Map_Delete, .Count, .Redact_Map:
+	case .Map_Set, .Map_Hot, .Map_Add, .Map_Remove, .Map_Delete, .Count:
 		_op_map(w, n, k)
-	case .Text_Insert, .Text_Delete, .Redact_Text:
+	case .Text_Insert, .Text_Delete:
 		_op_text(w, n, k)
 	case .Tree_Write, .Tree_Remove:
 		_op_tree(w, n, k)
@@ -525,19 +522,7 @@ _op_convo :: proc(w: ^World, n: ^Node, k: Op_Kind) {
 		op.key = strings.clone(fmt.tprintf("m%d", rng_int(&w.rng, 3)), w.allocator)
 		err := eng.convo_unmount(&n.e, o, op.key, op_done_handle(op))
 		op_result(op, n, err)
-	case .Redact_Msg:
-		t := _pick_op(m, &w.rng, oi, {.Send, .Stream}, true)
-		if t == nil || t.status == .Uncertain {
-			return
-		}
-		op := new_op(m, .Redact_Msg, n, oi)
-		op.target = t.idx
-		snapshot_search_models(w, n, op)
-		context = instance_context(&n.inst)
-		err := eng.convo_redact(&n.e, o, t.rid, op_done_handle(op))
-		world_note(w, "%s redact message %s -> %v", n.name, t.token, err)
-		op_result(op, n, err)
-	case .Create, .Map_Set, .Map_Hot, .Map_Add, .Map_Remove, .Map_Delete, .Count, .Text_Insert, .Text_Delete, .Tree_Write, .Tree_Remove, .Redact_Text, .Redact_Map, .Catalog, .Usage, .Share, .Mount_Tree, .Disk_Agent, .Disk_Person, .Git_Mount, .Search_Peer, .Promote, .Read_Live, .Stream, .Buffer_Open, .Buffer_Type, .Buffer_Delete, .Buffer_Undo, .Buffer_Anchor, .Buffer_Sync, .Buffer_Burst:
+	case .Create, .Map_Set, .Map_Hot, .Map_Add, .Map_Remove, .Map_Delete, .Count, .Text_Insert, .Text_Delete, .Tree_Write, .Tree_Remove, .Catalog, .Usage, .Share, .Mount_Tree, .Disk_Agent, .Disk_Person, .Git_Mount, .Search_Peer, .Promote, .Read_Live, .Stream, .Buffer_Open, .Buffer_Type, .Buffer_Delete, .Buffer_Undo, .Buffer_Anchor, .Buffer_Sync, .Buffer_Burst:
 	}
 }
 
@@ -607,20 +592,7 @@ _op_map :: proc(w: ^World, n: ^Node, k: Op_Kind) {
 		_, cerr := omap.count(mw, transmute([]u8)op.key, 7, op.delta)
 		eng.touched(&n.e, o)
 		op_result(op, n, cerr == .None ? .None : .Invalid)
-	case .Redact_Map:
-		t := _pick_op(m, &w.rng, oi, {.Map_Set}, false)
-		if t == nil || t.node != n.idx || t.status == .Uncertain {
-			return
-		}
-		op := new_op(m, .Redact_Map, n, oi)
-		op.target = t.idx
-		op.key = strings.clone(t.key, w.allocator)
-		snapshot_search_models(w, n, op)
-		context = instance_context(&n.inst)
-		err := eng.map_redact(&n.e, o, transmute([]u8)t.key)
-		world_note(w, "%s redact map key %s -> %v", n.name, t.key, err)
-		op_result(op, n, err)
-	case .Create, .Send, .Queue, .Steer, .Edit, .Cancel, .Interrupt, .Switch, .Back, .Follow, .Answer, .Assign, .Mount, .Unmount, .Text_Insert, .Text_Delete, .Tree_Write, .Tree_Remove, .Redact_Msg, .Redact_Text, .Catalog, .Usage, .Share, .Mount_Tree, .Disk_Agent, .Disk_Person, .Git_Mount, .Search_Peer, .Promote, .Read_Live, .Stream, .Buffer_Open, .Buffer_Type, .Buffer_Delete, .Buffer_Undo, .Buffer_Anchor, .Buffer_Sync, .Buffer_Burst:
+	case .Create, .Send, .Queue, .Steer, .Edit, .Cancel, .Interrupt, .Switch, .Back, .Follow, .Answer, .Assign, .Mount, .Unmount, .Text_Insert, .Text_Delete, .Tree_Write, .Tree_Remove, .Catalog, .Usage, .Share, .Mount_Tree, .Disk_Agent, .Disk_Person, .Git_Mount, .Search_Peer, .Promote, .Read_Live, .Stream, .Buffer_Open, .Buffer_Type, .Buffer_Delete, .Buffer_Undo, .Buffer_Anchor, .Buffer_Sync, .Buffer_Burst:
 	}
 }
 
@@ -653,31 +625,17 @@ _op_text :: proc(w: ^World, n: ^Node, k: Op_Kind) {
 		err := eng.text_edit(&n.e, o, pos, 0, tok, op_done_handle(op))
 		world_note(w, "%s text %s insert %s at %d of %q -> %v", n.name, id_short(o.id), tok, pos, string(data), err)
 		op_result(op, n, err)
-	case .Text_Delete, .Redact_Text:
+	case .Text_Delete:
 		if len(toks) == 0 {
 			return
 		}
 		t := toks[rng_int(&w.rng, len(toks))]
-		if k == .Redact_Text {
-			src := _token_op(m, oi, t.text)
-			if src == nil || src.status == .Uncertain {
-				return
-			}
-			op := new_op(m, .Redact_Text, n, oi)
-			append(&op.deletes, strings.clone(t.text, w.allocator))
-			snapshot_search_models(w, n, op)
-			context = instance_context(&n.inst)
-			err := eng.text_redact(&n.e, o, t.pos, len(t.text))
-			world_note(w, "%s redact text %s -> %v", n.name, t.text, err)
-			op_result(op, n, err)
-			return
-		}
 		op := new_op(m, .Text_Delete, n, oi)
 		append(&op.deletes, strings.clone(t.text, w.allocator))
 		err := eng.text_edit(&n.e, o, t.pos, len(t.text), "", op_done_handle(op))
 		world_note(w, "%s text %s delete %s at %d of %q -> %v", n.name, id_short(o.id), t.text, t.pos, string(data), err)
 		op_result(op, n, err)
-	case .Create, .Send, .Queue, .Steer, .Edit, .Cancel, .Interrupt, .Switch, .Back, .Follow, .Answer, .Assign, .Mount, .Unmount, .Map_Set, .Map_Hot, .Map_Add, .Map_Remove, .Map_Delete, .Count, .Tree_Write, .Tree_Remove, .Redact_Msg, .Redact_Map, .Catalog, .Usage, .Share, .Mount_Tree, .Disk_Agent, .Disk_Person, .Git_Mount, .Search_Peer, .Promote, .Read_Live, .Stream, .Buffer_Open, .Buffer_Type, .Buffer_Delete, .Buffer_Undo, .Buffer_Anchor, .Buffer_Sync, .Buffer_Burst:
+	case .Create, .Send, .Queue, .Steer, .Edit, .Cancel, .Interrupt, .Switch, .Back, .Follow, .Answer, .Assign, .Mount, .Unmount, .Map_Set, .Map_Hot, .Map_Add, .Map_Remove, .Map_Delete, .Count, .Tree_Write, .Tree_Remove, .Catalog, .Usage, .Share, .Mount_Tree, .Disk_Agent, .Disk_Person, .Git_Mount, .Search_Peer, .Promote, .Read_Live, .Stream, .Buffer_Open, .Buffer_Type, .Buffer_Delete, .Buffer_Undo, .Buffer_Anchor, .Buffer_Sync, .Buffer_Burst:
 	}
 }
 
@@ -745,7 +703,7 @@ _op_tree :: proc(w: ^World, n: ^Node, k: Op_Kind) {
 		err := eng.tree_remove(&n.e, o, path)
 		world_note(w, "%s tree_remove %s/%s saw %v -> %v", n.name, id_short(o.id), path, op.deletes[:], err)
 		op_result(op, n, err)
-	case .Create, .Send, .Queue, .Steer, .Edit, .Cancel, .Interrupt, .Switch, .Back, .Follow, .Answer, .Assign, .Mount, .Unmount, .Map_Set, .Map_Hot, .Map_Add, .Map_Remove, .Map_Delete, .Count, .Text_Insert, .Text_Delete, .Redact_Msg, .Redact_Text, .Redact_Map, .Catalog, .Usage, .Share, .Mount_Tree, .Disk_Agent, .Disk_Person, .Git_Mount, .Search_Peer, .Promote, .Read_Live, .Stream, .Buffer_Open, .Buffer_Type, .Buffer_Delete, .Buffer_Undo, .Buffer_Anchor, .Buffer_Sync, .Buffer_Burst:
+	case .Create, .Send, .Queue, .Steer, .Edit, .Cancel, .Interrupt, .Switch, .Back, .Follow, .Answer, .Assign, .Mount, .Unmount, .Map_Set, .Map_Hot, .Map_Add, .Map_Remove, .Map_Delete, .Count, .Text_Insert, .Text_Delete, .Catalog, .Usage, .Share, .Mount_Tree, .Disk_Agent, .Disk_Person, .Git_Mount, .Search_Peer, .Promote, .Read_Live, .Stream, .Buffer_Open, .Buffer_Type, .Buffer_Delete, .Buffer_Undo, .Buffer_Anchor, .Buffer_Sync, .Buffer_Burst:
 	}
 }
 
