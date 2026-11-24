@@ -1227,6 +1227,7 @@ _d_unlink :: proc(data: rawptr, path: string) -> prim.Error {
 	dir := d.inodes[lk.parent]
 	_freed_note(d, path, lk.ino)
 	ino := _unlink_entry(d, dir, lk.name)
+	fmt.eprintf("UL ino=%d path=%s\n", ino, path)
 	append(&d.meta, Meta_Op{kind = .Unlink, dir = lk.parent, name = strings.clone(lk.name, d.allocator), ino = 0, gone = ino})
 	_maybe_orphan(d, ino)
 	_event(d, path)
@@ -1747,6 +1748,7 @@ disk_contains :: proc(d: ^Disk, needle: []u8, allocator := context.temp_allocato
 			continue
 		}
 		if at := _index_of(n.data[:], needle); at >= 0 {
+			fmt.eprintf("DC ino=%d nlink=%d opens=%d\n", k, n.nlink, n.opens)
 			return fmt.aprintf("%s (live bytes at offset %d of %d)", _path_of(d, k, context.temp_allocator), at, len(n.data), allocator = allocator), true
 		}
 		if at := _index_of(n.durable[:], needle); at >= 0 {

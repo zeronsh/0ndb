@@ -51,7 +51,6 @@ bitrot_flip :: proc(w: ^World, n: ^Node) {
 	}
 }
 
-@(private = "file")
 _bitrot_write :: proc(w: ^World, n: ^Node, o: eng.Own_Length, at: i64, bit: u8) -> bool {
 	fd, oerr := prim.open_file(n.e.vfs, o.path, {.Write})
 	if oerr != .None {
