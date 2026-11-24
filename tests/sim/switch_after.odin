@@ -104,10 +104,8 @@ _sa_lines :: proc(w: ^World, n: ^Node, tree: eng.Object) -> (l: Sa_Lines, ok: bo
 @(private = "file")
 _sa_same :: proc(w: ^World, line: string, want, got: map[string]string, kind: Switch_After_Kind, mode: Crash_Mode, crash_at: u64) {
 	keys := make([dynamic]string, context.temp_allocator)
-	for k in want {
-		append(&keys, k)
-	}
-	for k in got {
+	append(&keys, ..prim.sorted_keys(want))
+	for k in prim.sorted_keys(got) {
 		if k not_in want {
 			append(&keys, k)
 		}
