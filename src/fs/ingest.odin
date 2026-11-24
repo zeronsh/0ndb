@@ -1540,7 +1540,14 @@ step_mark :: proc(b: ^Builder, step: prim.Id) {
 }
 
 @(private)
-replay_departing :: proc(m: ^Mount, long: runtime.Allocator, replayed: ^map[fstree.Inode_Id]bool) -> Error {
+Replayed :: struct {
+	inodes: map[fstree.Inode_Id]bool,
+	paths:  [dynamic]string,
+	heads:  [dynamic]crdt.Op_Id,
+}
+
+@(private)
+replay_departing :: proc(m: ^Mount, long: runtime.Allocator, out: ^Replayed) -> Error {
 	if m.history == nil || m.db == nil || len(m.attrib_chain) == 0 {
 		return .None
 	}
@@ -1578,12 +1585,16 @@ replay_departing :: proc(m: ^Mount, long: runtime.Allocator, replayed: ^map[fstr
 				break
 			}
 			cur = st.oid
-			replayed[e.inode] = true
+			if e.inode not_in out.inodes {
+				out.inodes[e.inode] = true
+				append(&out.paths, path)
+			}
 		}
 		if a, has := m.attrib[path]; has && !a.used && a.oid == cur {
 			attrib_set(m, path, a.actor, true, a.oid, a.scope, a.base)
 		}
 	}
+	append(&out.heads, ..q.rebased[:])
 	return .None
 }
 
@@ -1931,9 +1942,13 @@ mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> (err: Error) {
 			delete(m.branch, m.allocator)
 			m.branch, _ = clone_string(key, m.allocator)
 			if follow {
-				replayed := make(map[fstree.Inode_Id]bool, p.long)
+				replayed := Replayed {
+					inodes = make(map[fstree.Inode_Id]bool, p.long),
+					paths  = make([dynamic]string, p.long),
+					heads  = make([dynamic]crdt.Op_Id, p.long),
+				}
 				replay_departing(m, p.long, &replayed) or_return
-				line_follow(m, key, replayed) or_return
+				line_follow(m, key, &replayed) or_return
 				p.git_wrote = true
 			}
 		}
@@ -2163,18 +2178,31 @@ shown_with_own :: proc(m: ^Mount, line: string, row: Version) -> (v: Version, er
 }
 
 @(private)
-line_follow :: proc(m: ^Mount, key: string, replayed: map[fstree.Inode_Id]bool) -> Error {
+line_follow :: proc(m: ^Mount, key: string, replayed: ^Replayed) -> Error {
 	h := m.history
 	shown_put(&m.shown, m.line, m.synced[:], m.allocator)
 	v, found := history_line(h, key, context.temp_allocator) or_return
 	if !found || len(v) == 0 {
-		history_set_line(h, key, m.synced[:]) or_return
+		sl := make([dynamic]crdt.Lv, context.temp_allocator)
+		rl := make([dynamic]crdt.Lv, context.temp_allocator)
+		if crdt.graph_version_lvs(&h.g, m.synced[:], &sl) != .None || crdt.graph_version_lvs(&h.g, replayed.heads[:], &rl) != .None {
+			return .Corrupt
+		}
+		both := make([dynamic]crdt.Lv, context.temp_allocator)
+		crdt.version_union(&h.g, sl[:], rl[:], &both)
+		ids := crdt.graph_version_ids(&h.g, both[:], context.temp_allocator)
+		history_set_line(h, key, ids) or_return
+		clear(&m.synced)
+		append(&m.synced, ..ids)
+		for path in replayed.paths {
+			mount_reshow_add(m, path)
+		}
 	} else {
 		target := v
 		if row, ok := shown_version(m, key, v); ok {
 			target = shown_with_own(m, key, row) or_return
 		}
-		line_retarget(m, target, replayed) or_return
+		line_retarget(m, target, replayed.inodes) or_return
 	}
 	delete(m.line, m.allocator)
 	m.line, _ = clone_string(key, m.allocator)

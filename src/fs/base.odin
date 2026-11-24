@@ -5,6 +5,7 @@ import "core:slice"
 import "../crdt"
 import "../fshist"
 import "../fstree"
+import "../odb"
 import "../prim"
 
 Base_Note :: enum u8 {
@@ -623,10 +624,23 @@ rebase_changes :: proc(p: ^Pass) -> Error {
 			append(&keep, c)
 			continue
 		}
+		logged: Step_Log
 		if a, has := m.attrib[c.path]; has && !a.used {
 			c.step = a.step
+			c.base = a.base
+			logged.needed = a.step == {} && (c.scope != nil || c.scope_id != {})
+		} else if c.scope != nil {
+			logged.needed = true
+		}
+		if logged.needed {
+			logged.actor = actor
+			logged.scope = c.scope.id if c.scope != nil else c.scope_id
+			c.step = step_new(m)
 		}
 		done, rerr := rebase_commit(p, &c, v, inode, actor, event)
+		if (rerr == .None || rerr == .Reloading) && done && logged.needed {
+			step_log(m, &c, inode, logged) or_return
+		}
 		#partial switch rerr {
 		case .None:
 		case .Reloading, .Io, .No_Space:
@@ -693,6 +707,28 @@ _event_digest :: proc(inode: crdt.Op_Id, data: []u8) -> (out: [32]u8) {
 	blake2b.update(&ctx, data)
 	blake2b.final(&ctx, out[:])
 	return
+}
+
+@(private)
+Step_Log :: struct {
+	needed: bool,
+	actor:  prim.Id,
+	scope:  prim.Id,
+}
+
+@(private)
+step_log :: proc(m: ^Mount, c: ^Change, inode: fstree.Inode_Id, l: Step_Log) -> Error {
+	if m.db == nil || m.history == nil {
+		return .None
+	}
+	data, oid, binary, ok := read_content(m, c.path, c.stat, inode, true) or_return
+	if !ok || binary {
+		return .None
+	}
+	if got, werr := odb.write(m.db, .Blob, data); werr != .None || got != oid {
+		return .None
+	}
+	return attrib_log_append(m, c.path, l.actor, oid, l.scope, c.base, c.step)
 }
 
 @(private)
