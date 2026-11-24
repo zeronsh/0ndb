@@ -350,7 +350,27 @@ _mount_fenced :: proc(m: ^fs.Mount, data: rawptr, err: fs.Error) {
 }
 
 @(private)
+_sleep_post :: proc(e: ^Engine) {
+	if e.sleep_posted || e.closing {
+		return
+	}
+	owed := e.sweep_owed
+	if e.plug.reg_on {
+		for m in e.plug.reg.mounts {
+			owed ||= m != nil && m.awake && m.sleep_owed
+		}
+	}
+	if owed && post(e, proc(e: ^Engine, data: rawptr) {
+		e.sleep_posted = false
+		_sleep_owed(e)
+	}, nil) == .None {
+		e.sleep_posted = true
+	}
+}
+
+@(private)
 _sleep_owed :: proc(e: ^Engine) {
+	context = context_for(e)
 	if e.closing || e.in_tick || e.settling || len(e.batches) > 0 || len(e.dirty) > 0 || prim.loop_nested(e.loop) {
 		return
 	}

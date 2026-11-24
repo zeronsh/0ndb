@@ -369,6 +369,7 @@ Engine :: struct {
 	deliver_hook: Tick_Hook,
 	tick_wanted:  bool,
 	sweep_owed:   bool,
+	sleep_posted: bool,
 	settle_timer: prim.Timer,
 	settling:     bool,
 	in_tick:      bool,
