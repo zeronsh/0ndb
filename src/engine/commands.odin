@@ -204,7 +204,13 @@ Pending_Cmd :: struct {
 	cmd:   Command,
 	state: Cmd_State,
 	done:  Done,
+	until: i64,
+	limit: i64,
+	dropped: bool,
 }
+
+PARKED_SEND_MS :: 10_000
+PARKED_FLAP_MS :: 2_000
 
 exec :: proc(e: ^Engine, cmd: Command, done: Done = {}) -> (res: Result, err: Error) {
 	context = context_for(e)
@@ -267,12 +273,104 @@ exec :: proc(e: ^Engine, cmd: Command, done: Done = {}) -> (res: Result, err: Er
 		append(&e.held, p)
 		return res, .Pending
 	}
+	if _, send := cmd.(Cmd_Send); send && st.stage == 0 {
+		p.until = prim.clock_mono_ns(e.cfg.clock) / 1_000_000 + PARKED_SEND_MS
+		p.limit = p.until
+	}
 	werr := _wait(e, h, {}, p)
 	if werr != .Pending {
 		_cmd_free(e, p)
 		return res, werr
 	}
+	_parked_arm(e)
 	return res, .Pending
+}
+
+cancel_parked :: proc(e: ^Engine, data: rawptr) -> bool {
+	context = context_for(e)
+	for w, i in e.waiters {
+		if w.cmd == nil || w.cmd.until == 0 || w.cmd.done.data != data {
+			continue
+		}
+		ordered_remove(&e.waiters, i)
+		_cmd_free(e, w.cmd)
+		free(w, e.allocator)
+		_parked_arm(e)
+		return true
+	}
+	for p, i in e.held {
+		if p.until != 0 && p.done.data == data {
+			ordered_remove(&e.held, i)
+			_cmd_free(e, p)
+			return true
+		}
+	}
+	for w in e.waking {
+		if w.cmd != nil && w.cmd.until != 0 && w.cmd.done.data == data && !w.cmd.dropped {
+			w.cmd.dropped = true
+			return true
+		}
+	}
+	return false
+}
+
+@(private)
+_parked_link :: proc(e: ^Engine, space: prim.Id, up: bool) {
+	now := prim.clock_mono_ns(e.cfg.clock) / 1_000_000
+	for w in e.waiters {
+		if w.space == space && w.cmd != nil && w.cmd.until != 0 {
+			w.cmd.until = w.cmd.limit if up else min(w.cmd.until, now + PARKED_FLAP_MS)
+		}
+	}
+	_parked_arm(e)
+}
+
+@(private)
+_parked_drop :: proc(e: ^Engine, now: i64) {
+	for i := 0; i < len(e.waiters); {
+		w := e.waiters[i]
+		if w.cmd == nil || w.cmd.until == 0 || w.cmd.until > now {
+			i += 1
+			continue
+		}
+		ordered_remove(&e.waiters, i)
+		p := w.cmd
+		free(w, e.allocator)
+		_cmd_fail(e, p, .Offline)
+		i = 0
+	}
+	_parked_arm(e)
+}
+
+@(private)
+_parked_arm :: proc(e: ^Engine) {
+	first := i64(0)
+	for w in e.waiters {
+		if w.cmd != nil && w.cmd.until != 0 && (first == 0 || w.cmd.until < first) {
+			first = w.cmd.until
+		}
+	}
+	if first == e.park_at {
+		return
+	}
+	if e.park_timer != 0 {
+		prim.timer_cancel(e.loop, e.park_timer)
+		e.park_timer = 0
+	}
+	e.park_at = first
+	if first == 0 || e.closing {
+		return
+	}
+	e.park_timer = prim.timer(e.loop, max(first - prim.clock_mono_ns(e.cfg.clock) / 1_000_000, 0), e, _on_parked)
+}
+
+@(private)
+_on_parked :: proc(l: ^prim.Loop, data: rawptr) {
+	e := (^Engine)(data)
+	context = context_for(e)
+	e.park_timer = 0
+	e.park_at = 0
+	_parked_drop(e, prim.clock_mono_ns(e.cfg.clock) / 1_000_000)
 }
 
 convo_send :: proc(e: ^Engine, o: Object, text: string, parent: Rid = {}, attachments: []convo.Attachment = nil, done: Done = {}) -> (msg: Rid, err: Error) {

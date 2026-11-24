@@ -544,6 +544,9 @@ _complete :: proc(c: ^Call, st: Status, payload: []u8) {
 		c.timer = 0
 	}
 	eng.cancel_waits(a.e, c)
+	if c.in_exec && eng.cancel_parked(a.e, c) {
+		c.in_exec = false
+	}
 	p := payload
 	if p == nil && st != .Ok {
 		p = _error_payload(c, st, context.temp_allocator)
