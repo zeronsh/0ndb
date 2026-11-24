@@ -608,7 +608,7 @@ _buffers_tick :: proc(e: ^Engine) {
 		if err != .None {
 			continue
 		}
-		if aerr := _buffer_advance(e, b, h); aerr != .None && aerr != .Missing {
+		if aerr := _buffer_advance(e, b, h); aerr != .None && aerr != .Missing && !_store_err(e, aerr) {
 			_log(e, .Warn, "buffer advance failed")
 		}
 	}

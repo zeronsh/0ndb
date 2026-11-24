@@ -82,13 +82,51 @@ Card_Pub :: struct {
 
 @(private)
 _registry_open :: proc(e: ^Engine) -> Error {
-	path := _join(context.temp_allocator, e.pack_root, "registry") or_return
-	_oerr(omap.db_open(&e.reg.db, e.vfs, path, e.allocator)) or_return
+	path := _join(context.temp_allocator, e.dir, "registry") or_return
+	_registry_migrate(e, path) or_return
+	_oerr(omap.db_open(&e.reg.db, e.base, path, e.allocator)) or_return
 	e.reg.open = true
 	e.reg.staged = make(map[prim.Id][]u8, e.allocator)
 	e.reg.sstaged = make(map[prim.Id][]u8, e.allocator)
 	e.reg.kstaged = make(map[prim.Id][]u8, e.allocator)
 	return .None
+}
+
+@(private)
+_registry_migrate :: proc(e: ^Engine, path: string) -> Error {
+	old := _join(context.temp_allocator, e.pack_root, "registry") or_return
+	if !prim.exists(e.vfs, old) {
+		return .None
+	}
+	if !prim.exists(e.base, path) {
+		data := _perr2(prim.read_file(e.vfs, old, context.temp_allocator)) or_return
+		_perr(prim.replace_atomic(e.base, path, data)) or_return
+	}
+	return _perr(prim.remove(e.vfs, old))
+}
+
+@(private)
+_reg_commit :: proc(e: ^Engine, t: ^omap.Txn) -> Error {
+	err := omap.txn_commit(t)
+
+	if err != .None {
+		_reg_fail(e, _oerr(err))
+	}
+	return _oerr(err)
+}
+
+@(private)
+_store_err :: proc(e: ^Engine, err: Error) -> bool {
+	if err == .Io || err == .No_Space {
+		_fatal(e, err)
+		return true
+	}
+	return false
+}
+
+@(private)
+_reg_fail :: proc(e: ^Engine, err: Error) {
+	_fatal(e, err if err != .None else .Io)
 }
 
 @(private)
@@ -147,8 +185,8 @@ _registry_flush :: proc(e: ^Engine) -> Error {
 			return _oerr(err)
 		}
 	}
-	if err := omap.txn_commit(t); err != .None {
-		return _oerr(err)
+	if err := _reg_commit(e, t); err != .None {
+		return err
 	}
 	e.reg.meta = true
 	for _, v in e.reg.staged {
@@ -375,7 +413,7 @@ _dirty_keys :: proc(e: ^Engine, sp: ^Space, object: prim.Id, kind: Kind, scope: 
 
 @(private)
 _durable_begin :: proc(e: ^Engine) {
-	if !e.pk_open {
+	if !e.pk_open || e.fatal != .None {
 		return
 	}
 	_trees_persist(e)
@@ -579,7 +617,7 @@ _publish :: proc(e: ^Engine, d: ^Dirty_Seg) {
 			d.tree.tree.version += 1
 			d.tree.dirty = true
 			_dirty_keys(e, sp, d.object, d.kind, d.scope, d.tree)
-		} else if err != .None {
+		} else if err != .None && !_store_err(e, _serr(err)) {
 			_log(e, .Warn, "keys publish failed")
 		}
 		crypto.zero_explicit(&okey, size_of(okey))
@@ -599,7 +637,9 @@ _publish :: proc(e: ^Engine, d: ^Dirty_Seg) {
 				d.tree.upload_refs -= 1
 				_own_tree_unref(e, d.tree)
 			}
-			_log(e, .Warn, "publish failed")
+			if !_store_err(e, _serr(err)) {
+				_log(e, .Warn, "publish failed")
+			}
 		}
 	}
 }

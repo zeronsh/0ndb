@@ -159,16 +159,18 @@ _rlog_migrate_pending :: proc(e: ^Engine) {
 	}
 	t, terr := omap.txn_begin(&e.reg.db)
 	if terr != .None {
+		_reg_fail(e, _oerr(terr))
 		return
 	}
 	for k in old {
 		kk := k
 		if _, derr := omap.txn_delete(t, ROOT_PENDING, kk[:]); derr != .None {
 			omap.txn_abort(t)
+			_reg_fail(e, .Io)
 			return
 		}
 	}
-	omap.txn_commit(t)
+	_reg_commit(e, t)
 }
 
 @(private)
@@ -177,8 +179,17 @@ _rlog_pend_record :: proc(e: ^Engine, op: u8, k: [32]u8) {
 	b[0] = op
 	kk := k
 	copy(b[1:], kk[:])
-	if _, err := journal.journal_append(&e.rlog.j, b[:]); err == .None {
-		e.rlog.records += 1
+	if _, err := journal.journal_append(&e.rlog.j, b[:]); err != .None {
+		_fatal(e, _jerr(err))
+		return
+	}
+	e.rlog.records += 1
+}
+
+@(private)
+_rlog_commit :: proc(e: ^Engine) {
+	if err := journal.journal_commit(&e.rlog.j); err != .None {
+		_fatal(e, _jerr(err))
 	}
 }
 
@@ -202,7 +213,7 @@ _rlog_pend_set :: proc(e: ^Engine, k: [32]u8, length: i64) {
 		}
 	}
 	_rlog_pend_record(e, RLOG_PEND_ADD, k)
-	journal.journal_commit(&l.j)
+	_rlog_commit(e)
 	l.pend[k] = length
 }
 
@@ -259,15 +270,17 @@ _rlog_migrate :: proc(e: ^Engine) {
 	}
 	t, terr := omap.txn_begin(&e.reg.db)
 	if terr != .None {
+		_reg_fail(e, _oerr(terr))
 		return
 	}
 	for &o in old {
 		if _, derr := omap.txn_delete(t, ROOT_REDACT, _rlog_bytes(&o.key)); derr != .None {
 			omap.txn_abort(t)
+			_reg_fail(e, .Io)
 			return
 		}
 	}
-	omap.txn_commit(t)
+	_reg_commit(e, t)
 }
 
 @(private)
@@ -366,12 +379,13 @@ _rlog_settle :: proc(e: ^Engine, closing: bool) {
 		b[1] = u8(len(key))
 		n := 2 + copy(b[2:], key)
 		if _, err := journal.journal_append(&l.j, b[:n]); err != .None {
+			_fatal(e, _jerr(err))
 			return
 		}
 		l.records += 1
 	}
 	clear(&l.clears)
-	journal.journal_commit(&l.j)
+	_rlog_commit(e)
 }
 
 @(private)
@@ -399,7 +413,7 @@ _rlog_rewrite :: proc(e: ^Engine) {
 	for k in l.pend {
 		_rlog_pend_record(e, RLOG_PEND_ADD, k)
 	}
-	journal.journal_commit(&l.j)
+	_rlog_commit(e)
 }
 
 @(private)

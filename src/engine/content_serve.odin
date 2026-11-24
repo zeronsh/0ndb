@@ -34,6 +34,7 @@ _serve_register :: proc(e: ^Engine, h: ^Handle, refs: []fs.Content_Ref) {
 	}
 	t, terr := omap.txn_begin(&e.reg.db)
 	if terr != .None {
+		_reg_fail(e, _oerr(terr))
 		return
 	}
 	for ref in refs {
@@ -62,11 +63,12 @@ _serve_register :: proc(e: ^Engine, h: ^Handle, refs: []fs.Content_Ref) {
 			k := _serve_key(osync.object_part_index(key, p))
 			if omap.txn_put(t, ROOT_OWNED, k[:], buf[:w]) != .None {
 				omap.txn_abort(t)
+				_reg_fail(e, .Io)
 				return
 			}
 		}
 	}
-	omap.txn_commit(t)
+	_reg_commit(e, t)
 }
 
 @(private)

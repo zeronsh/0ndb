@@ -429,7 +429,9 @@ _manifest_pending_store :: proc(e: ^Engine, list: [][]u8) {
 	for b in list {
 		prim.write_bytes(&w, b)
 	}
-	prim.replace_atomic(e.vfs, path, buf[:])
+	if err := prim.replace_atomic(e.vfs, path, buf[:]); err != .None {
+		_store_err(e, _perr(err))
+	}
 }
 
 @(private)

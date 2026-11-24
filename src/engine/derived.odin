@@ -242,7 +242,7 @@ _registry_recover :: proc(e: ^Engine) -> Error {
 			return _oerr(err)
 		}
 	}
-	_oerr(omap.txn_commit(t)) or_return
+	_reg_commit(e, t) or_return
 	e.reg.meta = true
 	return .None
 }
