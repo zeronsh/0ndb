@@ -1201,7 +1201,7 @@ mount_mark :: proc(m: ^Mount, rel: string, scope: ^Scope = nil) {
 		s = active_scope(m)
 	}
 	if v, ok := &m.dirty[rel]; ok {
-		if explicit || s != nil {
+		if explicit || v^ == nil {
 			v^ = s
 		}
 	} else {
@@ -1328,12 +1328,15 @@ mount_mark_written :: proc(m: ^Mount, rel: string, scope: ^Scope) {
 		mount_mark(m, rel)
 		return
 	}
+	given := scope != nil
 	scope := scope
 	if scope == nil {
 		scope = active_scope(m)
 	}
 	if v, ok := &m.dirty[rel]; ok {
-		v^ = scope
+		if given || v^ == nil {
+			v^ = scope
+		}
 	} else {
 		k, _ := clone_string(rel, m.allocator)
 		m.dirty[k] = scope
@@ -1959,7 +1962,7 @@ mount_sync :: proc(m: ^Mount) -> Error {
 }
 
 scope_open :: proc(reg: ^Registry, m: ^Mount, id: prim.Id, actor: prim.Id, pids: []prim.Pid = nil, since := Observe_Since{}) -> ^Scope {
-	if m != nil && since.mono == 0 && active_scope(m) == nil {
+	if m != nil && since.mono == 0 {
 		mount_sync(m)
 	} else if m != nil && len(m.dirty) > 0 {
 		_pass_before(m, since)

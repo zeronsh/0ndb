@@ -249,6 +249,7 @@ _to_run :: proc(w: ^World, model: To_Observer, alloc: runtime.Allocator) {
 	oi := len(mm.objs) - 1
 	prim.mkdir_all(c.vfs, TO_ROOT, 0o755)
 	_to_put(c, "a.txt", "<b1>\n")
+	_to_put(c, "n.txt", "<b2>\n")
 	if err := node_mount(w, n, oi, TO_ROOT); err != .None {
 		world_fail(w, "turn owns: mount: %v", err)
 		return
@@ -272,8 +273,6 @@ _to_run :: proc(w: ^World, model: To_Observer, alloc: runtime.Allocator) {
 	c.r0 = _to_msg(c, .User, nil, true) or_else {}
 	_to_msg(c, .Assistant, nil, true)
 	c.r0 = c.parent
-	before := make(map[string]string, alloc)
-	before["a.txt"] = "<b1>\n"
 	u, uok := _to_msg(c, .User, nil, true)
 	if !uok {
 		return
@@ -310,6 +309,19 @@ _to_run :: proc(w: ^World, model: To_Observer, alloc: runtime.Allocator) {
 			world_fail(w, "turn owns: tree_write: %v", err)
 		}
 	}
+	buffer: {
+		context = instance_context(&n.inst)
+		defer node_after(n)
+		info, err := eng.buffer_open(&n.e, c.tree, eng.Buffer_Options{path = "n.txt", page = 0}, context.temp_allocator)
+		if err != .None {
+			world_fail(w, "turn owns: buffer_open: %v", err)
+			break buffer
+		}
+		if _, _, eerr := eng.buffer_edit(&n.e, info.id, info.rev, []eng.Buffer_Edit{{len("<b2>\n"), 0, transmute([]u8)string("<C2>\n")}}); eerr != .None {
+			world_fail(w, "turn owns: buffer_edit: %v", eerr)
+		}
+		eng.buffer_close(&n.e, info.id)
+	}
 	run_until(w, w.now + 500_000_000, true)
 	turn_close: {
 		context = instance_context(&n.inst)
@@ -325,10 +337,12 @@ _to_run :: proc(w: ^World, model: To_Observer, alloc: runtime.Allocator) {
 	after["z.txt"] = "<A3>\n"
 	after["p.txt"] = "<P2>\n"
 	after["api.txt"] = "<C1>\n"
+	after["n.txt"] = "<b2>\n<C2>\n"
 	_to_expect(c, "after the turn", after)
 	undone := make(map[string]string, alloc)
 	undone["a.txt"] = "<b1>\n"
 	undone["api.txt"] = "<C1>\n"
+	undone["n.txt"] = "<b2>\n<C2>\n"
 	undo: prim.Id
 	do_undo: {
 		context = instance_context(&n.inst)
