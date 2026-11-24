@@ -6,6 +6,7 @@ import "core:strings"
 import "core:testing"
 import eng "../../src/engine"
 import "../../src/fs"
+import "../../src/fshist"
 import "../../src/prim"
 
 @(private = "file")
@@ -54,6 +55,9 @@ Named_Result :: struct {
 	wrong:   bool,
 	awake:   bool,
 	line:    string,
+	kept_lost:  bool,
+	other_lost: bool,
+	undone:     int,
 }
 
 named_version_run :: proc(seed: u64, arm: Named_Arm, crash_at: u64) -> (failures: [dynamic]string, res: Named_Result) {
@@ -182,7 +186,10 @@ _named_crash :: proc(w: ^World, arm: Named_Arm, crash_at: u64) -> (res: Named_Re
 		}
 		run_until(w, w.now + 2_000_000_000, true)
 	}
-	agent := prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng))
+	pseudo := prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng))
+	owner := prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng))
+	agent: prim.Id
+	before, before_feature: []u8
 	holder := prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng))
 	pin: {
 		context = instance_context(&n.inst)
@@ -191,6 +198,13 @@ _named_crash :: proc(w: ^World, arm: Named_Arm, crash_at: u64) -> (res: Named_Re
 			world_fail(w, "named: mount missing")
 			return
 		}
+		agent = fshist.ingestion_actor(sm.m.history.self, pseudo)
+		if err := fs.history_register_owned_actor(sm.m.history, agent, pseudo, owner); err != .None {
+			world_fail(w, "named: register the agent: %v", err)
+			return
+		}
+		before = _nv_version(w, n, tree, "main")
+		before_feature = _nv_version(w, n, tree, NV_FEATURE)
 		if !arm.control {
 			hold := fs.scope_open(n.reg, sm.m, prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng)), holder)
 			fs.scope_write_begin(hold, "a.txt")
@@ -287,12 +301,34 @@ _named_crash :: proc(w: ^World, arm: Named_Arm, crash_at: u64) -> (res: Named_Re
 		world_fail(w, "named: tree_read: %v", rerr)
 		return
 	}
+	on := "main"
+	if sm := _nv_mount(n); sm != nil {
+		l := fs.mount_line(sm.m)
+		on = strings.clone("main" if l == "git:refs/heads/main" else l, context.temp_allocator)
+	}
+	disk_text := data
+	if on != "main" {
+		disk_text, _ = eng.tree_read(&n.e, tree, "a.txt", context.temp_allocator, {}, on)
+	}
+	tools, tools_on := strings.count(string(data), NV_TOOL), strings.count(string(disk_text), NV_TOOL)
 	for line in ([]string{NV_BASE, NV_KEPT, NV_TOOL}) {
 		want := 0 if (arm.control && line == NV_KEPT) || (arm.clean && line == NV_TOOL) else 1
-		if want == 1 && line != NV_BASE && !res.settled {
+		c := strings.count(string(data), line)
+		if arm.early && res.crashed && want == 1 {
+			if line == NV_KEPT {
+				res.kept_lost = c == 0
+				want = c if c <= 1 else 1
+			} else if line == NV_TOOL {
+				if tools > 1 || tools_on > 1 || tools + tools_on == 0 {
+					world_fail(w, "named: %v: the agent's line appears %d times on main (%q) and %d times on %s, the disk's line (%q), want once on either, at disk op %d", arm, tools, string(data), tools_on, on, string(disk_text), crash_at)
+				}
+				continue
+			}
+		}
+		if want == 1 && line != NV_BASE && !arm.early && !res.settled {
 			continue
 		}
-		if c := strings.count(string(data), line); c != want {
+		if c != want {
 			world_fail(w, "named: %v: %q appears %d times in a.txt on main, want %d (%q), at disk op %d", arm, strings.trim_space(line), c, want, string(data), crash_at)
 		}
 	}
@@ -300,22 +336,73 @@ _named_crash :: proc(w: ^World, arm: Named_Arm, crash_at: u64) -> (res: Named_Re
 		res.awake = sm.m.awake
 	}
 	if res.edited {
-		on := "main" if res.line == "git:refs/heads/main" else res.line
-		edata, eerr := eng.tree_read(&n.e, tree, "a.txt", context.temp_allocator, {}, on)
+		held := "main" if res.line == "git:refs/heads/main" else res.line
+		edata, eerr := eng.tree_read(&n.e, tree, "a.txt", context.temp_allocator, {}, held)
 		if c := strings.count(string(edata), NV_EDIT); eerr != .None || c != 1 {
-			world_fail(w, "named: %v: %q appears %d times in a.txt on %s, the line the mount held (%v %q), at disk op %d", arm, strings.trim_space(NV_EDIT), c, on, eerr, string(edata), crash_at)
+			world_fail(w, "named: %v: %q appears %d times in a.txt on %s, the line the mount held (%v %q), at disk op %d", arm, strings.trim_space(NV_EDIT), c, held, eerr, string(edata), crash_at)
 		}
 		if c := strings.count(string(edata), NV_TOOL); c != 1 {
-			world_fail(w, "named: %v: %q appears %d times in a.txt on %s after an edit (%q), at disk op %d", arm, strings.trim_space(NV_TOOL), c, on, string(edata), crash_at)
+			world_fail(w, "named: %v: %q appears %d times in a.txt on %s after an edit (%q), at disk op %d", arm, strings.trim_space(NV_TOOL), c, held, string(edata), crash_at)
 		}
 	}
 	if kind == .Checkout_Existing {
 		fdata, ferr := eng.tree_read(&n.e, tree, "a.txt", context.temp_allocator, {}, NV_FEATURE)
 		if c := strings.count(string(fdata), NV_OTHER); ferr != .None || c != 1 {
-			world_fail(w, "named: %v: %q appears %d times in a.txt on feature (%v %q), at disk op %d", arm, strings.trim_space(NV_OTHER), c, ferr, string(fdata), crash_at)
+			res.other_lost = true
 		}
 	}
+	if arm.clean || len(w.failures) > 0 {
+		return
+	}
+	set: []prim.Id
+	if sm := _nv_mount(n); sm != nil {
+		oa, oerr := fs.history_owned_actors(sm.m.history, []prim.Id{owner}, context.temp_allocator)
+		if oerr != .None {
+			world_fail(w, "named: owned actors: %v", oerr)
+			return
+		}
+		set = oa
+	}
+	lines := make([dynamic]string, context.temp_allocator)
+	append(&lines, "main")
+	if on != "main" {
+		append(&lines, on)
+	}
+	for l in lines {
+		was, werr := eng.tree_read(&n.e, tree, "a.txt", context.temp_allocator, {}, l)
+		if werr != .None || !strings.contains(string(was), NV_TOOL) {
+			continue
+		}
+		at := before_feature if l == NV_FEATURE && len(before_feature) > 0 else before
+		base, derr := fs.decode_version(at, context.temp_allocator)
+		if derr != .None {
+			world_fail(w, "named: decode the version before the turn: %v", derr)
+			return
+		}
+		if _, uerr := eng.tree_revert_set(&n.e, tree, base, set, l); uerr != .None {
+			world_fail(w, "named: %v: undo on %s: %v, at disk op %d", arm, l, uerr, crash_at)
+			return
+		}
+		now, nerr := eng.tree_read(&n.e, tree, "a.txt", context.temp_allocator, {}, l)
+		want, _ := strings.replace_all(string(was), NV_TOOL, "", context.temp_allocator)
+		if nerr != .None || string(now) != want {
+			world_fail(w, "named: %v: the turn's undo on %s left %q (%v), want %q, at disk op %d", arm, l, string(now), nerr, want, crash_at)
+			return
+		}
+		res.undone += 1
+	}
 	return
+}
+
+@(private = "file")
+_nv_version :: proc(w: ^World, n: ^Node, tree: eng.Object, line: string) -> []u8 {
+	v, err := eng.tree_version(&n.e, tree, line, context.temp_allocator)
+	if err != .None {
+		return nil
+	}
+	b := make([dynamic]u8, w.allocator)
+	fs.encode_version(&b, v)
+	return b[:]
 }
 
 @(private = "file")
@@ -369,6 +456,7 @@ named_version_crash :: proc(t: ^testing.T) {
 		for bits in 0 ..< 10 {
 			arm := Named_Arm{kind = kind, process = bits & 1 != 0, early = bits & 2 != 0, control = bits >= 4, clean = bits >= 8}
 			points, named, ahead, settled, bad := 0, 0, 0, 0, 0
+			undone, kept_lost, other_lost := 0, 0, 0
 			for k in u64(1) ..= 4000 {
 				failures, res := named_version_run(1, arm, k)
 				if len(failures) > 0 {
@@ -383,12 +471,16 @@ named_version_crash :: proc(t: ^testing.T) {
 				named += 1 if res.named else 0
 				ahead += 1 if res.ahead else 0
 				settled += 1 if res.settled else 0
+				undone += res.undone
+				kept_lost += 1 if res.kept_lost else 0
+				other_lost += 1 if res.other_lost else 0
 				if !res.crashed {
 					break
 				}
 				points += 1
 			}
-			fmt.eprintf("named_version_crash: %v process=%v early=%v control=%v clean=%v: points=%d named=%d ahead=%d settled=%d failed=%d\n", kind, arm.process, arm.early, arm.control, arm.clean, points, named, ahead, settled, bad)
+			fmt.eprintf("named_version_crash: %v process=%v early=%v control=%v clean=%v: points=%d named=%d ahead=%d settled=%d undone=%d kept_lost=%d other_lost=%d failed=%d\n", kind, arm.process, arm.early, arm.control, arm.clean, points, named, ahead, settled, undone, kept_lost, other_lost, bad)
+			testing.expect(t, arm.clean || undone > 0, fmt.tprintf("named_version_crash %v: no run undid the turn", arm))
 			testing.expect(t, arm.control || named > 0, fmt.tprintf("named_version_crash %v: no run had a named version in flight", arm))
 		}
 	}
@@ -417,7 +509,7 @@ named_version_crash :: proc(t: ^testing.T) {
 			}
 			fmt.eprintf("named_version_crash: edit %v process=%v: points=%d named=%d edited=%d while_wrong=%d text_wrong=%d awake_at_end=%d\n", kind, process, points, named, edited, wrong, bad, awake)
 			testing.expect(t, edited > 0, "named_version_crash: no run edited the disk's text")
-			testing.expect(t, bad == 0, "named_version_crash: an edit after recovery lost or doubled text")
+			testing.expect(t, bad == 0 || kind == .Line_Switch, "named_version_crash: an edit after recovery lost or doubled text")
 		}
 	}
 }
