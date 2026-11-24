@@ -6,7 +6,8 @@ import "core:strconv"
 import "core:sync"
 import "../prim"
 
-KV_MAGIC :: u64(0x3167_6f6c_7662_6430)
+KV_MAGIC :: u64(0x3267_6f6c_7662_6430)
+KV_MAGIC_V1 :: u64(0x3167_6f6c_7662_6430)
 KV_IDX_MAGIC :: u64(0x3178_6469_7662_6430)
 KV_HEADER :: 4096
 KV_LOG_HEADER :: 16
@@ -797,8 +798,14 @@ kv_open_gen :: proc(kv: ^Kv) -> Error {
 	if rerr != .None {
 		return from_prim(rerr)
 	}
-	if got != KV_LOG_HEADER || prim.get_u64le(hdr[0:8]) != KV_MAGIC {
+	magic := prim.get_u64le(hdr[0:8])
+	if got != KV_LOG_HEADER || (magic != KV_MAGIC && magic != KV_MAGIC_V1) {
 		return .Corrupt
+	}
+	if magic == KV_MAGIC_V1 {
+		prim.put_u64le(hdr[0:8], KV_MAGIC)
+		from_prim(prim.write_at(kv.vfs, fd, hdr[0:8], 0)) or_return
+		from_prim(prim.datasync(kv.vfs, fd)) or_return
 	}
 	kv.marked = prim.get_u32le(hdr[8:12]) == KV_LOG_MARKED
 	kv.log_end = u64(size)
