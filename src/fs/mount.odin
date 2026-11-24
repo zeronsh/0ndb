@@ -81,6 +81,7 @@ Registry :: struct {
 	ready_data: rawptr,
 	observer:  Write_Observer,
 	fence_token: u64,
+	nested:    int,
 	watcher:   Watcher,
 	random:    prim.Random,
 	os_ready:  bool,
@@ -365,6 +366,9 @@ Mount :: struct {
 	ignore:      Ignore,
 	awake:       bool,
 	synced:      [dynamic]crdt.Op_Id,
+	placed:      [dynamic]crdt.Op_Id,
+	has_placed:  bool,
+	mat_ready:   bool,
 	dirty:       map[string]^Scope,
 	dirty_at:    map[string]i64,
 	rescan:      bool,
@@ -864,6 +868,7 @@ mount_close :: proc(m: ^Mount) {
 	}
 	delete(m.open_scopes)
 	delete(m.synced)
+	delete(m.placed)
 	delete(m.saved_synced)
 	git_head_destroy(&m.head, m.allocator)
 	if m.has_git {
@@ -1013,6 +1018,19 @@ mount_holds :: proc(m: ^Mount, target: Version) -> bool {
 		}
 	}
 	return true
+}
+
+mount_placed :: proc(m: ^Mount) -> Version {
+	if m.has_placed {
+		return m.placed[:]
+	}
+	return mount_synced(m)
+}
+
+mount_take_ready :: proc(m: ^Mount) -> bool {
+	r := m.mat_ready
+	m.mat_ready = false
+	return r
 }
 
 mount_synced :: proc(m: ^Mount) -> Version {
@@ -1689,7 +1707,13 @@ observer_wait :: proc(reg: ^Registry) -> Error {
 	}
 	defer virtual.arena_destroy(&arena)
 	context.temp_allocator = virtual.arena_allocator(&arena)
+	reg.nested += 1
+	defer reg.nested -= 1
 	return from_prim(prim.loop_step(reg.loop, true))
+}
+
+registry_nested :: proc "contextless" (reg: ^Registry) -> bool {
+	return reg.nested > 0
 }
 
 @(private)
@@ -2270,6 +2294,7 @@ mount_ack :: proc(m: ^Mount) -> Error {
 	h := m.history
 	if m.mat_wait && h.content_mark <= h.durable {
 		m.mat_wait = false
+		m.mat_ready = true
 		mount_schedule(m, 0)
 	}
 	n := 0
