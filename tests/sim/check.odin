@@ -406,11 +406,24 @@ stall :: proc(w: ^World, format: string, args: ..any) {
 	world_fail(w, format, ..args)
 }
 
+BYZ_SKIP_ONE_IN :: 10
+
+STAT_BYZ_CHECKED: Stat
+STAT_BYZ_SKIPPED: Stat
+
+@(init)
+_byz_content_init :: proc "contextless" () {
+	register_stat_line(71, "byzantine_content")
+	STAT_BYZ_CHECKED = register_stat(71, 0, "checked")
+	STAT_BYZ_SKIPPED = register_stat(71, 1, "skipped")
+}
+
 check_convergence :: proc(w: ^World, final: bool) -> (converged: bool) {
 	m := &w.model
 	converged = true
 	resolve_uncertain(w)
 	known := known_tokens(m)
+	checked, skipped := 0, 0
 	for _, oi in m.objs {
 		if !obj_exists(m, oi) {
 			continue
@@ -418,11 +431,13 @@ check_convergence :: proc(w: ^World, final: bool) -> (converged: bool) {
 		rs := readers_of(w, oi)
 		ref: Digest
 		refn := -1
+		agreed := true
 		for idx in rs {
 			n := w.nodes[idx]
 			d := digest_object(w, n, oi)
 			if !d.complete {
 				converged = false
+				agreed = false
 				if final {
 					stall(w, "convergence: %s could not fully read %v %s (%s)", n.name, m.objs[oi].kind, id_short(m.objs[oi].o.id), d.why)
 				}
@@ -439,6 +454,7 @@ check_convergence :: proc(w: ^World, final: bool) -> (converged: bool) {
 			}
 			if _strip_catalog(d.text, d.guest || ref.guest) != _strip_catalog(ref.text, d.guest || ref.guest) {
 				converged = false
+				agreed = false
 				if final {
 					stall(w, "convergence: %v %s differs between %s and %s:\n--- %s\n%s--- %s\n%s", m.objs[oi].kind, id_short(m.objs[oi].o.id), w.nodes[refn].name, n.name, w.nodes[refn].name, ref.text, n.name, d.text)
 				}
@@ -449,11 +465,23 @@ check_convergence :: proc(w: ^World, final: bool) -> (converged: bool) {
 			if final && w.cfg.verbose && !w.cfg.quiet && m.objs[oi].kind != .Convo {
 				fmt.eprintf("[%9.3f] final %v %s on %s:\n%s\n", f64(w.now) / 1e6, m.objs[oi].kind, id_short(m.objs[oi].o.id), w.nodes[refn].name, ref.text)
 			}
-			if final && !w.cfg.byzantine {
+			if final && (agreed || !w.cfg.byzantine) {
+				checked += 1
 				check_object_model(w, oi, w.nodes[refn], ref.text)
 				check_conflicts(w, oi)
 			}
 			delete(ref.text, w.allocator)
+		}
+		if final && w.cfg.byzantine && len(rs) > 0 && !agreed {
+			skipped += 1
+			world_note(w, "byzantine: the content of %v %s is not checked, its readers did not agree", m.objs[oi].kind, id_short(m.objs[oi].o.id))
+		}
+	}
+	if final && w.cfg.byzantine {
+		stat_add(w, STAT_BYZ_CHECKED, u64(checked))
+		stat_add(w, STAT_BYZ_SKIPPED, u64(skipped))
+		if skipped * BYZ_SKIP_ONE_IN > checked + skipped {
+			world_fail(w, "byzantine: the content of %d of %d objects was not checked, more than one in %d", skipped, checked + skipped, BYZ_SKIP_ONE_IN)
 		}
 	}
 	return
