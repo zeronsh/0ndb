@@ -224,6 +224,7 @@ Turn_Finished :: struct {
 Turn_Failed :: struct {
 	message:    string,
 	checkpoint: string,
+	auth:       bool,
 }
 
 Rewind_Failed :: struct {
@@ -377,6 +378,7 @@ Driver :: struct {
 	reason_item: string,
 	streamed:    bool,
 	interrupted: bool,
+	auth_failed: bool,
 	replaying:   bool,
 	can_load:    bool,
 	can_resume:  bool,
@@ -1072,6 +1074,7 @@ finish_turn :: proc(d: ^Driver, o: ^Output, status: Turn_Status) {
 	emit(o, Turn_Finished{status = status, checkpoint = dup(o, d.checkpoint)})
 	d.running = false
 	d.interrupted = false
+	d.auth_failed = false
 	set(d, &d.turn, "")
 	set(d, &d.last_error, "")
 }
@@ -1079,9 +1082,10 @@ finish_turn :: proc(d: ^Driver, o: ^Output, status: Turn_Status) {
 @(private)
 fail_turn :: proc(d: ^Driver, o: ^Output, message: string) {
 	flush_usage(d, o)
-	emit(o, Turn_Failed{message = dup(o, message), checkpoint = dup(o, d.checkpoint)})
+	emit(o, Turn_Failed{message = dup(o, message), checkpoint = dup(o, d.checkpoint), auth = d.auth_failed})
 	d.running = false
 	d.interrupted = false
+	d.auth_failed = false
 	set(d, &d.turn, "")
 	set(d, &d.last_error, "")
 }
