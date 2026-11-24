@@ -157,7 +157,7 @@ class Provider(BaseHTTPRequestHandler):
 class Daemon:
     def __init__(self, d, port, bin_path):
         self.dir = d
-        self.bin = bin_path
+        self.bin = os.path.abspath(bin_path)
         base = tempfile.gettempdir()
         self.rt = tempfile.mkdtemp(prefix="0s", dir=base if len(base) < 40 else "/tmp")
         self.env = dict(os.environ, ONDB_HOME=os.path.join(d, "home"), ONDB_RUNTIME_DIR=self.rt, ANTHROPIC_BASE_URL="http://127.0.0.1:%d" % port, ANTHROPIC_API_KEY="x")
