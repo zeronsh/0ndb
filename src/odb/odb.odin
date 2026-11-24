@@ -176,6 +176,49 @@ sweep_temps :: proc(db: ^Odb) {
 			prim.remove(db.vfs, p)
 		}
 	}
+	if db.store {
+		sweep_ref_locks(db)
+	}
+}
+
+@(private)
+sweep_ref_locks :: proc(db: ^Odb) {
+	packed := strings.concatenate({db.common_dir, "/packed-refs.lock"}, context.temp_allocator)
+	prim.remove(db.vfs, packed)
+	todo := make([dynamic]string, context.temp_allocator)
+	append(&todo, strings.concatenate({db.common_dir, "/refs"}, context.temp_allocator))
+	for len(todo) > 0 {
+		dir := pop(&todo)
+		d: prim.Dir
+		if prim.dir_open(db.vfs, &d, dir, context.temp_allocator) != .None {
+			continue
+		}
+		stale := make([dynamic]string, context.temp_allocator)
+		for {
+			ent, more, derr := prim.dir_next(db.vfs, &d)
+			if derr != .None || !more {
+				break
+			}
+			p := strings.concatenate({dir, "/", ent.name}, context.temp_allocator)
+			kind := ent.kind
+			if kind == .Unknown {
+				st, serr := prim.lstat(db.vfs, p)
+				if serr != .None {
+					continue
+				}
+				kind = st.kind
+			}
+			if kind == .Dir {
+				append(&todo, p)
+			} else if kind == .File && strings.has_suffix(ent.name, ".lock") {
+				append(&stale, p)
+			}
+		}
+		prim.dir_close(db.vfs, &d)
+		for p in stale {
+			prim.remove(db.vfs, p)
+		}
+	}
 }
 
 @(private)
