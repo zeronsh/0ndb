@@ -247,6 +247,7 @@ Eval_Wait :: struct {
 }
 
 Runtime :: struct {
+	installed:   map[string]Installed_Probe,
 	e:           ^eng.Engine,
 	cfg:         Config,
 	allocator:   runtime.Allocator,
@@ -432,6 +433,11 @@ close :: proc(r: ^Runtime) {
 		return
 	}
 	r.closing = true
+	for k in prim.unordered(r.installed) {
+		delete(k, r.allocator)
+	}
+	delete(r.installed)
+	r.installed = nil
 	eng.set_tick_hook(r.e, {})
 	l := eng.loop(r.e)
 	if r.hooked && r.e.cfg.events.data == r {
