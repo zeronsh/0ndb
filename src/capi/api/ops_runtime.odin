@@ -770,6 +770,9 @@ op_undo :: proc(c: ^Call, o: ^Out) -> Status {
 		return .Unsupported
 	}
 	ob := a_object(c, "object")
+	if werr := eng.convo_warm(c.api.e, ob, ready_local(c)); werr != .None {
+		return pend(c, werr)
+	}
 	id, err := rt.runtime_undo(r, ob, a_rid(c, "msg"))
 	if err != .None && err != .Pending {
 		return status_of(err)
@@ -785,6 +788,9 @@ op_redo :: proc(c: ^Call, o: ^Out) -> Status {
 		return .Unsupported
 	}
 	ob := a_object(c, "object")
+	if werr := eng.convo_warm(c.api.e, ob, ready_local(c)); werr != .None {
+		return pend(c, werr)
+	}
 	id, err := rt.runtime_redo(r, ob, a_id(c, "undo"))
 	if err != .None && err != .Pending {
 		return status_of(err)
@@ -799,7 +805,11 @@ op_regenerate :: proc(c: ^Call, o: ^Out) -> Status {
 	if r == nil {
 		return .Unsupported
 	}
-	id, err := rt.runtime_regenerate(r, a_object(c, "object"), a_rid(c, "msg"))
+	ob := a_object(c, "object")
+	if werr := eng.convo_warm(c.api.e, ob, ready_local(c)); werr != .None {
+		return pend(c, werr)
+	}
+	id, err := rt.runtime_regenerate(r, ob, a_rid(c, "msg"))
 	if err != .None && err != .Pending {
 		return status_of(err)
 	}
