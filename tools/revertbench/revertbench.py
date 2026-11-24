@@ -157,10 +157,10 @@ class Turns:
 
 def shell_command(ops):
     blob = base64.b64encode(json.dumps(ops).encode()).decode()
-    cmd = '"%s" "%s" "%s" "%s"' % (PY, OP, blob, Turns.workdir)
-    cmd = "& " + cmd if WIN else cmd
+    parts = (PY, OP, blob, Turns.workdir)
+    cmd = " ".join('"%s"' % (x.replace("\\", "/") if WIN else x) for x in parts)
     linger = os.environ.get("RB_LINGER", "0")
-    return cmd + ("; Start-Sleep " if WIN else " ; sleep ") + linger if linger != "0" else cmd
+    return cmd + " ; sleep " + linger if linger != "0" else cmd
 
 
 class FakeProvider(BaseHTTPRequestHandler):
