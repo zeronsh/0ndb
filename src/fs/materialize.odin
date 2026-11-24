@@ -286,6 +286,7 @@ materialize_to :: proc(m: ^Mount, target: Version, merge: bool) -> Error {
 		files  = make([dynamic]string, context.temp_allocator),
 		dirs   = make(map[string]bool, context.temp_allocator),
 		staged = make([dynamic]Mat_Stage, context.temp_allocator),
+		late   = make([dynamic]string, context.temp_allocator),
 	}
 	m.mat = &ms
 	defer m.mat = nil
@@ -295,30 +296,33 @@ materialize_to :: proc(m: ^Mount, target: Version, merge: bool) -> Error {
 		if len(ms.staged) > 0 && mat_item_structural(&it) {
 			err = mat_commit_staged(m, &ms)
 		}
+		if err == .None && it.present && slice.contains(ms.late[:], it.path) {
+			err = mat_commit_staged(m, &ms)
+			if err == .None {
+				err = mat_barrier(m, &ms)
+			}
+			if err == .None {
+				err = mat_late_dirs(m, &ms)
+			}
+		}
 		if err == .None {
 			err = materialize_one(m, &it, tl[:])
 		}
 		if err != .None {
 			mat_unstage(m, &ms, 0)
 			mat_owe(m, &ms)
-			if mat_structural(items[i:]) {
-				mat_pin_written(m, items[:i], target)
-				mat_owe_applied(m, items[:i])
-				m.rescan = true
-			} else {
-				mat_roll_forward(m, items[:], sl[:], target)
-			}
+			mat_failed(m, &ms, items[:], i, sl[:], target)
 			return err
 		}
 	}
 	if err := mat_commit_staged(m, &ms); err != .None {
 		mat_owe(m, &ms)
-		mat_roll_forward(m, items[:], sl[:], target)
+		mat_failed(m, &ms, items[:], len(items), sl[:], target)
 		return err
 	}
 	if err := mat_pay_owed(m, &ms); err != .None {
 		mat_owe(m, &ms)
-		mat_roll_forward(m, items[:], sl[:], target)
+		mat_failed(m, &ms, items[:], len(items), sl[:], target)
 		return err
 	}
 	if !ms.raced && !m.restoring && !merge {
@@ -329,8 +333,19 @@ materialize_to :: proc(m: ^Mount, target: Version, merge: bool) -> Error {
 	}
 	if berr := mat_barrier(m, &ms); berr != .None {
 		mat_owe(m, &ms)
-		mat_roll_forward(m, items[:], sl[:], target)
+		mat_failed(m, &ms, items[:], len(items), sl[:], target)
 		return berr
+	}
+	if len(ms.late) > 0 {
+		lerr := mat_late_dirs(m, &ms)
+		if lerr == .None {
+			lerr = mat_barrier(m, &ms)
+		}
+		if lerr != .None {
+			mat_owe(m, &ms)
+			mat_failed(m, &ms, items[:], len(items), sl[:], target)
+			return lerr
+		}
 	}
 	mat_owed_clear(m)
 	if ms.raced && !merge && !m.restoring && m.mat_retries < MAT_RACE_RETRIES {
@@ -365,6 +380,7 @@ Mat_Sync :: struct {
 	dirs:   map[string]bool,
 	raced:  bool,
 	staged: [dynamic]Mat_Stage,
+	late:   [dynamic]string,
 }
 
 @(private)
@@ -578,6 +594,44 @@ mat_raced :: proc(m: ^Mount) {
 	if m.mat != nil {
 		m.mat.raced = true
 	}
+}
+
+@(private)
+mat_failed :: proc(m: ^Mount, ms: ^Mat_Sync, items: []Mat_Item, at: int, sl: []crdt.Lv, target: Version) {
+	if mat_structural(items[at:]) || len(ms.late) > 0 {
+		mat_pin_written(m, items[:at], target)
+		mat_owe_applied(m, items[:at])
+		m.rescan = true
+		return
+	}
+	mat_roll_forward(m, items, sl, target)
+}
+
+@(private)
+mat_late_dirs :: proc(m: ^Mount, ms: ^Mat_Sync) -> Error {
+	slice.sort_by(ms.late[:], proc(a, b: string) -> bool {
+		return count_depth(a) > count_depth(b) || count_depth(a) == count_depth(b) && a < b
+	})
+	for len(ms.late) > 0 {
+		rel := ms.late[0]
+		abuf: prim.Path_Buf
+		abs := abs_path(m, rel, abuf[:])
+		e := prim.remove_dir(m.vfs, abs)
+		#partial switch e {
+		case .None, .Not_Found:
+			mat_dir(m, path_parent_abs(abs))
+		case .Not_Empty:
+		case:
+			st, serr := prim.lstat(m.vfs, abs)
+			if serr != .None || st.kind == .Dir {
+				return from_prim(e)
+			}
+			mount_mark(m, rel)
+		}
+		shadow_remove(&m.shadow, rel) or_return
+		ordered_remove(&ms.late, 0)
+	}
+	return .None
 }
 
 @(private)
@@ -1069,7 +1123,14 @@ materialize_inner :: proc(m: ^Mount, it: ^Mat_Item, tl: []crdt.Lv) -> Error {
 		}
 		abs := abs_path(m, it.old, abuf[:])
 		if it.entry.kind == .Dir {
-			if e := prim.remove_dir(m.vfs, abs); e != .None && e != .Not_Found && e != .Not_Empty {
+			if e := prim.remove_dir(m.vfs, abs); e == .Not_Empty && m.mat != nil && !m.restoring {
+				late, lerr := clone_string(it.old, context.temp_allocator)
+				if lerr != nil {
+					return .No_Memory
+				}
+				append(&m.mat.late, late)
+				return .None
+			} else if e != .None && e != .Not_Found && e != .Not_Empty {
 				return from_prim(e)
 			}
 		} else if e := prim.remove(m.vfs, abs); e != .None && e != .Not_Found {

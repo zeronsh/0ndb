@@ -1147,8 +1147,23 @@ adopt_one :: proc(p: ^Pass, snap: ^fstree.Snapshot, ll: []crdt.Lv, line: Version
 		return false, .Corrupt
 	}
 	if c.kind == .Remove {
-		if c.old.kind != .File || (at_line && ino == c.old.inode) {
+		if (c.old.kind != .File && c.old.kind != .Dir) || (at_line && ino == c.old.inode) {
 			return false, .None
+		}
+		if c.old.kind == .Dir {
+			info, ok, ierr := fstree.info(snap, c.old.inode, context.temp_allocator)
+			if ierr != nil {
+				return false, .Corrupt
+			}
+			if ok && info.present {
+				p, pok, perr := fstree.path(snap, c.old.inode, context.temp_allocator)
+				if perr != nil || !pok {
+					return false, .None
+				}
+				if d := probe(m, p) or_return; d.kind != .Dir {
+					return false, .None
+				}
+			}
 		}
 		shadow_remove(&m.shadow, c.path) or_return
 		mount_absent_add(m, c.path)
