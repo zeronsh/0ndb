@@ -688,7 +688,7 @@ rebase_commit :: proc(p: ^Pass, c: ^Change, v: []crdt.Op_Id, inode: fstree.Inode
 	ne.stat = c.stat
 	ne.oid = oid
 	ne.ver = 0
-	predicted: fstree.Op_Id
+	ahead: crdt.Op_Id
 	if err == .None {
 		if b.n == 0 {
 			buf := make([dynamic]u8, context.temp_allocator)
@@ -699,8 +699,8 @@ rebase_commit :: proc(p: ^Pass, c: ^Change, v: []crdt.Op_Id, inode: fstree.Inode
 			builder_opaque(&b, b.scope)
 			b.scope = nil
 		}
-		predicted = op_inode(h, crdt.Op_Id{b.actor, b.seq0 + u64(b.n)})
-		one := [1]fstree.Op_Id{predicted}
+		ahead = crdt.Op_Id{b.actor, b.seq0 + u64(b.n)}
+		one := [1]fstree.Op_Id{op_inode(h, ahead)}
 		ne.ver, err = shadow_version_add(&m.shadow, one[:])
 	}
 	if err == .None {
@@ -713,7 +713,7 @@ rebase_commit :: proc(p: ^Pass, c: ^Change, v: []crdt.Op_Id, inode: fstree.Inode
 	head: crdt.Op_Id
 	has := false
 	head, has, err = builder_commit_at(m, &b, v)
-	if (err == .None || err == .Reloading) && (!has || op_inode(h, head) != predicted) {
+	if (err == .None || err == .Reloading) && (!has || head != ahead) {
 		err = .Corrupt
 	}
 	if err != .None && err != .Reloading {
