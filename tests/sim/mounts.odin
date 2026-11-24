@@ -1127,6 +1127,16 @@ op_git_mount :: proc(w: ^World, n: ^Node) {
 	}
 }
 
+check_fork_rejected :: proc(w: ^World) {
+	for n in w.nodes {
+		for sm in n.mounts {
+			if sm.m != nil && sm.m.fork_rejected > 0 {
+				world_fail(w, "mount: %s %s forked a line without %d named versions the disk holds", n.name, sm.root, sm.m.fork_rejected)
+			}
+		}
+	}
+}
+
 check_synced_disk :: proc(w: ^World, n: ^Node) {
 	if !n.alive || !n.e_open || len(n.disk.events) > 0 || n.watch_scheduled || n.disk.dead {
 		return
@@ -1162,6 +1172,7 @@ STAT_BASE_CLOSE_FAILED: Stat
 @(init)
 _mounts_stats :: proc "contextless" () {
 	register_final_check(110, check_mounts)
+	register_final_check(111, check_fork_rejected)
 	register_stat_line(50, "agent_bases")
 	STAT_BASE_MERGED = register_stat(50, 0, "merged")
 	STAT_BASE_CURRENT = register_stat(50, 1, "current")
