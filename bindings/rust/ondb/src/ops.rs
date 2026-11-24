@@ -165,9 +165,6 @@ impl Client {
         self.call(&json!({"op": "follow", "object": object}))
     }
 
-    pub fn redact(&self, object: &str, msg: &str) -> Pending<WriteResult> {
-        self.call(&json!({"op": "redact", "object": object, "msg": msg}))
-    }
 
     pub fn record(&self, object: &str, a: &RecordArgs) -> Pending<Receipt> {
         let mut m = Map::new();
@@ -387,9 +384,6 @@ impl Client {
         self.call(&json!({"op": "map.remove", "object": object, "key": hex(key), "tag": tag, "element": hex(element)}))
     }
 
-    pub fn map_redact(&self, object: &str, key: &[u8]) -> Pending<Ack> {
-        self.call(&json!({"op": "map.redact", "object": object, "key": hex(key)}))
-    }
 
     pub fn text_read(&self, object: &str) -> Pending<Text> {
         self.call(&json!({"op": "text.read", "object": object}))
@@ -403,9 +397,6 @@ impl Client {
         self.call(&json!({"op": "text.edit", "object": object, "pos": pos, "remove": remove, "insert": insert}))
     }
 
-    pub fn text_redact(&self, object: &str, pos: u64, len: u64) -> Pending<Ack> {
-        self.call(&json!({"op": "text.redact", "object": object, "pos": pos, "len": len}))
-    }
 
     pub fn tree_read(&self, object: &str, path: &str, line: Option<&str>) -> Pending<TreeText> {
         let mut m = Map::new();
