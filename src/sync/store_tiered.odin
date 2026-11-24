@@ -69,6 +69,13 @@ Tier_Store :: struct {
 	park_timer: prim.Timer,
 	park_ms:    i64,
 	parks:      u64,
+	man_reads:      u64,
+	man_read_bytes: u64,
+	index_reads:      u64,
+	index_read_bytes: u64,
+	index_writes:     u64,
+	index_repairs:    u64,
+	index_failures:   u64,
 	allocator: runtime.Allocator,
 }
 
@@ -121,6 +128,15 @@ Tier_Space :: struct {
 	thawing:   map[Stream_Id]int,
 	redacting: map[Stream_Id]int,
 	rewriting: map[Stream_Id]int,
+	idx_w:     i64,
+	idx_dw:    i64,
+	idx_next:  i64,
+	idx_len:   i64,
+	idx_mark:  i64,
+	idx_busy:  bool,
+	idx_q:     [dynamic]u8,
+	idx_fly:   [dynamic]u8,
+	idx_base:  i64,
 }
 
 @(private)
@@ -300,7 +316,7 @@ _tier_ns_open :: proc(data: rawptr, id: Space_Id) -> (h: rawptr, usage: i64, err
 	t := cast(^Tier_Store)data
 	if sp, ok := t.spaces[id]; ok {
 		sp.refs += 1
-		return sp, max(sp.usage - sp.man_len, 0), .None
+		return sp, max(sp.usage - sp.man_len - sp.idx_len, 0), .None
 	}
 	ns, u := t.inner.namespace_open(t.inner.data, id) or_return
 	sp := new(Tier_Space, t.allocator)
@@ -317,13 +333,20 @@ _tier_ns_open :: proc(data: rawptr, id: Space_Id) -> (h: rawptr, usage: i64, err
 	sp.thawing = make(map[Stream_Id]int, t.allocator)
 	sp.redacting = make(map[Stream_Id]int, t.allocator)
 	sp.rewriting = make(map[Stream_Id]int, t.allocator)
+	sp.idx_q = make([dynamic]u8, t.allocator)
+	sp.idx_fly = make([dynamic]u8, t.allocator)
 	t.spaces[id] = sp
-	if lerr := _tier_load(sp); lerr != .None {
+	lerr := _tier_load(sp)
+	if lerr == .None {
+		lerr = _tier_index_load(sp)
+	}
+	if lerr != .None {
 		delete_key(&t.spaces, id)
 		_tier_space_free(t, sp)
 		return nil, 0, lerr
 	}
-	return sp, max(sp.usage - sp.man_len, 0), .None
+	_tier_index_flush(sp)
+	return sp, max(sp.usage - sp.man_len - sp.idx_len, 0), .None
 }
 
 @(private)
@@ -349,7 +372,7 @@ _tier_unhold :: proc(sp: ^Tier_Space) {
 @(private)
 _tier_maybe_release :: proc(sp: ^Tier_Space) {
 	t := sp.t
-	if sp.refs > 0 || sp.dirty || sp.flushing || sp.man_busy || len(sp.man_q) > 0 || len(sp.man_wait) > 0 || len(sp.open) > 0 || sp.evicting > 0 || len(sp.ev_q) > 0 || len(sp.ev_fly) > 0 {
+	if sp.refs > 0 || sp.dirty || sp.flushing || sp.man_busy || len(sp.man_q) > 0 || len(sp.man_wait) > 0 || len(sp.open) > 0 || sp.evicting > 0 || len(sp.ev_q) > 0 || len(sp.ev_fly) > 0 || sp.idx_busy {
 		return
 	}
 	delete_key(&t.spaces, sp.id)
@@ -377,6 +400,8 @@ _tier_space_free :: proc(t: ^Tier_Store, sp: ^Tier_Space) {
 	delete(sp.thawing)
 	delete(sp.redacting)
 	delete(sp.rewriting)
+	delete(sp.idx_q)
+	delete(sp.idx_fly)
 	if sp.man != nil {
 		t.inner.stream_close(t.inner.data, sp.man)
 	}
@@ -721,6 +746,9 @@ _tier_man_flush :: proc(sp: ^Tier_Space) {
 		carries ||= Tier_Kind(sp.man_q[i]) == .Dirty
 	}
 	sp.man_dirty = carries
+	clear(&sp.idx_fly)
+	append(&sp.idx_fly, ..sp.man_q[:])
+	sp.idx_base = sp.man_len
 	clear(&sp.man_q)
 	append(&sp.ev_fly, ..sp.ev_q[:])
 	clear(&sp.ev_q)
@@ -737,7 +765,10 @@ _tier_man_done :: proc(ctx: rawptr, result: Error, value: i64) {
 	if result == .None {
 		sp.usage += value - sp.man_len
 		sp.man_len = value
+		_tier_index_queue(sp, sp.idx_fly[:], sp.idx_base)
 	}
+	clear(&sp.idx_fly)
+	_tier_index_flush(sp)
 	_tier_ev_done(sp, result)
 	if sp.man_dirty {
 		sp.man_dirty = false
@@ -1068,7 +1099,7 @@ _tier_rewrite :: proc(sp: ^Tier_Space, id: Stream_Id, rng: [2]i64) -> int {
 	if sp.man_len == 0 || t.cfg.objects.read == nil {
 		return 0
 	}
-	raw, ok := _tier_manifest(sp)
+	raw, ok := _tier_stream_records(sp, id)
 	if !ok {
 		return 0
 	}
