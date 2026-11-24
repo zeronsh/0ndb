@@ -257,6 +257,7 @@ verify_shadow :: proc(m: ^Mount, synced: ^fstree.Snapshot, dir: string, disk: bo
 }
 
 mount_synced_text :: proc(m: ^Mount, rel: string, allocator := context.allocator) -> (text: []u8, found: bool, err: Error) {
+	mount_wake(m) or_return
 	h := m.history
 	if h == nil || !h.awake {
 		return nil, false, .Busy

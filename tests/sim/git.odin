@@ -702,3 +702,39 @@ git_index_oids :: proc(vfs: prim.Vfs, root: string) -> map[string]odb.Oid {
 	}
 	return out
 }
+
+git_index_refresh :: proc(vfs: prim.Vfs, root: string) -> prim.Error {
+	git := strings.concatenate({root, "/.git"}, context.temp_allocator)
+	rows := _git_index_rows(vfs, git)
+	lock := strings.concatenate({git, "/index.lock"}, context.temp_allocator)
+	lfd := prim.open_file(vfs, lock, {.Write, .Create, .Exclusive}, 0o644) or_return
+	prim.close_file(vfs, lfd) or_return
+	names := make([dynamic]string, context.temp_allocator)
+	for k in rows {
+		append(&names, k)
+	}
+	slice.sort(names[:])
+	idx := make([dynamic]u8, context.temp_allocator)
+	append(&idx, 'D', 'I', 'R', 'C')
+	_put32(&idx, 2)
+	_put32(&idx, u32(len(names)))
+	for name in names {
+		row := rows[name]
+		path := strings.concatenate({root, "/", name}, context.temp_allocator)
+		data, derr := prim.read_file(vfs, path, context.temp_allocator)
+		if derr == .None {
+			if h, herr := odb.hash(.Sha1, .Blob, data); herr == .None && h == row.oid {
+				if err := _git_index_entry(&idx, vfs, path, name, row.oid); err != .None {
+					prim.remove(vfs, lock)
+					return err
+				}
+				continue
+			}
+		}
+		append(&idx, ..row.raw)
+	}
+	sum := odb.hash_bytes(.Sha1, idx[:])
+	append(&idx, ..sum[:20])
+	_write_file(vfs, lock, idx[:]) or_return
+	return prim.rename(vfs, lock, strings.concatenate({git, "/index"}, context.temp_allocator))
+}

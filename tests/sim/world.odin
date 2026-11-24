@@ -194,6 +194,7 @@ Config :: struct {
 	durability:  eng.Durability,
 	promote:     i64,
 	persist_fault: bool,
+	index_trust: bool,
 }
 
 World :: struct {

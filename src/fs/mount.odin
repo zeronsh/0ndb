@@ -413,6 +413,8 @@ Mount :: struct {
 	override:    map[string]odb.Oid,
 	trusted:     map[string]Index_Entry,
 	trust_mtime: i64,
+	trust_reads: int,
+	trust_refused: int,
 	clean:       bool,
 	waits:       [dynamic]Mount_Wait,
 	open_scopes: map[string]^Scope,
