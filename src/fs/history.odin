@@ -131,6 +131,7 @@ History :: struct {
 	kv_upto:    u64,
 	mark:       u64,
 	mark_fp:    [3]u64,
+	content_mark: u64,
 	staged:     [dynamic]Staged_Blob,
 	mounts:     [dynamic]^Mount,
 	pins:       [dynamic]odb.Oid,
@@ -393,6 +394,15 @@ history_rebind :: proc(h: ^History, streams: Stream_Source, opts: History_Option
 
 history_durable_mark :: proc "contextless" (h: ^History) -> u64 {
 	return h.mark
+}
+
+history_mark_refresh :: proc(h: ^History) {
+	fp := history_fp(h)
+	if fp != h.mark_fp {
+		h.mark += 1
+		h.mark_fp = fp
+		h.content_mark = h.mark
+	}
 }
 
 history_mark_take :: proc "contextless" (h: ^History) -> u64 {
@@ -1612,6 +1622,7 @@ history_stage_blob :: proc(h: ^History, data: []u8) -> (oid: odb.Oid, err: Error
 	copy_data := make([]u8, len(data), h.allocator)
 	copy(copy_data, data)
 	h.mark += 1
+	h.content_mark = h.mark
 	append(&h.staged, Staged_Blob{oid, copy_data, h.mark})
 	return oid, .None
 }

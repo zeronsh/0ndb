@@ -440,15 +440,19 @@ _cu_drive_new :: proc(e: ^Engine, o: Object, move: prim.Id) -> Error {
 
 convo_undo_drive :: proc(e: ^Engine, o: Object, undo: prim.Id) -> Error {
 	context = context_for(e)
+	st, found := _cu_undo_state(e, o, undo) or_return
+	if !found {
+		return .Not_Found
+	}
+	convs: []Undo_Conv
 	for _ in 0 ..< int(max(convo.Undo_Phase)) + 1 {
-		st, found := _cu_undo_state(e, o, undo) or_return
-		if !found {
-			return .Not_Found
-		}
 		if st.phase == .Released {
 			return .None
 		}
-		_cu_undo_step(e, o, &st) or_return
+		if convs == nil {
+			convs = _cu_move_tree(e, o, &st) or_return
+		}
+		_cu_undo_step(e, o, &st, convs) or_return
 	}
 	return .None
 }
@@ -493,6 +497,17 @@ _cu_undo_write :: proc(e: ^Engine, o: Object, undo: prim.Id, msg: Rid, phase: co
 _cu_durable :: proc(e: ^Engine, h: ^Handle) -> Error {
 	_oerr(convo.writer_commit(&h.cw)) or_return
 	_handle_mark(h)
+	return .None
+}
+
+@(private)
+_cu_advance :: proc(e: ^Engine, o: Object, st: ^convo.Undo_State, phase: convo.Undo_Phase, set: []convo.Undo_Line) -> Error {
+	_cu_undo_write(e, o, st.id, st.msg, phase, set, st.redo) or_return
+	st.phase = phase
+	if phase == .Fenced {
+		st.set = set
+		st.fenced = true
+	}
 	return .None
 }
 
@@ -549,8 +564,7 @@ _cu_descends :: proc(e: ^Engine, o: Object, at, of: Rid) -> (yes: bool, err: Err
 }
 
 @(private)
-_cu_undo_step :: proc(e: ^Engine, o: Object, st: ^convo.Undo_State) -> Error {
-	convs := _cu_move_tree(e, o, st) or_return
+_cu_undo_step :: proc(e: ^Engine, o: Object, st: ^convo.Undo_State, convs: []Undo_Conv) -> Error {
 	visible := make([dynamic]Object, context.temp_allocator)
 	for c in convs {
 		if !c.hidden {
@@ -563,7 +577,7 @@ _cu_undo_step :: proc(e: ^Engine, o: Object, st: ^convo.Undo_State) -> Error {
 		if hk.hold != nil {
 			hk.hold(hk.data, e, visible[:], st.id) or_return
 		}
-		return _cu_undo_write(e, o, st.id, st.msg, .Held, nil, st.redo)
+		return _cu_advance(e, o, st, .Held, nil)
 	case .Held:
 		_cu_undo_fence(e, convs)
 		set: []convo.Undo_Line
@@ -575,21 +589,21 @@ _cu_undo_step :: proc(e: ^Engine, o: Object, st: ^convo.Undo_State) -> Error {
 			set = _cu_undo_set(e, o, st.msg, convs) or_return
 		}
 		_cu_park(e, o.space, set) or_return
-		return _cu_undo_write(e, o, st.id, st.msg, .Fenced, set, st.redo)
+		return _cu_advance(e, o, st, .Fenced, set)
 	case .Fenced:
 		for l in st.set {
 			_cu_undo_line(e, o.space, st.id, o.id, l) or_return
 		}
 		_cu_undo_undone(e, o, st, convs) or_return
-		return _cu_undo_write(e, o, st.id, st.msg, .Reverted, nil, st.redo)
+		return _cu_advance(e, o, st, .Reverted, nil)
 	case .Reverted:
 		if st.cause == .Undo && st.redo == {} {
 			_cu_undo_unmount(e, o, st.msg) or_return
 		}
-		return _cu_undo_write(e, o, st.id, st.msg, .Moved, nil, st.redo)
+		return _cu_advance(e, o, st, .Moved, nil)
 	case .Moved:
 		_cu_undo_leaves(e, o, st, convs) or_return
-		return _cu_undo_write(e, o, st.id, st.msg, .Leaves, nil, st.redo)
+		return _cu_advance(e, o, st, .Leaves, nil)
 	case .Leaves:
 		if hk.rewind != nil {
 			for c in visible {
@@ -597,12 +611,12 @@ _cu_undo_step :: proc(e: ^Engine, o: Object, st: ^convo.Undo_State) -> Error {
 				hk.rewind(hk.data, e, c, st_c.position) or_return
 			}
 		}
-		return _cu_undo_write(e, o, st.id, st.msg, .Rewound, nil, st.redo)
+		return _cu_advance(e, o, st, .Rewound, nil)
 	case .Rewound:
 		if hk.release != nil {
 			hk.release(hk.data, e, visible[:], st.id) or_return
 		}
-		return _cu_undo_write(e, o, st.id, st.msg, .Released, nil, st.redo)
+		return _cu_advance(e, o, st, .Released, nil)
 	case .Released:
 	}
 	return .None
