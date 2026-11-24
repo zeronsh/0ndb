@@ -1786,6 +1786,28 @@ shown_version :: proc(m: ^Mount, line: string, head: Version) -> (v: Version, ok
 }
 
 @(private)
+shown_with_own :: proc(m: ^Mount, line: string, row: Version) -> (v: Version, err: Error) {
+	h := m.history
+	actor := line_actor(m, line) or_return
+	known := crdt.graph_known(&h.g, actor)
+	if known == 0 {
+		return row, .None
+	}
+	own, ok := crdt.graph_lv(&h.g, crdt.Op_Id{actor, known - 1})
+	rl := make([dynamic]crdt.Lv, context.temp_allocator)
+	if !ok || crdt.graph_version_lvs(&h.g, row, &rl) != .None {
+		return nil, .Corrupt
+	}
+	if crdt.graph_contains(&h.g, rl[:], own) {
+		return row, .None
+	}
+	one := [1]crdt.Lv{own}
+	both := make([dynamic]crdt.Lv, context.temp_allocator)
+	crdt.version_union(&h.g, rl[:], one[:], &both)
+	return crdt.graph_version_ids(&h.g, both[:], context.temp_allocator), .None
+}
+
+@(private)
 line_follow :: proc(m: ^Mount, key: string) -> Error {
 	h := m.history
 	shown_put(&m.shown, m.line, m.synced[:], m.allocator)
@@ -1795,7 +1817,7 @@ line_follow :: proc(m: ^Mount, key: string) -> Error {
 	} else {
 		target := v
 		if row, ok := shown_version(m, key, v); ok {
-			target = row
+			target = shown_with_own(m, key, row) or_return
 		}
 		line_retarget(m, target) or_return
 	}
