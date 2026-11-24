@@ -689,6 +689,7 @@ flush :: proc(e: ^Engine) -> Error {
 			return err
 		}
 		_held_retry(e)
+		_hist_blocked_retry(e)
 		if !_tick_pending(e) && len(e.held) == 0 {
 			break
 		}
@@ -795,6 +796,25 @@ _on_wake :: proc(l: ^prim.Loop, data: rawptr) {
 }
 
 @(private)
+_hist_blocked_retry :: proc(e: ^Engine) {
+	if pack.pressure(&e.pk) {
+		return
+	}
+	for id in prim.sorted_keys(e.handles) {
+		h := e.handles[id]
+		if h.hist == nil || !fs.history_groups_blocked(h.hist) {
+			continue
+		}
+		if err := fs.history_groups_retry(h.hist); err != .None {
+			_log(e, .Warn, "history state commit failed")
+		}
+		if fs.history_durable_mark(h.hist) > h.hist.durable {
+			_touch(e)
+		}
+	}
+}
+
+@(private)
 _pack_poll :: proc(e: ^Engine) {
 	if !e.pk_open {
 		return
@@ -805,6 +825,7 @@ _pack_poll :: proc(e: ^Engine) {
 	}
 	if was && !pack.pressure(&e.pk) {
 		_held_retry(e)
+		_hist_blocked_retry(e)
 		if _tick_pending(e) {
 			_touch(e)
 		}
