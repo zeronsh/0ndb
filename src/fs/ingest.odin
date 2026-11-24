@@ -1551,6 +1551,7 @@ mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> (err: Error) {
 		p.git_wrote = (p.head_moved && (!commits_only || rewritten)) || (p.operation != "" && stamp != m.stamp)
 		if key := branch_key(m, p.head, p.long); key != m.branch && p.operation == "" {
 			p.switched = true
+			m.switch_tail = false
 			p.line_from, _ = clone_string(m.branch, p.long)
 			p.line_to = key
 			follow := m.opts.follow_branch && m.line == m.branch
