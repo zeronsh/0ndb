@@ -75,6 +75,7 @@ Message :: struct {
 	landed:      bool,
 	landed_as:   Seal_Status,
 	claim:       Rid,
+	scope:       Rid,
 	lines:       []Line,
 }
 
@@ -848,6 +849,34 @@ compactions :: proc(v: ^obj.View, floor: prim.Hlc, allocator := context.allocato
 	return acc.list[:], .None
 }
 
+Turn_Scope :: struct {
+	at:     Rid,
+	msg:    Rid,
+	id:     prim.Id,
+	actor:  prim.Id,
+	stamp:  prim.Hlc,
+	before: []u8,
+	after:  []u8,
+}
+
+turn_scope_at :: proc(v: ^obj.View, at: Rid, allocator := context.allocator) -> (out: Turn_Scope, err: Error) {
+	x := obj.vref(v, at) or_return
+	body, _ := obj.get(v, x.seg, x.off) or_return
+	if obj.is_redacted(body) {
+		return {}, .Not_Found
+	}
+	rec := decode_record(body, x.off, v.scratch) or_return
+	sc, ok := rec.body.(Scope)
+	if !ok || sc.kind != .Turn {
+		return {}, .Corrupt
+	}
+	m := obj.resolve(v, x.seg, sc.msg) or_return
+	out = Turn_Scope{at = at, msg = obj.rid(v, m) or_return, id = sc.id, actor = sc.actor, stamp = rec.stamp}
+	out.before = obj.clone_bytes(sc.before, allocator) or_return
+	out.after = obj.clone_bytes(sc.after, allocator) or_return
+	return out, .None
+}
+
 intents :: proc(v: ^obj.View, allocator := context.allocator) -> (items: []Intent, err: Error) {
 	pend := make([dynamic]Pend, v.scratch)
 	_pending(v, &pend) or_return
@@ -1109,7 +1138,7 @@ _seal_info :: proc(v: ^obj.View, at: Vref, seal: Vref, seal_known: bool, msg: ^M
 		sv := seal
 		if sv.seg == s && sv.off > at.off {
 			body, _ := obj.get(v, s, sv.off) or_return
-			_apply_seal(body, sv.off, at.off, msg, allocator) or_return
+			_apply_seal(v, s, body, sv.off, at.off, msg, allocator) or_return
 			msg.seal = obj.rid_body(v, sv, body)
 			seal_at^ = sv
 			return msg.last_block, .None
@@ -1140,7 +1169,7 @@ _seal_info :: proc(v: ^obj.View, at: Vref, seal: Vref, seal_known: bool, msg: ^M
 			}
 			c.seals[key] = mo
 			if mo == at.off {
-				_apply_seal(body, sum.last_seal, at.off, msg, allocator) or_return
+				_apply_seal(v, s, body, sum.last_seal, at.off, msg, allocator) or_return
 				seal_at^ = Vref{s, sum.last_seal}
 				msg.seal = obj.rid_body(v, seal_at^, body)
 				return msg.last_block, .None
@@ -1153,19 +1182,22 @@ _seal_info :: proc(v: ^obj.View, at: Vref, seal: Vref, seal_known: bool, msg: ^M
 		return l, .None
 	}
 	body, _ := obj.get(v, s, so) or_return
-	_apply_seal(body, so, at.off, msg, allocator) or_return
+	_apply_seal(v, s, body, so, at.off, msg, allocator) or_return
 	seal_at^ = Vref{s, so}
 	msg.seal = obj.rid_body(v, seal_at^, body)
 	return msg.last_block, .None
 }
 
 @(private)
-_apply_seal :: proc(body: []u8, off: i64, m: i64, msg: ^Message, allocator: runtime.Allocator) -> Error {
+_apply_seal :: proc(v: ^obj.View, seg: int, body: []u8, off: i64, m: i64, msg: ^Message, allocator: runtime.Allocator) -> Error {
 	rec := decode_record(body, off) or_return
 	#partial switch r in rec.body {
 	case Seal:
 		if r.msg != m {
 			return .Corrupt
+		}
+		if r.scope != 0 {
+			msg.scope = obj.rid(v, Vref{seg, r.scope}) or_return
 		}
 		msg.status = r.status
 		msg.usage = r.usage
