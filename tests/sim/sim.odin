@@ -543,9 +543,7 @@ env_disabled :: proc() -> (out: bit_set[Op_Kind]) {
 				out += {k}
 			}
 		}
-		if strings.trim_space(part) == "redact" {
-			out += {.Redact_Msg, .Redact_Text, .Redact_Map}
-		}
+
 	}
 	return
 }

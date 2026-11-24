@@ -322,34 +322,6 @@ hostile :: proc(id: prim.Id) -> bool {
 	return id[1] == 0xad
 }
 
-REDACT :: u8(0xff)
-
-redact_msg :: proc(actor: prim.Id, seq: u64, n: int) -> []u8 {
-	buf := make([dynamic]u8)
-	w := prim.writer(&buf)
-	prim.write_u8(&w, REDACT)
-	prim.write_id(&w, actor)
-	prim.write_uvarint(&w, seq)
-	prim.write_uvarint(&w, u64(n))
-	return buf[:]
-}
-
-apply_redact :: proc(r: ^Replica, msg: []u8) {
-	rd := prim.reader(msg[1:])
-	actor := prim.read_id(&rd)
-	seq := prim.read_uvarint(&rd)
-	n := int(prim.read_uvarint(&rd))
-	added := make([dynamic]crdt.Op_Span)
-	defer delete(added)
-	crdt.graph_redact(&r.g, actor, seq, n, &added)
-	for a in added {
-		for &f in r.files {
-			crdt.log_redact(&f.log, &r.g, a.id.actor, a.id.seq, a.len)
-			crdt.text_redact(&f.text, &r.g, a.id.actor, a.id.seq, a.len)
-		}
-	}
-}
-
 copy_read :: proc(data: rawptr, src: crdt.Op_Id, dst: []u8, authors: ^[dynamic]crdt.Author_Span) -> int {
 	r := (^Replica)(data)
 	done := 0
@@ -377,18 +349,14 @@ expected :: proc(g: ^crdt.Graph, s: Snapshot) -> ([]u8, []crdt.Author_Span) {
 		for i in 0 ..< sp.len {
 			id := crdt.Op_Id{sp.id.actor, sp.id.seq + u64(i)}
 			op := crdt.Op_Id{sp.op.actor, sp.op.seq + u64(i)}
-			red := crdt.graph_is_redacted(g, op)
-			if red {
-				bytes[pos + i] = 0
-			}
 			if n := len(spans); n > 0 {
 				l := &spans[n - 1]
-				if l.id.actor == id.actor && l.id.seq + u64(l.len) == id.seq && l.op.actor == op.actor && l.op.seq + u64(l.len) == op.seq && l.redacted == red {
+				if l.id.actor == id.actor && l.id.seq + u64(l.len) == id.seq && l.op.actor == op.actor && l.op.seq + u64(l.len) == op.seq {
 					l.len += 1
 					continue
 				}
 			}
-			append(&spans, crdt.Author_Span{id = id, op = op, len = 1, redacted = red})
+			append(&spans, crdt.Author_Span{id = id, op = op, len = 1})
 		}
 		pos += sp.len
 	}
@@ -396,10 +364,6 @@ expected :: proc(g: ^crdt.Graph, s: Snapshot) -> ([]u8, []crdt.Author_Span) {
 }
 
 deliver :: proc(t: ^testing.T, r: ^Replica, msg: []u8, rng: ^Rng) -> bool {
-	if len(msg) > 0 && msg[0] == REDACT {
-		apply_redact(r, msg)
-		return true
-	}
 	b, err := crdt.batch_decode(msg, dict = r.dict)
 	testing.expect_value(t, err, crdt.Error.None)
 	if err != .None {
@@ -730,17 +694,7 @@ run_fuzz :: proc(t: ^testing.T, seed: u64, replicas: int, rounds: int) {
 		who := below(&rng, replicas)
 		switch below(&rng, 10) {
 		case 0 ..= 3:
-			if chance(&rng, 10) {
-				victim := &rs[below(&rng, replicas)]
-				seq := u64(below(&rng, int(victim.seq) + 20))
-				n := 1 + below(&rng, 40)
-				for &o in rs {
-					append(&o.inbox, redact_msg(victim.actor, seq, n))
-					if chance(&rng, 20) {
-						append(&o.inbox, redact_msg(victim.actor, seq, n))
-					}
-				}
-			} else if chance(&rng, 12) {
+			if chance(&rng, 12) {
 				attack(t, rs, who, &rng, &attacks)
 			} else {
 				local_edit(t, rs, who, &rng)
