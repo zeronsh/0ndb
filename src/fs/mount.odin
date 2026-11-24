@@ -2441,9 +2441,9 @@ mount_recover :: proc(m: ^Mount) -> Error {
 			if ierr != nil {
 				return .Corrupt
 			}
-			old, _, had := shadow_by_inode(&m.shadow, ino, context.temp_allocator) or_return
+			old, oe, had := shadow_by_inode(&m.shadow, ino, context.temp_allocator) or_return
 			if !found || !info.present {
-				if had {
+				if had && !(recover_orphan(m, old, oe, ino, by_intent[:]) or_return) {
 					shadow_remove(&m.shadow, old) or_return
 				}
 				continue
@@ -2476,6 +2476,41 @@ mount_recover :: proc(m: ^Mount) -> Error {
 Recovered_Intent :: struct {
 	end:     crdt.Op_Id,
 	touched: map[fstree.Inode_Id]bool,
+}
+
+@(private)
+recover_orphan :: proc(m: ^Mount, p: string, e: Entry, ino: fstree.Inode_Id, intents: []Recovered_Intent) -> (kept: bool, err: Error) {
+	h := m.history
+	if e.kind != .File {
+		return false, .None
+	}
+	d := probe(m, p) or_return
+	if d.kind != .File {
+		return false, .None
+	}
+	data, oid, binary, ok := read_content(m, p, d.stat, ino, true) or_return
+	if !ok || binary || .Opaque in tree_flags(h, ino) {
+		return false, .None
+	}
+	#reverse for it in intents {
+		if !it.touched[ino] {
+			continue
+		}
+		at := [1]crdt.Op_Id{it.end}
+		t, terr := history_text_at(h, ino, at[:], context.temp_allocator)
+		if terr != .None || string(t) != string(data) {
+			continue
+		}
+		one := [1]fstree.Op_Id{op_inode(h, it.end)}
+		ne := e
+		ne.ver = shadow_version_add(&m.shadow, one[:]) or_return
+		ne.stat = d.stat
+		ne.oid = oid
+		shadow_put(&m.shadow, p, ne) or_return
+		mount_absent_add(m, p)
+		return true, .None
+	}
+	return false, .None
 }
 
 @(private)
