@@ -1734,7 +1734,10 @@ line_follow :: proc(m: ^Mount, key: string) -> Error {
 		fork := fork_version(m) or_return
 		history_set_line(h, key, fork) or_return
 	} else {
-		line_retarget(m, v) or_return
+		same := fork_matches(m, v) or_return
+		if !same {
+			line_retarget(m, v) or_return
+		}
 	}
 	delete(m.line, m.allocator)
 	m.line, _ = clone_string(key, m.allocator)
@@ -1833,6 +1836,32 @@ fork_version :: proc(m: ^Mount) -> (v: Version, err: Error) {
 		acc = next
 	}
 	return crdt.graph_version_ids(&h.g, acc[:], context.temp_allocator), .None
+}
+
+@(private)
+fork_matches :: proc(m: ^Mount, line: Version) -> (same: bool, err: Error) {
+	h := m.history
+	rejected := m.fork_rejected
+	fork := fork_version(m) or_return
+	m.fork_rejected = rejected
+	fl := make([dynamic]crdt.Lv, context.temp_allocator)
+	ll := make([dynamic]crdt.Lv, context.temp_allocator)
+	sl := make([dynamic]crdt.Lv, context.temp_allocator)
+	if crdt.graph_version_lvs(&h.g, fork, &fl) != .None || crdt.graph_version_lvs(&h.g, line, &ll) != .None || crdt.graph_version_lvs(&h.g, m.synced[:], &sl) != .None {
+		return false, .Corrupt
+	}
+	if crdt.frontier_eq(fl[:], sl[:]) {
+		return false, .None
+	}
+	only_a := make([dynamic]crdt.Lv_Span, context.temp_allocator)
+	only_b := make([dynamic]crdt.Lv_Span, context.temp_allocator)
+	crdt.graph_diff(&h.g, fl[:], ll[:], &only_a, &only_b)
+	if len(only_a) > 0 {
+		return false, .None
+	}
+	touched := make(map[fstree.Inode_Id]bool, context.temp_allocator)
+	spans_touched(h, only_b[:], &touched) or_return
+	return len(touched) == 0, .None
 }
 
 @(private)
