@@ -893,30 +893,42 @@ displaced_touch :: proc(m: ^Mount, snap: ^fstree.Snapshot, touched: ^map[fstree.
 
 @(private)
 name_group_touch :: proc(snap: ^fstree.Snapshot, path: string, touched: ^map[fstree.Inode_Id]bool) -> Error {
-	base := conflict_base(path)
-	if base == path {
-		return .None
-	}
-	dir := fstree.ROOT
-	if parent := path_parent(path); parent != "" {
-		d, ok, derr := fstree.lookup(snap, parent)
-		if derr != nil {
-			return .Corrupt
+	dirs := make([dynamic]fstree.Inode_Id, context.temp_allocator)
+	append(&dirs, fstree.ROOT)
+	rest := path
+	for len(rest) > 0 {
+		part := rest
+		if at := strings.index_byte(rest, '/'); at >= 0 {
+			part, rest = rest[:at], rest[at + 1:]
+		} else {
+			rest = ""
 		}
-		if !ok {
-			return .None
+		next := make([dynamic]fstree.Inode_Id, context.temp_allocator)
+		for d in dirs {
+			if ino, ok, lerr := fstree.lookup_child(snap, d, part); lerr != nil {
+				return .Corrupt
+			} else if ok {
+				append(&next, ino)
+				continue
+			}
+			name := conflict_base(part)
+			if name == part {
+				continue
+			}
+			kids, kerr := fstree.children(snap, d, nil, 0, context.temp_allocator)
+			if kerr != nil {
+				return .Corrupt
+			}
+			for k in kids {
+				if k.name == name || (len(k.name) > len(name) && k.name[len(name)] == '~' && k.name[:len(name)] == name) {
+					append(&next, k.inode)
+				}
+			}
 		}
-		dir = d
-	}
-	kids, kerr := fstree.children(snap, dir, nil, 0, context.temp_allocator)
-	if kerr != nil {
-		return .Corrupt
-	}
-	name := path_name(base)
-	for k in kids {
-		if k.name == name || (len(k.name) > len(name) && k.name[len(name)] == '~' && k.name[:len(name)] == name) {
-			touched[k.inode] = true
+		for ino in next {
+			touched[ino] = true
 		}
+		dirs = next
 	}
 	return .None
 }
