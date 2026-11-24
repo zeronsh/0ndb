@@ -105,27 +105,20 @@ _sorted :: proc() {
 		return
 	}
 	reg.sorted = true
-	by :: proc(a, b: Ordered($P)) -> bool {
-		return a.order < b.order
-	}
-	slice.stable_sort_by(reg.final_checks.items[:reg.final_checks.n], by)
-	slice.stable_sort_by(reg.inits.items[:reg.inits.n], by)
-	slice.stable_sort_by(reg.destroys.items[:reg.destroys.n], by)
-	slice.stable_sort_by(reg.collects.items[:reg.collects.n], by)
-	slice.stable_sort_by(reg.steps.items[:reg.steps.n], by)
-	slice.stable_sort_by(reg.waits.items[:reg.waits.n], by)
-	slice.stable_sort_by(reg.engine_events.items[:reg.engine_events.n], by)
-	slice.stable_sort_by(reg.disk_reads.items[:reg.disk_reads.n], by)
-	slice.stable_sort_by(reg.filters.items[:reg.filters.n], by)
-	slice.stable_sort_by(reg.restarted.items[:reg.restarted.n], proc(a, b: Restart_Entry) -> bool {
-		return a.order < b.order
-	})
-	slice.stable_sort_by(reg.ops.items[:reg.ops.n], proc(a, b: Ext_Op) -> bool {
-		return a.order < b.order
-	})
-	slice.stable_sort_by(reg.lines.items[:reg.lines.n], proc(a, b: Stat_Line) -> bool {
-		return a.order < b.order
-	})
+	tab := int(env_u64("SIM_TAB", 999))
+	k := int(env_u64("SIM_K", 0))
+	_partial_sort(0, reg.final_checks.items[:reg.final_checks.n], tab, k)
+	_partial_sort(1, reg.inits.items[:reg.inits.n], tab, k)
+	_partial_sort(2, reg.destroys.items[:reg.destroys.n], tab, k)
+	_partial_sort(3, reg.collects.items[:reg.collects.n], tab, k)
+	_partial_sort(4, reg.steps.items[:reg.steps.n], tab, k)
+	_partial_sort(5, reg.waits.items[:reg.waits.n], tab, k)
+	_partial_sort(6, reg.engine_events.items[:reg.engine_events.n], tab, k)
+	_partial_sort(7, reg.disk_reads.items[:reg.disk_reads.n], tab, k)
+	_partial_sort(8, reg.filters.items[:reg.filters.n], tab, k)
+	_partial_sort(9, reg.restarted.items[:reg.restarted.n], tab, k)
+	_partial_sort(10, reg.ops.items[:reg.ops.n], tab, k)
+	_partial_sort(11, reg.lines.items[:reg.lines.n], tab, k)
 }
 
 @(private = "file")
@@ -427,4 +420,29 @@ ext_op_weights :: proc(w: ^World, out: ^[dynamic]int) {
 ext_op_run :: proc(w: ^World, n: ^Node, i: int) {
 	_sorted()
 	reg.ops.items[i].run(w, n)
+}
+
+_partial_sort :: proc(idx: int, data: []$T, tab: int, k: int) {
+	cmps := 0
+	stopped := false
+	outer: for i in 1 ..< len(data) {
+		j := i
+		temp := data[j]
+		for j > 0 {
+			cmps += 1
+			if idx == tab && cmps == k {
+				stopped = true
+				break outer
+			}
+			if !(temp.order < data[j - 1].order) {
+				break
+			}
+			data[j] = data[j - 1]
+			j -= 1
+		}
+		data[j] = temp
+	}
+	if idx == tab {
+		fmt.eprintf("PARTIAL tab=%d n=%d cmps=%d stopped=%v\n", idx, len(data), cmps, stopped)
+	}
 }
