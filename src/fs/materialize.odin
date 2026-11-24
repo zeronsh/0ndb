@@ -890,7 +890,7 @@ mat_adopt :: proc(m: ^Mount, it: ^Mat_Item, tl: []crdt.Lv) -> (adopted: bool, er
 		if od, _ := probe(m, it.old); od.kind != .Missing {
 			return false, .None
 		}
-		shadow_remove(&m.shadow, it.old) or_return
+		place_remove(m, it.old) or_return
 	}
 	d, _ := probe(m, it.path)
 	e := Entry{inode = it.inode, kind = it.kind, stat = d.stat}
@@ -899,7 +899,7 @@ mat_adopt :: proc(m: ^Mount, it: ^Mat_Item, tl: []crdt.Lv) -> (adopted: bool, er
 		data := history_text_at(m.history, it.inode, ids, context.temp_allocator) or_return
 		e.oid, _ = odb.hash(m.db.format, .Blob, data)
 	}
-	shadow_put(&m.shadow, it.path, e) or_return
+	place_put(m, it.path, e) or_return
 	return true, .None
 }
 
@@ -1076,7 +1076,7 @@ materialize_inner :: proc(m: ^Mount, it: ^Mat_Item, tl: []crdt.Lv) -> Error {
 			return from_prim(e)
 		}
 		mat_dir(m, path_parent_abs(abs))
-		return .None if m.restoring else shadow_remove(&m.shadow, it.old)
+		return .None if m.restoring else place_remove(m, it.old)
 	}
 	if up := path_parent(it.path); len(up) > 0 && !m.restoring {
 		if pe, found := shadow_get(&m.shadow, up) or_return; !found || pe.kind != .Dir || pe.inode != it.parent {
@@ -1115,9 +1115,9 @@ materialize_inner :: proc(m: ^Mount, it: ^Mat_Item, tl: []crdt.Lv) -> Error {
 		} else if it.kind == .Dir {
 			move_shadow_tree(m, it.old, it.path) or_return
 		} else {
-			shadow_remove(&m.shadow, it.old) or_return
+			place_remove(m, it.old) or_return
 			if it.kind == .File && m.mat != nil && it.entry.kind == .File {
-				shadow_put(&m.shadow, it.path, it.entry) or_return
+				place_put(m, it.path, it.entry) or_return
 			}
 		}
 	} else if !it.has_old {
@@ -1210,7 +1210,7 @@ materialize_inner :: proc(m: ^Mount, it: ^Mat_Item, tl: []crdt.Lv) -> Error {
 	if m.restoring {
 		return .None
 	}
-	return shadow_put(&m.shadow, it.path, e)
+	return place_put(m, it.path, e)
 }
 
 @(private)
@@ -1394,7 +1394,7 @@ mat_commit_staged :: proc(m: ^Mount, ms: ^Mat_Sync) -> Error {
 		if cur, serr := prim.lstat(m.vfs, st.abs); serr == .None {
 			e.stat = disk_stat(cur)
 		}
-		if perr := shadow_put(&m.shadow, st.item.path, e); perr != .None {
+		if perr := place_put(m, st.item.path, e); perr != .None {
 			mat_unstage(m, ms, i + 1)
 			return perr
 		}

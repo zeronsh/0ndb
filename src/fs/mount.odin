@@ -1514,6 +1514,9 @@ attrib_log_open :: proc(m: ^Mount) -> Error {
 					key, _ := delete_key(&m.attrib, path)
 					delete(key, m.allocator)
 				}
+				if o != {} {
+					attrib_chain_drop(m, path)
+				}
 			} else {
 				attrib_set(m, path, actor, false, o, sc)
 				if o != {} {
@@ -1582,6 +1585,49 @@ attrib_chain_drop :: proc(m: ^Mount, path: string) {
 		delete(l)
 		delete(k, m.allocator)
 	}
+}
+
+@(private)
+attrib_settle :: proc(m: ^Mount, path: string, oid: odb.Oid) -> Error {
+	a, has := m.attrib[path]
+	if path not_in m.attrib_chain && !(has && !a.used && a.oid != {}) {
+		return .None
+	}
+	attrib_chain_drop(m, path)
+	if has && a.used {
+		return .None
+	}
+	if has {
+		key, _ := delete_key(&m.attrib, path)
+		delete(key, m.allocator)
+	}
+	settled := oid
+	if settled == {} {
+		settled[0] = 1
+	}
+	attrib_log_append(m, path, prim.Id{}, settled) or_return
+	if s := m.open_scopes[path]; s != nil && has && s.actor == a.actor {
+		attrib_set(m, path, a.actor, false, {}, a.scope)
+		attrib_log_append(m, path, a.actor, {}, a.scope) or_return
+	}
+	attrib_log_durable(m, nil, nil)
+	return .None
+}
+
+@(private)
+place_put :: proc(m: ^Mount, path: string, e: Entry) -> Error {
+	if path in m.attrib || path in m.attrib_chain {
+		if old, found := shadow_get(&m.shadow, path) or_return; !found || old.inode != e.inode {
+			attrib_settle(m, path, e.oid) or_return
+		}
+	}
+	return shadow_put(&m.shadow, path, e)
+}
+
+@(private)
+place_remove :: proc(m: ^Mount, path: string) -> Error {
+	attrib_settle(m, path, {}) or_return
+	return shadow_remove(&m.shadow, path)
 }
 
 @(private)

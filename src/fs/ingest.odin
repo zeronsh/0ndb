@@ -1402,6 +1402,10 @@ attribute_changes :: proc(p: ^Pass) -> Error {
 			}
 			continue
 		}
+		if c.kind == .Modify && c.old.oid != {} && disk_oid == c.old.oid {
+			attrib_settle(m, c.path, disk_oid) or_return
+			continue
+		}
 		matched, broken, gone := false, false, false
 		cur := c.old.oid if c.kind == .Modify else odb.Oid{}
 		for st in steps {
