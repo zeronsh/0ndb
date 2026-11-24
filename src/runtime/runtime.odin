@@ -247,7 +247,7 @@ Eval_Wait :: struct {
 }
 
 Runtime :: struct {
-	auth_marks:  map[string]string,
+	auth_marks:  map[string]Auth_Mark,
 	e:           ^eng.Engine,
 	cfg:         Config,
 	allocator:   runtime.Allocator,
@@ -435,7 +435,7 @@ close :: proc(r: ^Runtime) {
 	r.closing = true
 	for k, v in r.auth_marks {
 		delete(k, r.allocator)
-		delete(v, r.allocator)
+		delete(v.sig, r.allocator)
 	}
 	delete(r.auth_marks)
 	r.auth_marks = nil

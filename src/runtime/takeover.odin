@@ -363,13 +363,26 @@ _auth_signature :: proc(r: ^Runtime, d: agent.Provider_Descriptor) -> string {
 	return strings.to_string(b)
 }
 
+AUTH_SETTLE_MS :: 10_000
+
+Auth_Mark :: struct {
+	sig: string,
+	at:  i64,
+}
+
 @(private)
 _auth_marked :: proc(r: ^Runtime, d: agent.Provider_Descriptor) -> bool {
-	sig, marked := r.auth_marks[d.id]
+	mk, marked := &r.auth_marks[d.id]
 	if !marked {
 		return false
 	}
-	if sig == _auth_signature(r, d) {
+	sig := _auth_signature(r, d)
+	if mk.sig == sig {
+		return true
+	}
+	if prim.now_ms() - mk.at < AUTH_SETTLE_MS {
+		delete(mk.sig, r.allocator)
+		mk.sig = strings.clone(sig, r.allocator)
 		return true
 	}
 	provider_auth_ok(r, d.id)
@@ -382,14 +395,14 @@ provider_auth_failed :: proc(r: ^Runtime, id: string) {
 		return
 	}
 	if r.auth_marks == nil {
-		r.auth_marks = make(map[string]string, r.allocator)
+		r.auth_marks = make(map[string]Auth_Mark, r.allocator)
 	}
-	sig := strings.clone(_auth_signature(r, d), r.allocator)
+	mk := Auth_Mark{sig = strings.clone(_auth_signature(r, d), r.allocator), at = prim.now_ms()}
 	if old, had := &r.auth_marks[id]; had {
-		delete(old^, r.allocator)
-		old^ = sig
+		delete(old.sig, r.allocator)
+		old^ = mk
 	} else {
-		r.auth_marks[strings.clone(id, r.allocator)] = sig
+		r.auth_marks[strings.clone(id, r.allocator)] = mk
 	}
 	readvertise_all(r)
 }
@@ -400,7 +413,7 @@ provider_auth_ok :: proc(r: ^Runtime, id: string) {
 	}
 	k, v := delete_key(&r.auth_marks, id)
 	delete(k, r.allocator)
-	delete(v, r.allocator)
+	delete(v.sig, r.allocator)
 	readvertise_all(r)
 }
 
