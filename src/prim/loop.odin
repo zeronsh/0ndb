@@ -227,6 +227,14 @@ loop_nested :: proc "contextless" (l: ^Loop) -> bool {
 	return l.depth > 1
 }
 
+loop_nest :: proc "contextless" (l: ^Loop) {
+	l.depth += 1
+}
+
+loop_unnest :: proc "contextless" (l: ^Loop) {
+	l.depth -= 1
+}
+
 loop_idle :: proc "contextless" (l: ^Loop) -> bool {
 	return len(l.heap) == 0 && len(l.pending) == 0
 }
