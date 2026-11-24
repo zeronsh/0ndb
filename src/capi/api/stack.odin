@@ -64,9 +64,6 @@ stack_open :: proc(s: ^Stack, ec: eng.Config, opts: Stack_Options, allocator := 
 			cfg.write_observer = _observer_plug(s)
 		}
 	}
-	if opts.runtime && cfg.purge.purge == nil {
-		cfg.purge = eng.Purge_Hook{data = s, purge = _purge}
-	}
 	if err := eng.open(&s.e, cfg, allocator); err != .None {
 		return status_of(err)
 	}
@@ -263,18 +260,6 @@ _on_runners :: proc(data: rawptr, r: ^rt.Runtime, space: prim.Id) {
 		if info, changed := placement_changed(&s.a, o); changed {
 			_placement_emit(s, o, info)
 		}
-	}
-}
-
-@(private)
-_purge :: proc(data: rawptr, e: ^eng.Engine, req: ^eng.Purge_Request) {
-	s := (^Stack)(data)
-	if !s.r_on {
-		return
-	}
-	h := rt.purge_hook(&s.r)
-	if h.purge != nil {
-		h.purge(h.data, e, req)
 	}
 }
 
