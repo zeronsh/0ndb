@@ -92,11 +92,6 @@ Cmd_Assign :: struct {
 	runner: prim.Id,
 }
 
-Cmd_Redact :: struct {
-	object: Object,
-	msg:    Rid,
-}
-
 Cmd_Map_Set :: struct {
 	object: Object,
 	key:    []u8,
@@ -170,7 +165,6 @@ Command :: union {
 	Cmd_Unmount,
 	Cmd_Await,
 	Cmd_Assign,
-	Cmd_Redact,
 	Cmd_Map_Set,
 	Cmd_Map_Delete,
 	Cmd_Map_Add,
@@ -341,12 +335,6 @@ convo_unmount :: proc(e: ^Engine, o: Object, name: string, done: Done = {}) -> E
 	return x
 }
 
-convo_redact :: proc(e: ^Engine, o: Object, msg: Rid, done: Done = {}) -> Error {
-	context = context_for(e)
-	_, x := exec(e, Cmd_Redact{object = o, msg = msg}, done)
-	return x
-}
-
 map_set :: proc(e: ^Engine, o: Object, key: []u8, fields: []omap.Field, done: Done = {}) -> (off: i64, err: Error) {
 	context = context_for(e)
 	r, x := exec(e, Cmd_Map_Set{object = o, key = key, fields = fields}, done)
@@ -411,8 +399,6 @@ _cmd_object :: proc(cmd: Command) -> Object {
 	case Cmd_Await:
 		return c.object
 	case Cmd_Assign:
-		return c.object
-	case Cmd_Redact:
 		return c.object
 	case Cmd_Map_Set:
 		return c.object
@@ -603,9 +589,6 @@ _cmd_run :: proc(e: ^Engine, cmd: Command, st: ^Cmd_State) -> (res: Result, h: ^
 		off, x := convo.writer_assign(&h.cw, c.msg, c.runner)
 		err = _oerr(x)
 		res.off = off
-	case Cmd_Redact:
-		h = _convo_writable(e, c.object) or_return
-		err = _redact_message(e, h, c.msg)
 	case Cmd_Map_Set:
 		h = _map_writable(e, c.object) or_return
 		res.off, err = _map_put(e, h, c.key, c.fields)
@@ -638,8 +621,7 @@ _cmd_run :: proc(e: ^Engine, cmd: Command, st: ^Cmd_State) -> (res: Result, h: ^
 	}
 	if h != nil && err == .None {
 		_handle_mark(h)
-		_, redacting := cmd.(Cmd_Redact)
-		if h.kind == .Conversation && !redacting {
+		if h.kind == .Conversation {
 			_catalog_activity(e, h)
 		}
 	}
@@ -745,7 +727,7 @@ _cmd_clone :: proc(cmd: Command, a: runtime.Allocator) -> Command {
 		x := c
 		x.title = s(c.title, a)
 		return x
-	case Cmd_Cancel, Cmd_Interrupt, Cmd_Switch, Cmd_Follow, Cmd_Assign, Cmd_Redact:
+	case Cmd_Cancel, Cmd_Interrupt, Cmd_Switch, Cmd_Follow, Cmd_Assign:
 		return cmd
 	}
 	return cmd
