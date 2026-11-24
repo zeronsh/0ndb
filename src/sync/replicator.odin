@@ -203,6 +203,7 @@ Remote :: struct {
 	is_head:   bool,
 	tamper_hold: bool,
 	tamper_retried: bool,
+	relay_bad: bool,
 	plain:     bool,
 	skey:      journal.Key,
 	reaping:   bool,
@@ -1933,6 +1934,10 @@ _want_add :: proc(rm: ^Remote, g: journal.Range) {
 
 @(private)
 _fetch_gap :: proc(r: ^Replicator, rm: ^Remote, gap: journal.Range) {
+	if rm.relay_bad && r.phase == .Ready && !rm.keys_wait && !rm.retry_hold && !_covered_inflight(rm, gap) {
+		_pull_range(r, rm, gap.from, min(gap.to, gap.from + STAGE_MAX))
+		return
+	}
 	if r.phase != .Ready || rm.keys_wait || rm.tamper_hold || rm.retry_hold || _covered_inflight(rm, gap) {
 		return
 	}
@@ -2292,6 +2297,7 @@ _tamper :: proc(r: ^Replicator, rm: ^Remote) {
 	if _peer_tampered(r, rm) {
 		return
 	}
+	rm.relay_bad = true
 	r.tamper_run += 1
 	if r.tamper_run == TAMPER_REPORT {
 		_emit(r, Repl_Event{kind = .Relay_Misbehaving, err = .Corrupt, device = rm.device, name = rm.name, epoch = rm.epoch, stream = rm.id})
@@ -2813,6 +2819,7 @@ _repl_reset_state :: proc(r: ^Replicator) {
 	for _, rm in r.remotes {
 		rm.tamper_hold = false
 		rm.tamper_retried = false
+		rm.relay_bad = false
 		clear(&rm.inflight)
 		clear(&rm.pulls)
 		clear(&rm.refused)
