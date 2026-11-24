@@ -1768,6 +1768,38 @@ history_text_at :: proc(h: ^History, inode: fstree.Inode_Id, v: Version, allocat
 	return crdt.text_bytes(&tmp.text, allocator), .None
 }
 
+history_text_size :: proc(h: ^History, inode: fstree.Inode_Id, v: Version) -> (size: i64, ok: bool, err: Error) {
+	rec: File_Record
+	refs := 0
+	owned := false
+	defer if owned {
+		delete(rec.cp_version)
+		delete(rec.cp_spans)
+	}
+	if f, cached := h.files[inode]; cached {
+		rec = f.rec
+		refs = len(f.new_refs)
+	} else {
+		owned = true
+		read_file_record(h, inode, &rec) or_return
+	}
+	if !rec.has_cp || refs != 0 || rec.ops != rec.cp_count || rec.cp_len < 0 {
+		return 0, false, .None
+	}
+	lvs := make([dynamic]crdt.Lv, context.temp_allocator)
+	if crdt.graph_version_lvs(&h.g, v, &lvs) != .None {
+		return 0, false, .None
+	}
+	cpv := make([dynamic]crdt.Lv, context.temp_allocator)
+	if crdt.graph_version_lvs(&h.g, rec.cp_version[:], &cpv) != .None {
+		return 0, false, .None
+	}
+	if !crdt.graph_contains_all(&h.g, lvs[:], cpv[:]) {
+		return 0, false, .None
+	}
+	return rec.cp_len, true, .None
+}
+
 history_text_oid :: proc(h: ^History, inode: fstree.Inode_Id, v: Version) -> (oid: odb.Oid, ok: bool, err: Error) {
 	if h.db == nil {
 		return {}, false, .None
