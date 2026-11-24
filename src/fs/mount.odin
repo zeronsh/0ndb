@@ -1,5 +1,7 @@
 package fs
 
+import "core:fmt"
+
 import "base:runtime"
 import "core:hash/xxhash"
 import "core:crypto/blake2b"
@@ -1347,6 +1349,7 @@ _observe_begin :: proc(m: ^Mount, rel: string, scope: ^Scope, since: Observe_Sin
 	}
 	if stale {
 		if b, still := m.attrib[rel]; still && !b.used && b.actor == a.actor {
+			fmt.eprintf("DBG attrib delete %s %q at L1352\n", m.root, rel)
 			key, _ := delete_key(&m.attrib, rel)
 			delete(key, m.allocator)
 		}
@@ -1511,6 +1514,7 @@ attrib_log_open :: proc(m: ^Mount) -> Error {
 		if i64(pos) >= m.log_at {
 			if actor == {} {
 				if path in m.attrib {
+					fmt.eprintf("DBG attrib delete %s %q at L1516\n", m.root, path)
 					key, _ := delete_key(&m.attrib, path)
 					delete(key, m.allocator)
 				}
@@ -1937,6 +1941,11 @@ scope_close :: proc(reg: ^Registry, s: ^Scope) -> Error {
 		err = mount_sync(s.mount)
 		deferred := err == .Deferred
 		if deferred {
+			for k in prim.sorted_keys(s.mount.dirty) {
+				fmt.eprintf("DBG close deferred dirty %q scope_is_s %v line %q switch_to %q\n", k, s.mount.dirty[k] == s, s.mount.line, s.mount.switch_to)
+			}
+		}
+		if deferred {
 			err = .None
 		}
 		if err != .None || deferred {
@@ -2006,6 +2015,7 @@ scope_retire_unwritten :: proc(m: ^Mount, s: ^Scope) {
 			mount_closed(m, k)
 			continue
 		}
+		fmt.eprintf("DBG attrib delete %s %q at L2016\n", m.root, k)
 		key, _ := delete_key(&m.attrib, k)
 		attrib_log_append(m, key, prim.Id{})
 		delete(key, m.allocator)
@@ -2347,7 +2357,8 @@ Attrib :: struct {
 }
 
 @(private)
-attrib_set :: proc(m: ^Mount, path: string, actor: prim.Id, used := false, oid := odb.Oid{}, scope := prim.Id{}) {
+attrib_set :: proc(m: ^Mount, path: string, actor: prim.Id, used := false, oid := odb.Oid{}, scope := prim.Id{}, loc := #caller_location) {
+	if path == "a.txt" { fmt.eprintf("DBG attrib set %s %q actor %v used %v oid %v from %s:%d\n", m.root, path, actor, used, oid != {}, loc.file_path[len(loc.file_path)-12:], loc.line) }
 	if p, ok := &m.attrib[path]; ok {
 		p^ = Attrib{actor, used, oid, scope}
 		return
@@ -2372,6 +2383,7 @@ attrib_prune :: proc(m: ^Mount) {
 		}
 	}
 	for k in drop {
+		fmt.eprintf("DBG attrib delete %s %q at L2382\n", m.root, k)
 		key, _ := delete_key(&m.attrib, k)
 		delete(key, m.allocator)
 	}

@@ -1,5 +1,7 @@
 package fs
 
+import "core:fmt"
+
 import "base:runtime"
 import "core:crypto/blake2b"
 import "core:slice"
@@ -135,6 +137,7 @@ materialize_to :: proc(m: ^Mount, target: Version, merge: bool) -> Error {
 		m.mat_held = false
 		return .None
 	}
+	fmt.eprintf("DBG matto %s line %q merge %v durable %v\n", m.root, m.line, merge, mount_durable_now(m))
 	if !m.adopting && !mount_durable_now(m) {
 		m.mat_held = true
 		return .Deferred
@@ -1641,6 +1644,7 @@ mat_snapshot_dirty :: proc(m: ^Mount, items: []Mat_Item, target: Version) -> (he
 		}
 		old := history_text_at(h, it.inode, parents[:], context.temp_allocator) or_return
 		if string(old) != string(data) {
+			fmt.eprintf("DBG snapshot-dirty %s %q actor %v old %q disk %q dirty %v attrib %v\n", m.root, it.path, actor, string(old), string(data), it.path in m.dirty, m.attrib[it.path])
 			emit_text_edits(m, &b, it.inode, it.path, old, data) or_return
 		}
 		append(&snapped, i)

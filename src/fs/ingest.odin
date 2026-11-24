@@ -1,5 +1,7 @@
 package fs
 
+import "core:fmt"
+
 import "base:runtime"
 import "core:bytes"
 import "core:crypto/blake2b"
@@ -1351,6 +1353,10 @@ attribute_consumed :: proc(p: ^Pass, actor: prim.Id, idx: []int, scope := prim.I
 attribute_changes :: proc(p: ^Pass) -> Error {
 	m := p.m
 	for &c in p.changes {
+		if c.path == "a.txt" {
+			xa, xh := m.attrib[c.path]
+			fmt.eprintf("DBG attribute %s %q line %q scope %v has %v actor %v scopeid %v used %v on_line %v chain %d lost %v\n", m.root, c.path, m.line, c.scope != nil, xh, xa.actor, xa.scope, xa.used, actor_on_line(m, xa.actor), len(m.attrib_chain[c.path]), m.lost)
+		}
 		if c.scope != nil {
 			continue
 		}
@@ -2884,6 +2890,9 @@ parent_inode :: proc(p: ^Pass, rel: string) -> (fstree.Inode_Id, bool) {
 
 @(private)
 emit_change :: proc(p: ^Pass, b: ^Builder, c: ^Change) -> Error {
+	if c.path == "a.txt" {
+		fmt.eprintf("DBG emit %s %q kind %v line %q builder actor %v change actor %v has_copy %v\n", p.m.root, c.path, c.kind, p.m.line, b.actor, c.actor, c.has_copy)
+	}
 	emit_change_inner(p, b, c) or_return
 	if c.carried && c.kind == .Modify && c.disk == .Dir {
 		return .None
@@ -3311,6 +3320,11 @@ emit_modify :: proc(p: ^Pass, b: ^Builder, c: ^Change, e: Entry) -> Error {
 	}
 	copy_begin(m, c, data) or_return
 	defer m.copy = nil
+	if path == "a.txt" {
+		lv, _, _ := history_line(h, m.line, context.temp_allocator)
+		lt, _ := history_text_at(h, e.inode, lv, context.temp_allocator)
+		fmt.eprintf("DBG text %s line %q ver %d old %q new %q linetext %q\n", m.root, m.line, e.ver, string(old), string(data), string(lt))
+	}
 	emit_text_edits(m, b, e.inode, path, old, data) or_return
 	return shadow_put(&m.shadow, path, ne)
 }
