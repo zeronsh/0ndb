@@ -1197,11 +1197,8 @@ mount_mark :: proc(m: ^Mount, rel: string, scope: ^Scope = nil) {
 			}
 		}
 	}
-	if !explicit && !observer_installed(m.reg) {
-		s = active_scope(m)
-	}
 	if v, ok := &m.dirty[rel]; ok {
-		if explicit || (!observer_installed(m.reg) && s != nil) {
+		if explicit {
 			v^ = s
 		}
 	} else {
@@ -1406,6 +1403,9 @@ _observe_begin :: proc(m: ^Mount, rel: string, scope: ^Scope, since: Observe_Sin
 attrib_default_actor :: proc(m: ^Mount, path: string) -> prim.Id {
 	if a, has := m.attrib[path]; has && (!a.used || m.lost) {
 		return unattributed_actor(m.actor) if m.lost else a.actor
+	}
+	if t := active_scope(m); t != nil && !m.lost {
+		return t.actor
 	}
 	return m.actor
 }
@@ -1955,7 +1955,9 @@ mount_sync :: proc(m: ^Mount) -> Error {
 }
 
 scope_open :: proc(reg: ^Registry, m: ^Mount, id: prim.Id, actor: prim.Id, pids: []prim.Pid = nil, since := Observe_Since{}) -> ^Scope {
-	if m != nil && len(m.dirty) > 0 {
+	if m != nil && since.mono == 0 {
+		mount_sync(m)
+	} else if m != nil && len(m.dirty) > 0 {
 		_pass_before(m, since)
 	}
 	s := new(Scope, reg.allocator)

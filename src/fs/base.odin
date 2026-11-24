@@ -390,7 +390,7 @@ _change_pin :: proc(m: ^Mount, c: ^Change, buf: ^Pin) -> (p: ^Pin, actor: prim.I
 	}
 	a, ok := m.attrib[c.path]
 	if !ok || a.used || m.history == nil {
-		return _entry_pin(m, c, buf, attrib_default_actor(m, c.path))
+		return _entry_pin(m, c, buf, m.actor if active_scope(m) != nil && _same_content(m, c) else attrib_default_actor(m, c.path))
 	}
 	o, found := _observed(m.history, a.actor, c.path)
 	if !found || _same_content(m, c) {
@@ -557,6 +557,8 @@ rebase_changes :: proc(p: ^Pass) -> Error {
 		if c.scope == nil && c.scope_id == {} {
 			if a, ok := m.attrib[c.path]; ok && a.actor == actor {
 				c.scope_id = a.scope
+			} else if t := active_scope(m); t != nil && t.actor == actor {
+				c.scope_id = t.id
 			}
 		}
 		if c.disk != .File || c.moved != "" || (c.kind != .Modify && c.kind != .Create) || (c.kind == .Modify && c.old.kind != .File) {
