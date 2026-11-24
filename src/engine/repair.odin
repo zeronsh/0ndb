@@ -276,9 +276,6 @@ _restore_record :: proc(e: ^Engine, sp: ^Space, ev: ^osync.Repl_Event) -> Error 
 	if !ok || !e.pk_open {
 		return .Corrupt
 	}
-	if journal.classify(ev.meta, ev.from) != .Redacted && _redaction_known(e, sp.id, id, ev.from) {
-		_jerr(journal.redact_bytes(ev.meta, ev.from)) or_return
-	}
 	if h, hok := e.handles[id]; hok && h.w_open && h.sp == sp {
 		if j := _own_journal(h); j != nil {
 			return _jerr(journal.journal_restore(j, ev.from, ev.meta))
@@ -301,29 +298,6 @@ _restore_record :: proc(e: ^Engine, sp: ^Space, ev: ^osync.Repl_Event) -> Error 
 		}
 	}
 	return _jerr(rerr)
-}
-
-@(private)
-_redaction_known :: proc(e: ^Engine, space, object: prim.Id, off: i64) -> bool {
-	if !_rlog_ready(e) {
-		return false
-	}
-	s, o := space, object
-	for kk in prim.sorted_keys(e.rlog.live) {
-		if kk not_in e.rlog.live {
-			continue
-		}
-		x := e.rlog.live[kk]
-		k := kk
-		if int(k[56]) != 40 || string(k[:16]) != string(s[:]) || string(k[16:32]) != string(o[:]) {
-			continue
-		}
-		from := i64(prim.get_u64le(k[32:40]))
-		if from <= off && off < x.to {
-			return true
-		}
-	}
-	return false
 }
 
 @(private)
