@@ -741,7 +741,9 @@ equal in both directions.
   scope whose write replaced stored content appends two records, the base the
   write is diffed from and then the writer's content. Replay adds the base
   record to the path's steps without replacing a pending observation, so a
-  crash between the two still credits the writer. A crash
+  crash between the two still credits the writer. After a power cut, content
+  no record names stays unattributed, and an undo of the writer's turn leaves
+  it, because the person may have edited the file before the restart. A crash
   that loses a history commit therefore reopens with the attributions that
   commit consumed still pending, and the re-detected change is credited to
   its writer, not to the device. An observation record is synced before the
