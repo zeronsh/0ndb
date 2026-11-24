@@ -80,7 +80,7 @@ _br_write :: proc(c: ^Br_Ctx, agent: bool, name: string, data: string) -> bool {
 	scope: ^fs.Scope
 	if agent {
 		sid := prim.id_new_with(node_clock(&n.clock), rng_random(&c.w.rng))
-		scope = fs.scope_open(n.reg, m, sid, c.agent)
+		scope = sim_scope_open(c.w, n.reg, m, sid, c.agent)
 		if abs in n.writers {
 			n.writers[abs] = Writer_Info{scope = scope, agent = true}
 		} else {
