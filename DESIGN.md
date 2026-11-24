@@ -913,7 +913,11 @@ equal in both directions.
   and always compares its content at its own version. A file whose content is still its
   entry's (a racy entry reread) is not adopted: its entry already describes
   the disk. Leftover temps are internal names and
-  never ingested.
+  never ingested. A temp or fence name carries the mount's id and a number
+  and nothing else is swept: the first full scan after a reopen removes
+  exactly those, in directories the undo restored too, and a name that only
+  looks like one stays. A temp sits beside its file, or in the mount's root
+  when that path would not fit the platform's path limit.
 - **Large files** (over a size limit) are opaque content referenced by git
   oid, hashed and written by streaming, never read into memory.
 - **Ignore**: full `.gitignore` semantics (negation, anchoring, `**`,

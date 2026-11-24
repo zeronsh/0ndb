@@ -455,8 +455,16 @@ _lookup :: proc(d: ^Disk, path: string, follow: bool, depth := 0) -> (lk: Lookup
 		return lk, .Not_Dir
 	}
 	comps := make([dynamic]string, context.temp_allocator)
+	if len(path) >= prim.PATH_MAX {
+		return lk, .Name_Too_Long
+	}
 	if !_split(path, &comps) {
 		return lk, .Invalid
+	}
+	for c in comps {
+		if len(c) > 255 {
+			return lk, .Name_Too_Long
+		}
 	}
 	if len(comps) == 0 {
 		return Lookup{parent = ROOT_INO, name = "", ino = ROOT_INO, found = true}, .None

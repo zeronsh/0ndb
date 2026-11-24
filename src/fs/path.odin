@@ -1,6 +1,9 @@
 package fs
 
 import "base:runtime"
+import "core:strconv"
+import "core:strings"
+import "../prim"
 
 path_parent :: proc "contextless" (rel: string) -> string {
 	for i := len(rel) - 1; i >= 0; i -= 1 {
@@ -91,16 +94,34 @@ name_internal :: proc "contextless" (name: string) -> bool {
 	return len(name) >= len(TEMP_PREFIX) && name[:len(TEMP_PREFIX)] == TEMP_PREFIX
 }
 
-name_our_temp :: proc "contextless" (name: string) -> bool {
-	if len(name) <= len(TEMP_PREFIX) || name[:len(TEMP_PREFIX)] != TEMP_PREFIX {
+name_our_temp :: proc(name: string, id: prim.Id) -> bool {
+	if !strings.has_prefix(name, TEMP_PREFIX) {
 		return false
 	}
-	for c in name[len(TEMP_PREFIX):] {
+	rest := strings.trim_prefix(name[len(TEMP_PREFIX):], FENCE_INFIX)
+	hex := prim.id_hex(id)
+	if len(rest) < len(hex) + 2 || rest[:len(hex)] != string(hex[:]) || rest[len(hex)] != '-' {
+		return false
+	}
+	for c in rest[len(hex) + 1:] {
 		if c < '0' || c > '9' {
 			return false
 		}
 	}
 	return true
+}
+
+own_temp_name :: proc(id: prim.Id, infix: string, seq: u64, allocator: runtime.Allocator) -> string {
+	digits: [24]u8
+	num := strconv.write_uint(digits[:], seq, 10)
+	hex := prim.id_hex(id)
+	name := make([]u8, len(TEMP_PREFIX) + len(infix) + len(hex) + 1 + len(num), allocator)
+	n := copy(name, TEMP_PREFIX)
+	n += copy(name[n:], infix)
+	n += copy(name[n:], hex[:])
+	name[n] = '-'
+	copy(name[n + 1:], num)
+	return string(name)
 }
 
 path_internal :: proc "contextless" (rel: string) -> bool {

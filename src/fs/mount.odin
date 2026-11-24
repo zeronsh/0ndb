@@ -4,7 +4,6 @@ import "base:runtime"
 import "core:hash/xxhash"
 import "core:crypto/blake2b"
 import "core:mem/virtual"
-import "core:strconv"
 import "core:strings"
 import "../crdt"
 import "../fshist"
@@ -1824,17 +1823,9 @@ mount_step :: proc(m: ^Mount) -> Error {
 
 mount_fence :: proc(m: ^Mount, cb: Fence_Proc, data: rawptr) -> Error {
 	m.fence_seq += 1
-	digits: [24]u8
-	num := strconv.write_uint(digits[:], m.fence_seq, 10)
-	hex := prim.id_hex(m.id)
-	name := make([]u8, len(TEMP_PREFIX) + 6 + len(hex) + 1 + len(num), m.allocator)
-	n := copy(name, TEMP_PREFIX)
-	n += copy(name[n:], "fence-")
-	n += copy(name[n:], hex[:])
-	name[n] = '-'
-	copy(name[n + 1:], num)
-	append(&m.fences, Fence{name = string(name), cb = cb, data = data, observed = true})
-	p, _ := path_join(m.root, string(name), context.temp_allocator)
+	name := own_temp_name(m.id, FENCE_INFIX, m.fence_seq, m.allocator)
+	append(&m.fences, Fence{name = name, cb = cb, data = data, observed = true})
+	p, _ := path_join(m.root, name, context.temp_allocator)
 	fd, err := prim.open_file(m.vfs, p, {.Write, .Create, .Truncate}, 0o600)
 	if err != .None {
 		pop(&m.fences)

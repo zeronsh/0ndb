@@ -74,3 +74,5 @@ person_new_add  | k.txt=x               | write n.txt A\nB; person n.txt A\nP\nB
 person_new_del  | k.txt=x               | write n.txt A\nB\nC; person n.txt A\nC                  | undo:n.txt=-
 move_deep_dir   | a.txt=x                 | mkdir b; mkdir b/c; mv a.txt b/c/a.txt
 dir_swap_child  | d/f.txt=x               | mv d/f.txt f.txt; rmdir d; write d dfile | the path of an emptied directory reused by a file
+long_name       | @255=x l->k.txt k.txt=y | write @255 z; rm l; ln_s @255 l
+deep_path       | @deep/f=x               | write @deep/f z; write @deep/g y; ln_s f @deep/l

@@ -2716,6 +2716,7 @@ collect_subtree :: proc(p: ^Pass, rel: string) -> Error {
 	heap := runtime.heap_allocator()
 	own, _ := clone_string(rel, heap)
 	defer delete(own, heap)
+	mount_sweep_dir(m, own) or_return
 	chain, nodes := chain_for(m, own, heap)
 	defer chain_free(nodes, heap)
 	sc: Scanner
@@ -2744,6 +2745,9 @@ collect_subtree :: proc(p: ^Pass, rel: string) -> Error {
 		} else if it.kind == .Dir && nested_repo(m, it.path) {
 			scan_skip(&sc)
 		} else {
+			if it.kind == .Dir {
+				mount_sweep_dir(m, it.path) or_return
+			}
 			add_create(p, it.path, Probe{kind = it.kind, stat = it.stat, target = clone_string(it.target, context.temp_allocator) or_else ""}) or_return
 		}
 		pass_maybe_flush(p) or_return
