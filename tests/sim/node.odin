@@ -227,6 +227,10 @@ node_crashed :: proc(n: ^Node) {
 		n.disk.force_process = false
 		mode = .Process
 	}
+	if n.disk.force_power {
+		n.disk.force_power = false
+		mode = .Power
+	}
 	n.disk.dead = false
 	n.disk.crashed = true
 	if mode == .Power {

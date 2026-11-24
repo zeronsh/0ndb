@@ -1600,17 +1600,14 @@ temp_name :: proc(m: ^Mount, abs: string, allocator: runtime.Allocator) -> strin
 	return out
 }
 
-version_snapshot :: proc(h: ^History, lvs: []crdt.Lv) -> (snap: fstree.Snapshot, err: Error) {
-	if crdt.frontier_eq(lvs, h.g.heads[:]) {
-		return fstree.current(&h.tree), .None
-	}
+version_view :: proc(h: ^History, lvs: []crdt.Lv) -> fstree.View {
 	Vis :: struct {
 		h:  ^History,
 		tl: []crdt.Lv,
 	}
 	vis := new(Vis, context.temp_allocator)
 	vis^ = {h, lvs}
-	view := fstree.View {
+	return fstree.View {
 		data = vis,
 		visible = proc(data: rawptr, id: fstree.Op_Id) -> bool {
 			v := (^Vis)(data)
@@ -1619,7 +1616,13 @@ version_snapshot :: proc(h: ^History, lvs: []crdt.Lv) -> (snap: fstree.Snapshot,
 		},
 		floor = 0,
 	}
-	s, serr := fstree.snapshot(&h.tree, view, context.temp_allocator)
+}
+
+version_snapshot :: proc(h: ^History, lvs: []crdt.Lv) -> (snap: fstree.Snapshot, err: Error) {
+	if crdt.frontier_eq(lvs, h.g.heads[:]) {
+		return fstree.current(&h.tree), .None
+	}
+	s, serr := fstree.snapshot(&h.tree, version_view(h, lvs), context.temp_allocator)
 	if serr != nil {
 		return {}, .Corrupt
 	}

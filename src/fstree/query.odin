@@ -132,6 +132,18 @@ snapshot :: proc(t: ^Tree, view: View, allocator := context.allocator) -> (s: Sn
 	return
 }
 
+flags_in :: proc(t: ^Tree, view: View, id: Inode_Id) -> (flags: Flags, ok: bool, err: Error) {
+	s := Snapshot{tree = t, view = view}
+	if !snap_exists(&s, id) {
+		return
+	}
+	n := get(t, id) or_return
+	if n == nil {
+		return
+	}
+	return flags_at(&s, n), true, nil
+}
+
 snapshot_destroy :: proc(s: ^Snapshot) {
 	if s.current {
 		return
