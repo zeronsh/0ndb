@@ -94,7 +94,7 @@ src/
   textdiff/  line and byte diff, three-way merge
   fs/        file-tree objects on disk: mounts, scanning, ignore, watching, ingestion, materialization, git, lines, land
   search/    full-text and vector indexes over any objects, code-to-conversation lookup
-  agent/     harness drivers (Claude Code, Codex, Pi, Muse, ACP agents), session portability, purge
+  agent/     harness drivers (Claude Code, Codex, Pi, Muse, ACP agents), session portability
   model/     the native agent loop over model APIs (streaming, tools, caching, compaction)
   mcp/       MCP client (tools for the native loop) and server (0ndb tools for any harness)
   sync/      keys, encryption, relay core and protocol, announce feeds, replicator
