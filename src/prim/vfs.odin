@@ -79,6 +79,8 @@ Vfs_Procs :: struct {
 	dir_next:   proc(data: rawptr, d: ^Dir) -> (Dir_Entry, bool, Error),
 	dir_close:  proc(data: rawptr, d: ^Dir),
 	caps:       proc(data: rawptr, fd: Fd) -> Vfs_Caps,
+	op_begin:   proc(data: rawptr, bytes: i64) -> Error,
+	op_end:     proc(data: rawptr),
 	writeout:   proc(data: rawptr, fd: Fd) -> Error,
 	exchange:   proc(data: rawptr, a: string, b: string) -> Error,
 }
@@ -89,6 +91,19 @@ open_file :: #force_inline proc(vfs: Vfs, path: string, flags: Open_Flags = {}, 
 
 close_file :: #force_inline proc(vfs: Vfs, fd: Fd) -> Error {
 	return vfs.procs.close(vfs.data, fd)
+}
+
+op_begin :: #force_inline proc(vfs: Vfs, bytes: i64) -> Error {
+	if vfs.procs.op_begin == nil {
+		return .None
+	}
+	return vfs.procs.op_begin(vfs.data, bytes)
+}
+
+op_end :: #force_inline proc(vfs: Vfs) {
+	if vfs.procs.op_end != nil {
+		vfs.procs.op_end(vfs.data)
+	}
 }
 
 read_at :: #force_inline proc(vfs: Vfs, fd: Fd, buf: []u8, off: i64) -> (int, Error) {
