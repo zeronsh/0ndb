@@ -278,6 +278,7 @@ Mount :: struct {
 	rescan:      bool,
 	git_moved:   bool,
 	fence_seq:   u64,
+	conv_seq:    u64,
 	fences:      [dynamic]Fence,
 	timer:       prim.Timer,
 	idle_timer:  prim.Timer,

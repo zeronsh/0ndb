@@ -47,12 +47,14 @@ region_map :: proc(r: ^Region, base: uintptr, size: uint, bump: bool) -> (ok: bo
 	r.top = base
 	r.bump = bump
 	r.mapped = true
+	regions_mapped += 1
 	return true, ""
 }
 
 region_unmap :: proc(r: ^Region) {
 	if r.mapped {
 		os_region_unmap(r.base, r.size)
+		regions_mapped -= 1
 	}
 	r^ = {}
 }
