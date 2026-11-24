@@ -143,50 +143,6 @@ keytree_leaf :: proc(t: ^Key_Tree, cell: u64) -> (key: [32]u8, ok: bool) {
 	return t.path[depth], true
 }
 
-keytree_puncture :: proc(t: ^Key_Tree, from, to: i64) -> Error {
-	if from < 0 || to <= from {
-		return .Invalid
-	}
-	lo := u64(from) >> t.shift
-	hi := u64(to) >> t.shift
-	if hi <= lo {
-		return .None
-	}
-	return keytree_puncture_cells(t, lo, hi - 1)
-}
-
-keytree_puncture_except :: proc(t: ^Key_Tree, from, to: i64, keep: []i64) -> Error {
-	if from < 0 || to <= from {
-		return .Invalid
-	}
-	lo := u64(from) >> t.shift
-	hi := u64(to) >> t.shift
-	if hi <= lo {
-		return .None
-	}
-	cells := make([dynamic]u64, 0, len(keep), context.temp_allocator)
-	for k in keep {
-		if k >= 0 {
-			c := u64(k) >> t.shift
-			if c >= lo && c < hi {
-				append(&cells, c)
-			}
-		}
-	}
-	slice.sort(cells[:])
-	start := lo
-	for c in cells {
-		if c > start {
-			keytree_puncture_cells(t, start, c - 1) or_return
-		}
-		start = max(start, c + 1)
-	}
-	if start < hi {
-		keytree_puncture_cells(t, start, hi - 1) or_return
-	}
-	return .None
-}
-
 keytree_puncture_cells :: proc(t: ^Key_Tree, lo, hi_incl: u64) -> Error {
 	if hi_incl < lo || (t.depth < 64 && hi_incl >> t.depth != 0) {
 		return .Invalid
@@ -591,10 +547,3 @@ buffer_live_key :: proc(keys: journal.Key_Provider, off: i64, boot: [16]u8) -> (
 	return key, true
 }
 
-draft_puncture :: proc(t: ^Key_Tree, msg: i64) -> Error {
-	if msg <= 0 {
-		return .Invalid
-	}
-	cell := u64((msg >> 4 + 1) << 4) >> t.shift
-	return keytree_puncture_cells(t, cell, cell)
-}

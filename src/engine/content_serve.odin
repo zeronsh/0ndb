@@ -352,13 +352,6 @@ _serve_drop_space :: proc(e: ^Engine, space: prim.Id) {
 	_serve_drop(e, &d)
 }
 
-@(private)
-_serve_scrubbed :: proc(data: rawptr, targets: []odb.Oid) {
-	e := (^Engine)(data)
-	context = context_for(e)
-	_serve_drop_oids(e, targets)
-}
-
 serve_withdraw :: proc(e: ^Engine, oids: []odb.Oid) {
 	context = context_for(e)
 	_serve_drop_oids(e, oids)
