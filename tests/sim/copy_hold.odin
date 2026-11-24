@@ -104,7 +104,7 @@ _hold_read :: proc(n: ^Node, tree: eng.Object, line: string) -> (string, bool) {
 	defer node_after(n)
 	data, err := eng.tree_read(&n.e, tree, "a.txt", context.temp_allocator, {}, line)
 	if err != .None {
-		return "", false
+		return fmt.tprintf("<%v>", err), false
 	}
 	return strings.clone(string(data), context.temp_allocator), true
 }
@@ -327,12 +327,26 @@ _copy_hold :: proc(w: ^World) {
 			world_fail(w, "copy hold: redact the copied source: %v", rerr)
 			return
 		}
+		eng.tree_unmount(&a.e, sm.m)
+		for x, i in a.mounts {
+			if x.root == HOLD_ROOT {
+				ordered_remove(&a.mounts, i)
+				break
+			}
+		}
+		for x, i in m.mounts {
+			if x.node == a.idx && x.root == HOLD_ROOT {
+				ordered_remove(&m.mounts, i)
+				break
+			}
+		}
 	}
 	run_until(w, w.now + 30_000_000_000, true)
+	redacted := strings.concatenate({"shared a\n", strings.repeat("\x00", len(HOLD_TEXT), context.temp_allocator)}, context.temp_allocator)
 	for n in ([]^Node{a, b, c}) {
 		for line in ([]string{"main", HOLD_FEATURE}) {
-			if d, rok := _hold_read(n, tree, line); rok && strings.contains(d, HOLD_TEXT) {
-				world_fail(w, "copy hold: %s still reads the redacted source's bytes on %s: %q", n.name, line, d)
+			if d, rok := _hold_read(n, tree, line); !rok || d != redacted {
+				world_fail(w, "copy hold: %s reads a.txt on %s as %q (%v) after its copied source was redacted, want the range zero-filled in place", n.name, line, d, rok)
 			}
 		}
 	}
