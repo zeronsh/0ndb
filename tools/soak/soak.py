@@ -498,7 +498,7 @@ class Soak:
             st = self.c.call("convo.status", object=self.obj)
             head = st.get("head")
             if head and not st.get("running") and st.get("status") in ("idle", None):
-                w = self.c.call("convo.window", object=self.obj, anchor=head, before=4)
+                w = self.c.call("convo.window", object=self.obj, anchor=head, leaf=head, before=4)
                 for m in w.get("messages") or []:
                     if m.get("role") == "assistant" and m.get("parent") == user and m.get("id") not in known and m.get("seal"):
                         return m["id"], st
@@ -514,7 +514,7 @@ class Soak:
         return n
 
     def parent_of(self, rid):
-        for m in self.c.call("convo.window", object=self.obj, anchor=rid, before=1, after=1).get("messages") or []:
+        for m in self.c.call("convo.window", object=self.obj, anchor=rid, leaf=rid, before=1, after=1).get("messages") or []:
             if m.get("id") == rid:
                 return m.get("parent")
         return "missing"
