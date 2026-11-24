@@ -444,6 +444,12 @@ pend :: proc(c: ^Call, err: eng.Error) -> Status {
 	return status_of(err)
 }
 
+ready_local :: proc(c: ^Call) -> eng.Ready {
+	r := ready(c)
+	r.fresh = false
+	return r
+}
+
 @(private)
 _on_ready :: proc(data: rawptr, e: ^eng.Engine, err: eng.Error) {
 	c := (^Call)(data)
