@@ -9,6 +9,7 @@ import "../../src/fs"
 import "../../src/prim"
 
 CARRY_ROOT :: "/work/carry-n0-git"
+CARRY_LINE :: "agent line\n"
 
 carry_crash_run :: proc(seed: u64, crash_at: u64) -> (failures: [dynamic]string, crashed: bool) {
 	failures = make([dynamic]string)
@@ -116,7 +117,7 @@ _carry_crash :: proc(w: ^World, crash_at: u64) -> (crashed: bool) {
 			world_fail(w, "carry: observe: %v", oerr)
 			return
 		}
-		if werr := _carry_write(vfs, CARRY_ROOT + "/a.txt", transmute([]u8)string("shared a\nagent line\n")); werr != .None {
+		if werr := _carry_write(vfs, CARRY_ROOT + "/a.txt", transmute([]u8)string("shared a\n" + CARRY_LINE)); werr != .None {
 			world_fail(w, "carry: agent write: %v", werr)
 			return
 		}
@@ -167,10 +168,18 @@ _carry_crash :: proc(w: ^World, crash_at: u64) -> (crashed: bool) {
 	if string(data) != string(disk) {
 		world_fail(w, "carry: a.txt on main is %q, disk %q", string(data), string(disk))
 	}
+	mount := fs.history_present_actor(sm.m.history, sm.m.actor)
+	credited := 0
 	for sp in spans {
-		if sp.id.actor == agent {
-			world_fail(w, "carry: a.txt on main credits %d bytes git carried to the agent's scope %s", sp.len, id_short(agent))
+		if sp.op.actor != mount {
+			world_fail(w, "carry: a.txt on main holds %d bytes git carried that %s committed, not the mount", sp.len, id_short(sp.op.actor))
 		}
+		if sp.id.actor == agent {
+			credited += sp.len
+		}
+	}
+	if credited != len(CARRY_LINE) {
+		world_fail(w, "carry: a.txt on main credits the agent with %d bytes, not the %d of the line it wrote", credited, len(CARRY_LINE))
 	}
 	return
 }
