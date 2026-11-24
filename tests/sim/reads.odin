@@ -155,7 +155,7 @@ _live_settled :: proc(w: ^World, r: ^Live_Read, st: api.Status) {
 	case .Closed:
 		stat_add(w, STAT_LIVE_CLOSED)
 	case .Busy:
-		if !w.nodes[r.node].persist_outage {
+		if !outage_active(w.nodes[r.node]) {
 			world_fail(w, "interactive read: %s %s on %s settled Busy outside a persist outage", r.op, id_short(w.model.objs[r.obj].o.id), w.nodes[r.node].name)
 		}
 		stat_add(w, STAT_LIVE_ABSENT)
