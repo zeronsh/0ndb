@@ -25,6 +25,9 @@ An_Case :: enum u8 {
 	Shown_Remote_Rename,
 	Absent_Checkout,
 	Absent_Real_Name,
+	Away_Remote_Remove,
+	Away_Remote_Rename,
+	Away_Remote_Write,
 }
 
 @(private = "file")
@@ -181,14 +184,16 @@ _an_run :: proc(w: ^World, c: An_Case) -> (shaped: bool) {
 		}
 	}
 	lost, lok := _an_disk(a, loser)
-	_, kok := _an_disk(a, "c.txt")
+	kept, kok := _an_disk(a, "c.txt")
 	if loser == "" || !lok || !kok {
 		world_note(w, "absent name: no collision: %v, tree %s", _an_names(a), _an_tree(a, tree))
 		return
 	}
 	lost_text := strings.clone(lost, w.allocator)
+	kept_text := strings.clone(kept, w.allocator)
 	shaped = true
-	if c == .Absent_Checkout || c == .Absent_Real_Name {
+	away := c == .Away_Remote_Remove || c == .Away_Remote_Rename || c == .Away_Remote_Write
+	if away || c == .Absent_Checkout || c == .Absent_Real_Name {
 		{
 			context = instance_context(&a.inst)
 			if err := fs.mount_line_switch(sm.m, AN_FEATURE); err != .None {
@@ -214,13 +219,13 @@ _an_run :: proc(w: ^World, c: An_Case) -> (shaped: bool) {
 		context = instance_context(&a.inst)
 		fs.mount_sync(sm.m)
 		node_after(a)
-	case .Shown_Remote_Remove:
+	case .Shown_Remote_Remove, .Away_Remote_Remove:
 		context = instance_context(&b.inst)
 		if err := eng.tree_remove(&b.e, tree, "c.txt", "main"); err != .None && err != .Pending {
 			world_fail(w, "absent name: n1 tree_remove: %v", err)
 		}
 		node_after(b)
-	case .Shown_Remote_Rename:
+	case .Shown_Remote_Rename, .Away_Remote_Rename:
 		if err := node_mount(w, b, oi, AN_PEER); err != .None {
 			world_fail(w, "absent name: n1 mount: %v", err)
 			return
@@ -237,10 +242,23 @@ _an_run :: proc(w: ^World, c: An_Case) -> (shaped: bool) {
 			}
 		}
 		node_after(b)
+	case .Away_Remote_Write:
+		context = instance_context(&b.inst)
+		v, _ := eng.tree_version(&b.e, tree, "main", context.temp_allocator)
+		if err := eng.tree_write(&b.e, tree, "c.txt", transmute([]u8)strings.concatenate({kept_text, "while away\n"}, context.temp_allocator), v, "main"); err != .None && err != .Pending {
+			world_fail(w, "absent name: n1 away write: %v", err)
+		}
+		node_after(b)
 	case:
 	}
 	_an_settle(w)
-	if c == .Absent_Checkout || c == .Absent_Real_Name {
+	if c == .Away_Remote_Write {
+		if got := _an_tree(a, tree); !strings.contains(got, "while away") {
+			world_fail(w, "absent name %v: n0 never received the line, so the arm proves nothing: %s", c, got)
+			return
+		}
+	}
+	if away || c == .Absent_Checkout || c == .Absent_Real_Name {
 		changes := make([dynamic]Git_Change, context.temp_allocator)
 		res, err := git_checkout(disk_vfs(&a.disk), AN_ROOT, "main", false, when_s, node_clock(&a.clock), rng_random(&w.rng), &changes)
 		if res != .Done || err != .None {
@@ -267,11 +285,14 @@ _an_run :: proc(w: ^World, c: An_Case) -> (shaped: bool) {
 		fmt.sbprintf(&all, "%s=%q ", nm, data)
 	}
 	on_disk := strings.to_string(all)
-	if !strings.contains(on_tree, fmt.tprintf("c.txt=%q", lost_text)) {
+	if !strings.contains(on_tree, fmt.tprintf("c.txt=%q", lost_text)) && c != .Away_Remote_Write {
 		world_fail(w, "absent name %v: the other device's file is not c.txt in the tree: %s(disk %s)", c, on_tree, on_disk)
 	}
-	if got, ok := _an_disk(a, "c.txt"); !ok || got != lost_text {
+	if got, ok := _an_disk(a, "c.txt"); (!ok || got != lost_text) && c != .Away_Remote_Write {
 		world_fail(w, "absent name %v: c.txt on disk is %q (found %v), the tree's is %q; tree %s, disk %s", c, got, ok, lost_text, on_tree, on_disk)
+	}
+	if c == .Away_Remote_Write && (!strings.contains(on_tree, "while away") || !strings.contains(on_disk, "while away")) {
+		world_fail(w, "absent name %v: a line main got while this disk was on feature is gone after the checkout: tree %s, disk %s", c, on_tree, on_disk)
 	}
 	if c == .Absent_Real_Name {
 		if got, _ := _an_disk(a, "c.txt~deadbeef-0"); got != "real\n" {
@@ -314,7 +335,7 @@ absent_name :: proc(t: ^testing.T) {
 	test_begin(t)
 	defer test_end(t)
 	shapes: [An_Case]int
-	for c in An_Case {
+	for c in An_Case.Shown_Own_Remove ..= An_Case.Absent_Real_Name {
 		for seed in u64(1) ..= 4 {
 			shaped, failures := absent_name_run(seed, c)
 			shapes[c] += int(shaped)
@@ -326,6 +347,30 @@ absent_name :: proc(t: ^testing.T) {
 			delete(failures)
 		}
 		testing.expectf(t, shapes[c] > 0, "absent_name %v never made the collision", c)
+	}
+	free_all(context.temp_allocator)
+}
+
+@(test)
+away_main :: proc(t: ^testing.T) {
+	if s, ok := os.lookup_env("SIM_SEED", context.temp_allocator); ok && len(s) > 0 {
+		return
+	}
+	test_begin(t)
+	defer test_end(t)
+	shapes: [An_Case]int
+	for c in An_Case.Away_Remote_Remove ..= An_Case.Away_Remote_Write {
+		for seed in u64(1) ..= 4 {
+			shaped, failures := absent_name_run(seed, c)
+			shapes[c] += int(shaped)
+			for f in failures {
+				fmt.eprintf("away_main %v seed %d: %s\n", c, seed, f)
+				delete(f)
+			}
+			testing.expectf(t, len(failures) == 0, "away_main %v seed %d failed", c, seed)
+			delete(failures)
+		}
+		testing.expectf(t, shapes[c] > 0, "away_main %v never made the collision", c)
 	}
 	free_all(context.temp_allocator)
 }
