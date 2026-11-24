@@ -20,7 +20,9 @@ RESUME_PROMPT :: "Your previous turn was paused because the folder was switched 
 RESUME_MOVED_PROMPT :: "Your previous turn was paused because the folder was switched to another branch. It is back on the branch you were working on, but the branch moved while you were paused (new commits or a reset), so re-read any file you rely on before changing it; then continue the task from where you left off."
 
 evaluate :: proc(r: ^Runtime, o: Object) {
+	_dbg_lap_reset()
 	context = eng.context_for(r.e)
+	_dbg_lap("ev1 context = eng.context_for(r.e)")
 	if r.closing {
 		return
 	}
@@ -32,14 +34,17 @@ evaluate :: proc(r: ^Runtime, o: Object) {
 		return
 	}
 	c, found, cerr := eng.catalog_get(r.e, o, context.temp_allocator)
+	_dbg_lap("ev2 c, found, cerr := eng.catalog_get(r.e, o")
 	if cerr != .None || !found || c.kind != .Conversation {
 		return
 	}
 	v, verr := eng.convo_view(r.e, o)
+	_dbg_lap("ev3 v, verr := eng.convo_view(r.e, o)")
 	if verr != .None {
 		return
 	}
 	t, terr := convo.view_tail(v, r.self, context.temp_allocator)
+	_dbg_lap("ev4 t, terr := convo.view_tail(v, r.self, co")
 	if terr == .Missing {
 		eng.convo_status(r.e, o, _wait_ready(r, o))
 		return
@@ -60,7 +65,9 @@ evaluate :: proc(r: ^Runtime, o: Object) {
 		return
 	}
 	_lease_prune(r, o, v)
+	_dbg_lap("ev5 _lease_prune(r, o, v)")
 	items, ierr := convo.intents(v, context.temp_allocator)
+	_dbg_lap("ev6 items, ierr := convo.intents(v, context.")
 	if ierr == .Missing {
 		eng.convo_intents(r.e, o, context.temp_allocator, _wait_ready(r, o))
 		return
@@ -74,13 +81,17 @@ evaluate :: proc(r: ^Runtime, o: Object) {
 		return
 	}
 	cancelled := task_cancelled(r, o)
+	_dbg_lap("ev7 cancelled := task_cancelled(r, o)")
 	head, head_err := convo.tail_head(v, &t)
+	_dbg_lap("ev8 head, head_err := convo.tail_head(v, &t)")
 	if head_err != .None {
 		eng.convo_status(r.e, o, _wait_ready(r, o))
 		return
 	}
 	busy := t.running && _running_live(r, o, v, &t)
+	_dbg_lap("ev9 busy := t.running && _running_live(r, o,")
 	waiting_msg: Rid
+	_dbg_lap("ev10 waiting_msg: Rid")
 	defer _claim_prune(r, o, waiting_msg)
 	for &it in items {
 		#partial switch it.kind {
@@ -120,6 +131,7 @@ evaluate :: proc(r: ^Runtime, o: Object) {
 		return
 	}
 	hm, herr := convo.message(v, &t, convo.Position{msg = head}, context.temp_allocator)
+	_dbg_lap("ev11 hm, herr := convo.message(v, &t, convo.P")
 	if herr != .None {
 		return
 	}
@@ -777,35 +789,46 @@ _start_from_intent :: proc(r: ^Runtime, o: Object, head: Rid, it: ^convo.Intent)
 }
 
 start_run :: proc(r: ^Runtime, o: Object, user: Rid) -> Error {
+	_dbg_lap("sr0 enter")
 	if run_find(r, o) != nil {
 		return .Busy
 	}
 	v, verr := eng.convo_view(r.e, o)
+	_dbg_lap("sr1 v, verr := eng.convo_view(r.e, o)")
 	if verr != .None {
 		return .Engine
 	}
 	t, terr := convo.view_tail(v, r.self, context.temp_allocator)
+	_dbg_lap("sr2 t, terr := convo.view_tail(v, r.self, contex")
 	if terr != .None {
 		return .Pending
 	}
 	um, merr := convo.message(v, &t, convo.Position{msg = user}, context.temp_allocator)
+	_dbg_lap("sr3 um, merr := convo.message(v, &t, convo.Posit")
 	if merr != .None {
 		return .Pending
 	}
 	run := _run_new(r, o)
+	_dbg_lap("sr4 run := _run_new(r, o)")
 	if run == nil {
 		return .Limit
 	}
 	a, ok := agent_resolve(r, o, um.provider, um.model, run.alloc)
+	_dbg_lap("sr5 a, ok := agent_resolve(r, o, um.provider, um")
 	if !ok {
 		_run_free(run)
 		return .Not_Found
 	}
 	run.ai = a
+	_dbg_lap("sr6 run.ai = a")
 	run.user = user
+	_dbg_lap("sr7 run.user = user")
 	run.parent = um.parent
+	_dbg_lap("sr8 run.parent = um.parent")
 	_user_content(run, &um)
+	_dbg_lap("sr9 _user_content(run, &um)")
 	exhausted := false
+	_dbg_lap("sr10 exhausted := false")
 	if t, tok := task_get(r, o); tok && t.budget != {} {
 		used := _used(r, o)
 		if t.budget.tokens > 0 && used.input + used.output + used.cache_read + used.cache_write >= t.budget.tokens {
@@ -814,11 +837,13 @@ start_run :: proc(r: ^Runtime, o: Object, user: Rid) -> Error {
 		run.ai.budget = budget_min(run.ai.budget, _remaining(r, o, t.budget))
 	}
 	w := _convo_w(r, o)
+	_dbg_lap("sr11 w := _convo_w(r, o)")
 	if w == nil {
 		_run_free(run)
 		return .Engine
 	}
 	assignee, _ := convo.assignee(v, &t, user)
+	_dbg_lap("sr12 assignee, _ := convo.assignee(v, &t, user)")
 	if assignee != r.self {
 		if _, aerr := convo.writer_assign(w, user, r.self); aerr != .None {
 			_run_free(run)
@@ -826,17 +851,25 @@ start_run :: proc(r: ^Runtime, o: Object, user: Rid) -> Error {
 		}
 	}
 	lines := _new_lines(r, o, run)
+	_dbg_lap("sr13 lines := _new_lines(r, o, run)")
 	run.bound = _bound_lines(r, o, run.alloc)
+	_dbg_lap("sr14 run.bound = _bound_lines(r, o, run.alloc)")
 	eng.catalog_lines(r.e, o, convo.binds_encode(run.bound))
+	_dbg_lap("sr15 eng.catalog_lines(r.e, o, convo.binds_encode")
 	claim, cerr := convo.writer_claim(w, user, r.cfg.lease_ms, lines, run.bound)
+	_dbg_lap("sr16 claim, cerr := convo.writer_claim(w, user, r")
 	if cerr != .None {
 		_run_free(run)
 		return .Not_Assigned if cerr == .Not_Assigned else .Engine
 	}
 	run.claim = claim
+	_dbg_lap("sr17 run.claim = claim")
 	_asks_drop(r, o)
+	_dbg_lap("sr18 _asks_drop(r, o)")
 	_pending_put(r, o, Pending_Entry{msg = user, provider = placement_provider(&run.ai), since_ms = wall_ms(r), runner = r.self, assigned = true})
+	_dbg_lap("sr19 _pending_put(r, o, Pending_Entry{msg = user,")
 	_claim_prune(r, o, {})
+	_dbg_lap("sr20 _claim_prune(r, o, {})")
 	if exhausted {
 		eng.pin(r.e, o)
 		run.pinned = true
@@ -1706,4 +1739,18 @@ _activity_author :: proc(r: ^Runtime, o: Object) -> prim.Id {
 _replicated :: proc(r: ^Runtime, space: prim.Id) -> bool {
 	info, err := eng.space_info(r.e, space)
 	return err == .None && len(info.relay) > 0
+}
+
+dbg_lap_t: i64
+
+_dbg_lap_reset :: proc() {
+	dbg_lap_t = prim.mono_ns()
+}
+
+_dbg_lap :: proc(label: string) {
+	now := prim.mono_ns()
+	if d := now - dbg_lap_t; d > 1_000_000 {
+		fmt.eprintfln("LAP %s %.1fms", label, f64(d) / 1e6)
+	}
+	dbg_lap_t = now
 }
