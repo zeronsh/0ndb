@@ -1557,8 +1557,10 @@ attrib_log_open :: proc(m: ^Mount) -> Error {
 				break
 			}
 		}
+		at: i64
 		if prim.reader_remaining(&rd) >= len(step) {
 			step = prim.read_id(&rd)
+			at = prim.read_ivarint(&rd)
 		}
 		if !prim.reader_ok(&rd) {
 			break
@@ -1570,9 +1572,9 @@ attrib_log_open :: proc(m: ^Mount) -> Error {
 					delete(key, m.allocator)
 				}
 			} else {
-				attrib_set(m, path, actor, false, o, sc, base, step)
+				attrib_set(m, path, actor, false, o, sc, base, step, at)
 				if o != {} {
-					attrib_chain_add(m, path, Attrib_Step{actor, o, sc, base, step})
+					attrib_chain_add(m, path, Attrib_Step{actor, o, sc, base, step, at})
 				}
 			}
 		}
@@ -1583,7 +1585,7 @@ attrib_log_open :: proc(m: ^Mount) -> Error {
 }
 
 @(private)
-attrib_log_append :: proc(m: ^Mount, rel: string, actor: prim.Id, oid := odb.Oid{}, scope := prim.Id{}, base := Step_Base{}, step := prim.Id{}) -> Error {
+attrib_log_append :: proc(m: ^Mount, rel: string, actor: prim.Id, oid := odb.Oid{}, scope := prim.Id{}, base := Step_Base{}, step := prim.Id{}, at := i64(0)) -> Error {
 	if m.log_fd < 0 {
 		return save_mount_state(m)
 	}
@@ -1603,6 +1605,7 @@ attrib_log_append :: proc(m: ^Mount, rel: string, actor: prim.Id, oid := odb.Oid
 	}
 	if step != {} {
 		prim.write_id(&w, step)
+		prim.write_ivarint(&w, at)
 	}
 	rec := make([]u8, 8 + len(body), context.temp_allocator)
 	prim.put_u32le(rec[0:4], u32(len(body)))
@@ -1619,6 +1622,7 @@ Attrib_Step :: struct {
 	scope: prim.Id,
 	base:  Step_Base,
 	step:  prim.Id,
+	at:    i64,
 }
 
 @(private)
@@ -1711,8 +1715,9 @@ mount_closed :: proc(m: ^Mount, rel: string) {
 		attrib_log_append(m, rel, m.actor, prev.oid)
 	}
 	step := step_new(m)
-	attrib_set(m, rel, a.actor, false, oid, a.scope, a.base, step)
-	if attrib_log_append(m, rel, a.actor, oid, a.scope, a.base, step) == .None {
+	at := mount_jlen(m)
+	attrib_set(m, rel, a.actor, false, oid, a.scope, a.base, step, at)
+	if attrib_log_append(m, rel, a.actor, oid, a.scope, a.base, step, at) == .None {
 		attrib_log_durable(m, nil, nil)
 	}
 }
@@ -2275,12 +2280,14 @@ load_mount_state :: proc(m: ^Mount) -> (fresh: bool, err: Error) {
 		for _ in 0 ..< ns {
 			k := prim.read_str(&rd)
 			step := prim.read_id(&rd)
+			at := prim.read_ivarint(&rd)
 			base, bok := step_base_read(&rd)
 			if !bok || !prim.reader_ok(&rd) {
 				return false, .Corrupt
 			}
 			if a, ok := &m.attrib[k]; ok {
 				a.step = step
+				a.at = at
 				a.base = base
 			}
 		}
@@ -2457,6 +2464,7 @@ Attrib :: struct {
 	scope: prim.Id,
 	base:  Step_Base,
 	step:  prim.Id,
+	at:    i64,
 }
 
 STEP_BASE_NONE :: u8(0)
@@ -2473,13 +2481,36 @@ Step_Base :: struct {
 }
 
 @(private)
-attrib_set :: proc(m: ^Mount, path: string, actor: prim.Id, used := false, oid := odb.Oid{}, scope := prim.Id{}, base := Step_Base{}, step := prim.Id{}) {
+attrib_set :: proc(m: ^Mount, path: string, actor: prim.Id, used := false, oid := odb.Oid{}, scope := prim.Id{}, base := Step_Base{}, step := prim.Id{}, at := i64(0)) {
 	if p, ok := &m.attrib[path]; ok {
-		p^ = Attrib{actor, used, oid, scope, base, step}
+		p^ = Attrib{actor, used, oid, scope, base, step, at}
 		return
 	}
 	k, _ := clone_string(path, m.allocator)
-	m.attrib[k] = Attrib{actor, used, oid, scope, base, step}
+	m.attrib[k] = Attrib{actor, used, oid, scope, base, step, at}
+}
+
+@(private)
+landed_read :: proc(m: ^Mount) -> Error {
+	clear(&m.landed)
+	m.landed_gone = false
+	from := max(i64)
+	for _, l in prim.unordered(m.attrib_chain) {
+		for st in l {
+			if st.step != {} {
+				from = min(from, st.at)
+			}
+		}
+	}
+	for _, a in prim.unordered(m.attrib) {
+		if !a.used && a.step != {} {
+			from = min(from, a.at)
+		}
+	}
+	if from == max(i64) {
+		return .None
+	}
+	return history_steps(m.history, min(from, m.jpos), &m.landed, &m.landed_gone)
 }
 
 @(private)
@@ -2792,6 +2823,7 @@ save_mount_state :: proc(m: ^Mount) -> Error {
 	for k in stepped {
 		prim.write_str(&w, k)
 		prim.write_id(&w, attrib[k].step)
+		prim.write_ivarint(&w, attrib[k].at)
 		step_base_write(&w, attrib[k].base)
 	}
 	sum := xxhash.XXH3_64_with_seed(buf[:], 0) | 1
@@ -2846,10 +2878,8 @@ intents_dedupe :: proc(list: ^[dynamic]Intent) {
 mount_recover :: proc(m: ^Mount) -> Error {
 	h := m.history
 	if h != nil {
-		clear(&m.landed)
-		m.landed_gone = false
-		history_marked(h, m.jpos, commit_mark(m), &m.intents, &m.landed, &m.landed_gone) or_return
-		landed_settle(m)
+		landed_read(m) or_return
+		history_marked(h, m.jpos, commit_mark(m), &m.intents) or_return
 	}
 	intents_dedupe(&m.intents)
 	if len(m.intents) == 0 {
