@@ -1528,12 +1528,12 @@ replay_departing :: proc(m: ^Mount, long: runtime.Allocator) -> Error {
 			continue
 		}
 		steps := slice.clone(chain[:], context.temp_allocator)
-		attrib_chain_drop(m, k)
-		e, found := shadow_get(&m.shadow, k) or_return
+		path, _ := clone_string(k, long)
+		attrib_chain_drop(m, path)
+		e, found := shadow_get(&m.shadow, path) or_return
 		if !found || e.kind != .File {
 			continue
 		}
-		path, _ := clone_string(k, long)
 		c := Change{kind = .Modify, path = path, disk = .File, old = e}
 		cur := e.oid
 		for st in steps {
