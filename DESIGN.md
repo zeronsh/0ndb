@@ -1683,6 +1683,18 @@ concurrent typing is never lost or reverted.
   the grown coverage in one transaction. A lookup therefore reads at most
   32 KiB of records plus its share of those commits, however far behind
   the tail the range lies (sim `seal_scan`). Leaving a space drops both.
+- A blob a redaction scrubs can still back text nobody redacted: an
+  `Insert_Ref` op of another line or version that points into the same
+  blob. Before its own scrub, every device that applies the redaction, the
+  redactor and every holder alike, writes a zeroed copy B′ of each target
+  blob B into its history directory (`zeroed/<oid>`, written and synced by
+  rename): every byte zero except the ranges non-redacted `Insert_Ref` ops
+  into B use, found over every op ref and file-record base. A content read
+  whose blob is gone falls back to B′. B′ is local only: never uploaded,
+  never offered or packed under B's oid; a peer missing B gets its own B′
+  from its own redaction. A non-redacted range that overlaps a redacted one
+  means the redaction closure missed a copy and fails the redaction. A
+  crash after B′ and before the scrub leaves both; one before B′ leaves B.
 - Redaction in the device object store is a durable scrub intent
   (`objects/info/0ndb-scrub`: targets, protected blobs, superseded commits and
   trees). It is written and synced before the first irreversible step (the

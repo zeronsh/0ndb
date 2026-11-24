@@ -82,6 +82,7 @@ history_redact :: proc(h: ^History, spans: []crdt.Op_Span, allocator := context.
 	targets := make([dynamic]odb.Oid, context.temp_allocator)
 	protect := make([dynamic]odb.Oid, context.temp_allocator)
 	res.files = apply_redaction(h, all[:], extra[:], &targets, &protect) or_return
+	zero_blobs(h, all[:], targets[:]) or_return
 	if h.db != nil && len(targets) > 0 {
 		from_odb(odb.scrub_note(h.db, targets[:], protect[:])) or_return
 	}
@@ -476,6 +477,7 @@ apply_redact_record :: proc(h: ^History, body: []u8, preflight := false) -> Erro
 	targets := make([dynamic]odb.Oid, context.temp_allocator)
 	protect := make([dynamic]odb.Oid, context.temp_allocator)
 	apply_redaction(h, spans[:], nil, &targets, &protect) or_return
+	zero_blobs(h, spans[:], targets[:]) or_return
 	if h.db != nil && len(targets) > 0 {
 		unstage(h, targets[:], protect[:])
 		_, st, _ := odb.redact(h.db, targets[:], "refs/0ndb/", protect[:], true, context.temp_allocator)
@@ -503,4 +505,159 @@ unstage :: proc(h: ^History, targets: []odb.Oid, protect: []odb.Oid) {
 		delete(s.data, h.allocator)
 		ordered_remove(&h.staged, i)
 	}
+}
+
+@(private)
+ZEROED_DIR :: "zeroed"
+
+@(private)
+zeroed_path :: proc(h: ^History, oid: odb.Oid) -> (path: string, err: Error) {
+	hb: [odb.MAX_HEX]u8
+	hex := odb.oid_to_string(oid, h.db.format, &hb)
+	dir, derr := path_join(h.dir, ZEROED_DIR, context.temp_allocator)
+	if derr != nil {
+		return "", .No_Memory
+	}
+	p, perr := path_join(dir, hex, context.temp_allocator)
+	if perr != nil {
+		return "", .No_Memory
+	}
+	return p, .None
+}
+
+@(private)
+zeroed_read :: proc(h: ^History, oid: odb.Oid) -> (data: []u8, ok: bool) {
+	if h.db == nil {
+		return nil, false
+	}
+	p, perr := zeroed_path(h, oid)
+	if perr != .None {
+		return nil, false
+	}
+	d, rerr := prim.read_file(h.vfs, p, h.allocator)
+	if rerr != .None {
+		return nil, false
+	}
+	return d, true
+}
+
+@(private)
+span_holds :: proc(spans: []crdt.Op_Span, actor: prim.Id, seq: u64) -> bool {
+	for sp in spans {
+		if sp.id.actor == actor && seq >= sp.id.seq && seq < sp.id.seq + u64(sp.len) {
+			return true
+		}
+	}
+	return false
+}
+
+@(private)
+zero_blobs :: proc(h: ^History, spans: []crdt.Op_Span, targets: []odb.Oid) -> Error {
+	if h.db == nil || len(targets) == 0 {
+		return .None
+	}
+	touched := make(map[fstree.Inode_Id]bool, context.temp_allocator)
+	ignored := make([dynamic]odb.Oid, context.temp_allocator)
+	redaction_touched(h, spans, nil, &touched, &ignored, false) or_return
+	refs := make([dynamic]Op_Ref, context.temp_allocator)
+	visit :: proc(data: rawptr, key: []u8, value: []u8) -> bool {
+		out := (^[dynamic]Op_Ref)(data)
+		if len(key) == 13 && key[0] == 'f' {
+			r: File_Record
+			r.cp_version = make([dynamic]crdt.Op_Id, context.temp_allocator)
+			r.cp_spans = make([dynamic]crdt.Author_Span, context.temp_allocator)
+			if decode_file_record(value, &r) == .None && r.has_base {
+				append(out, r.base)
+			}
+			return true
+		}
+		if len(key) != 18 || key[0] != 'f' || key[1] != 'o' {
+			return true
+		}
+		rd := prim.reader(value)
+		for !prim.reader_done(&rd) {
+			ref: Op_Ref
+			ref.stream = u32(prim.read_uvarint(&rd))
+			ref.off = prim.read_uvarint(&rd)
+			ref.from = u32(prim.read_uvarint(&rd))
+			ref.to = u32(prim.read_uvarint(&rd))
+			if !prim.reader_ok(&rd) {
+				break
+			}
+			append(out, ref)
+		}
+		return true
+	}
+	kv_each(&h.kv, &refs, visit) or_return
+	for ino in sorted_inodes(touched) {
+		f := redaction_file(h, ino) or_return
+		append(&refs, ..f.new_refs[:])
+	}
+	done := make(map[odb.Oid]bool, context.temp_allocator)
+	dir_ready := false
+	for b in targets {
+		if done[b] {
+			continue
+		}
+		done[b] = true
+		t, data, rerr := odb.read(h.db, b, context.temp_allocator)
+		if rerr != .None || t != .Blob {
+			continue
+		}
+		out := make([]u8, len(data), context.temp_allocator)
+		used := make([]bool, len(data), context.temp_allocator)
+		red := make([]bool, len(data), context.temp_allocator)
+		seen := make(map[[2]u64]bool, context.temp_allocator)
+		for ref in refs {
+			key := [2]u64{u64(ref.stream), ref.off}
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			batch, berr := history_read_batch(h, ref.stream, ref.off, context.temp_allocator)
+			if berr != .None {
+				continue
+			}
+			pos: u64
+			for op in batch.ops {
+				s0 := batch.seq + pos
+				pos += u64(op.len)
+				if op.kind != .Insert_Ref || odb_oid(op.ref.oid) != b {
+					continue
+				}
+				for k in 0 ..< op.len {
+					p := op.ref.offset + k
+					if p < 0 || p >= len(data) {
+						continue
+					}
+					if span_holds(spans, batch.actor, s0 + u64(k)) {
+						red[p] = true
+					} else {
+						used[p] = true
+						out[p] = data[p]
+					}
+				}
+			}
+		}
+		for p in 0 ..< len(data) {
+			if red[p] && used[p] {
+				return .Invalid
+			}
+		}
+		if !dir_ready {
+			dir, derr := path_join(h.dir, ZEROED_DIR, context.temp_allocator)
+			if derr != nil {
+				return .No_Memory
+			}
+			from_prim(prim.mkdir_all(h.vfs, dir, 0o700)) or_return
+			from_prim(prim.sync_dir(h.vfs, h.dir)) or_return
+			dir_ready = true
+		}
+		zp := zeroed_path(h, b) or_return
+		from_prim(prim.replace_atomic(h.vfs, zp, out)) or_return
+	}
+	if f := h.opts.fault; f.blob_zeroed != nil {
+		f.blob_zeroed(f.data)
+	}
+	return .None
 }
