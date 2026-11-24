@@ -981,6 +981,9 @@ inode_set :: proc(s: ^Shadow, inode: fstree.Inode_Id, off: u64) -> Error {
 				}
 			} else {
 				r, rerr := read_rec(s, slot.off, &s.probe)
+				if rerr != .None && rerr != .Corrupt {
+					return rerr
+				}
 				if rerr != .None || r.del || r.entry.inode == inode {
 					return write_inode_slot(s, i, Inode_Slot{h, off})
 				}
@@ -1010,6 +1013,9 @@ inode_unset :: proc(s: ^Shadow, inode: fstree.Inode_Id, prev_off: u64) -> Error 
 				return write_inode_slot(s, i, Inode_Slot{h, 0})
 			}
 			r, rerr := read_rec(s, slot.off, &s.probe)
+			if rerr != .None && rerr != .Corrupt {
+				return rerr
+			}
 			if rerr == .None && r.entry.inode == inode {
 				return .None
 			}
@@ -1028,6 +1034,7 @@ find_path :: proc(s: ^Shadow, path: string, h: u64) -> (index: u64, slot: Path_S
 	i := h & mask
 	block: [SHADOW_BLOCK]u8
 	scanned: u64
+	bad := false
 	step := u64(8)
 	for scanned < s.cap {
 		n := min(step, s.cap - i)
@@ -1038,12 +1045,16 @@ find_path :: proc(s: ^Shadow, path: string, h: u64) -> (index: u64, slot: Path_S
 			b := buf[k * SHADOW_PATH_SLOT:]
 			sh := prim.get_u64le(b[0:8])
 			if sh == 0 {
-				return i + k, {}, false, .None
+				return i + k, {}, false, .Corrupt if bad else .None
 			}
 			if sh == h {
 				off := prim.get_u64le(b[8:16])
-				r, rerr2 := read_rec(s, off, &s.probe)
-				if rerr2 == .None && r.path == path {
+				r, rerr := read_rec(s, off, &s.probe)
+				if rerr != .None && rerr != .Corrupt {
+					return 0, {}, false, rerr
+				}
+				bad ||= rerr == .Corrupt
+				if rerr == .None && r.path == path {
 					s.probe_del = r.del
 					sl := Path_Slot{sh, off, prim.get_u64le(b[16:24]), prim.get_u64le(b[24:32])}
 					return i + k, sl, true, .None
@@ -1538,6 +1549,9 @@ recount :: proc(s: ^Shadow) -> Error {
 				continue
 			}
 			r, err := read_rec(s, prim.get_u64le(block[k + 8:k + 16]), &s.scratch)
+			if err != .None && err != .Corrupt {
+				return err
+			}
 			if err == .None && !r.del {
 				live += 1
 			}

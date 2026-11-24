@@ -1670,7 +1670,10 @@ mount_closed :: proc(m: ^Mount, rel: string) {
 	if rerr != .None {
 		return
 	}
-	prev, has_prev, _ := shadow_get(&m.shadow, rel)
+	prev, has_prev, perr := shadow_get(&m.shadow, rel)
+	if perr != .None {
+		return
+	}
 	cleaned, cok := eol_clean(m, rel, data, prev.inode, has_prev && prev.kind == .File)
 	if !cok {
 		return

@@ -234,7 +234,7 @@ materialize_to :: proc(m: ^Mount, target: Version, merge: bool) -> Error {
 	if m.mat_ingest && !merge {
 		held := false
 		for &it in items {
-			if p, blocked := mat_blocker(m, &it, tl[:]); blocked {
+			if p, blocked := mat_blocker(m, &it, tl[:]) or_return; blocked {
 				mount_mark(m, p)
 				held = true
 			}
@@ -251,7 +251,7 @@ materialize_to :: proc(m: ^Mount, target: Version, merge: bool) -> Error {
 			}
 			if crdt.frontier_eq(one[:], sl[:]) {
 				for &it in items {
-					if p, blocked := mat_blocker(m, &it, tl[:]); blocked {
+					if p, blocked := mat_blocker(m, &it, tl[:]) or_return; blocked {
 						c, _ := clone_string(p, m.allocator)
 						append(&m.collided, c)
 					}
@@ -836,18 +836,18 @@ displaced_touch :: proc(m: ^Mount, snap: ^fstree.Snapshot, touched: ^map[fstree.
 }
 
 @(private)
-mat_blocker :: proc(m: ^Mount, it: ^Mat_Item, tl: []crdt.Lv) -> (path: string, blocked: bool) {
+mat_blocker :: proc(m: ^Mount, it: ^Mat_Item, tl: []crdt.Lv) -> (path: string, blocked: bool, err: Error) {
 	if it.has_old && it.entry.kind != .Dir && !disk_matches(m, it.old, it.entry) {
-		return it.old, true
+		return it.old, true, .None
 	}
 	if it.present && it.kind != .Dir && (!it.has_old || it.old != it.path) {
 		if d, _ := probe(m, it.path); d.kind != .Missing {
-			if _, known, _ := shadow_get(&m.shadow, it.path); !known && !mat_is_item(m, it, tl) {
-				return it.path, true
+			if _, known := shadow_get(&m.shadow, it.path) or_return; !known && !mat_is_item(m, it, tl) {
+				return it.path, true, .None
 			}
 		}
 	}
-	return "", false
+	return "", false, .None
 }
 
 @(private)

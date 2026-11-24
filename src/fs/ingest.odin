@@ -1894,7 +1894,7 @@ pre_moves :: proc(p: ^Pass, keys: []string) -> Error {
 		if _, exists := shadow_get(&m.shadow, k) or_return; exists {
 			continue
 		}
-		parent_ok := parent_tracked(p, k)
+		parent_ok := parent_tracked(p, k) or_return
 		if !parent_ok {
 			continue
 		}
@@ -2266,7 +2266,7 @@ collect_path :: proc(p: ^Pass, rel: string, listed := false) -> Error {
 		if d.kind == .Missing || d.kind == .Other {
 			return .None
 		}
-		if !parent_tracked(p, rel) {
+		if tracked := parent_tracked(p, rel) or_return; !tracked {
 			parent := path_parent(rel)
 			if len(parent) > 0 {
 				return collect_path(p, parent)
@@ -2347,18 +2347,18 @@ mark_seen :: proc(p: ^Pass, rel: string) {
 }
 
 @(private)
-parent_tracked :: proc(p: ^Pass, rel: string) -> bool {
+parent_tracked :: proc(p: ^Pass, rel: string) -> (tracked: bool, err: Error) {
 	parent := path_parent(rel)
 	if len(parent) == 0 {
-		return true
+		return true, .None
 	}
 	for c in p.changes {
 		if c.kind == .Create && c.path == parent && c.disk == .Dir {
-			return true
+			return true, .None
 		}
 	}
-	e, found, _ := shadow_get(&p.m.shadow, parent)
-	return found && e.kind == .Dir
+	e, found := shadow_get(&p.m.shadow, parent) or_return
+	return found && e.kind == .Dir, .None
 }
 
 @(private)
@@ -2901,16 +2901,16 @@ find_change :: proc(p: ^Pass, path: string, kind: Change_Kind) -> (int, bool) {
 }
 
 @(private)
-parent_inode :: proc(p: ^Pass, rel: string) -> (fstree.Inode_Id, bool) {
+parent_inode :: proc(p: ^Pass, rel: string) -> (inode: fstree.Inode_Id, ok: bool, err: Error) {
 	parent := path_parent(rel)
 	if len(parent) == 0 {
-		return fstree.ROOT, true
+		return fstree.ROOT, true, .None
 	}
-	e, found, _ := shadow_get(&p.m.shadow, parent)
+	e, found := shadow_get(&p.m.shadow, parent) or_return
 	if found && e.kind == .Dir {
-		return e.inode, true
+		return e.inode, true, .None
 	}
-	return {}, false
+	return {}, false, .None
 }
 
 @(private)
@@ -2940,7 +2940,7 @@ emit_change_inner :: proc(p: ^Pass, b: ^Builder, c: ^Change) -> Error {
 			mount_reshow_add(m, c.path)
 		}
 	case .Create:
-		parent, ok := parent_inode(p, c.path)
+		parent, ok := parent_inode(p, c.path) or_return
 		if !ok {
 			mount_mark(m, c.path)
 			if c.moved != "" {
