@@ -238,8 +238,18 @@ verify_at_line :: proc(m: ^Mount, p: string, inode: fstree.Inode_Id) -> (at: boo
 		return false, .None
 	}
 	lvs := make([dynamic]crdt.Lv, context.temp_allocator)
-	if crdt.graph_version_lvs(&m.history.g, line, &lvs) != .None {
+	sl := make([dynamic]crdt.Lv, context.temp_allocator)
+	g := &m.history.g
+	if crdt.graph_version_lvs(g, line, &lvs) != .None || crdt.graph_version_lvs(g, m.synced[:], &sl) != .None {
 		return false, .Corrupt
+	}
+	if crdt.frontier_eq(lvs[:], sl[:]) {
+		return false, .None
+	}
+	for x in sl {
+		if !crdt.graph_contains(g, lvs[:], x) {
+			return false, .None
+		}
 	}
 	snap := version_snapshot(m.history, lvs[:]) or_return
 	defer fstree.snapshot_destroy(&snap)

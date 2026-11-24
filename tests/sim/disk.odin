@@ -31,6 +31,8 @@ Pend :: struct {
 
 Inode :: struct {
 	ino:      u64,
+	shown:    u64,
+	freed:    bool,
 	kind:     Inode_Kind,
 	mode:     u32,
 	data:     [dynamic]u8,
@@ -83,6 +85,12 @@ Dir_Iter :: struct {
 	pos:   int,
 }
 
+Ino_Reuse :: enum u8 {
+	Off,
+	Lowest,
+	Last,
+}
+
 Crash_Mode :: enum u8 {
 	Process,
 	Power,
@@ -118,6 +126,10 @@ Disk :: struct {
 	grains:    [dynamic]Grain,
 	crash_on_trunc: string,
 	force_process: bool,
+	force_power: bool,
+	reuse:     Ino_Reuse,
+	spare:     [dynamic]u64,
+	reused:    u64,
 	blob_crash: u64,
 	blob_crash_n: u64,
 	blob_crashes: u64,
@@ -231,6 +243,7 @@ disk_init :: proc(d: ^Disk, name: string, allocator: runtime.Allocator) {
 	d.meta = make([dynamic]Meta_Op, allocator)
 	d.events = make([dynamic]Watch_Ev, allocator)
 	d.grains = make([dynamic]Grain, allocator)
+	d.spare = make([dynamic]u64, allocator)
 	d.next_ino = ROOT_INO
 	d.next_fd = 16
 	root := _inode_new(d, .Dir, 0o755)
@@ -242,6 +255,7 @@ disk_destroy :: proc(d: ^Disk) {
 		_inode_free(d, n)
 	}
 	delete(d.inodes)
+	delete(d.spare)
 	for _, of in d.fds {
 		delete(of.path, d.allocator)
 	}
@@ -274,10 +288,62 @@ disk_open_fds :: proc(d: ^Disk) -> int {
 }
 
 @(private = "file")
+_ino_take :: proc(d: ^Disk, fresh: u64) -> u64 {
+	if d.reuse == .Off || len(d.spare) == 0 {
+		return fresh
+	}
+	at := len(d.spare) - 1
+	if d.reuse == .Lowest {
+		for x, i in d.spare {
+			if x < d.spare[at] {
+				at = i
+			}
+		}
+	}
+	d.reused += 1
+	ino := d.spare[at]
+	ordered_remove(&d.spare, at)
+	return ino
+}
+
+@(private = "file")
+_ino_give :: proc(d: ^Disk, n: ^Inode) {
+	if d.reuse == .Off || n.freed {
+		return
+	}
+	n.freed = true
+	append(&d.spare, n.shown)
+}
+
+@(private = "file")
+_ino_back :: proc(d: ^Disk) {
+	for k in prim.sorted_keys(d.inodes) {
+		n := d.inodes[k]
+		if !n.freed || n.nlink == 0 {
+			continue
+		}
+		n.freed = false
+		held := false
+		for x, i in d.spare {
+			if x == n.shown {
+				ordered_remove(&d.spare, i)
+				held = true
+				break
+			}
+		}
+		if !held {
+			n.shown = d.next_ino
+			d.next_ino += 1
+		}
+	}
+}
+
+@(private = "file")
 _inode_new :: proc(d: ^Disk, kind: Inode_Kind, mode: u32) -> ^Inode {
 	n := new(Inode, d.allocator)
 	n.ino = d.next_ino
 	d.next_ino += 1
+	n.shown = _ino_take(d, n.ino)
 	n.kind = kind
 	n.mode = mode & 0o7777
 	n.data = make([dynamic]u8, d.allocator)
@@ -536,6 +602,7 @@ _maybe_orphan :: proc(d: ^Disk, ino: u64) {
 	if !ok || n.nlink > 0 || n.opens > 0 {
 		return
 	}
+	_ino_give(d, n)
 	for m in d.meta {
 		if m.ino == ino {
 			return
@@ -1075,7 +1142,7 @@ _stat_of :: proc(n: ^Inode) -> prim.Stat {
 		size = size,
 		mode = _type_bits(n.kind) | n.mode,
 		kind = _kind(n.kind),
-		ino = n.ino,
+		ino = n.shown,
 		dev = 1,
 		nlink = u64(max(n.nlink, 0)),
 		mtime_ns = n.mtime_ns,
@@ -1414,7 +1481,7 @@ _d_dir_open :: proc(data: rawptr, dir: ^prim.Dir, path: string) -> prim.Error {
 	for k, j in names {
 		v := n.entries[k]
 		names[j] = strings.clone(k, a)
-		it.inos[j] = v
+		it.inos[j] = d.inodes[v].shown
 		it.kinds[j] = _kind(d.inodes[v].kind)
 	}
 	it.names = names
@@ -1627,6 +1694,7 @@ _collect :: proc(d: ^Disk) {
 			}
 		}
 	}
+	_ino_back(d)
 }
 
 @(private = "file")

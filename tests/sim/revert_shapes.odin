@@ -51,6 +51,7 @@ Rs_Case :: struct {
 	undo:  [][2]string,
 	offer: []string,
 	known: string,
+	cut:   string,
 }
 
 @(private = "file")
@@ -132,6 +133,8 @@ _rs_cases :: proc(alloc: runtime.Allocator) -> []Rs_Case {
 				append(&undo, [2]string{w[len("undo:"):eq], w[eq + 1:]})
 			} else if strings.has_prefix(w, "offer:") {
 				append(&offer, w[len("offer:"):])
+			} else if strings.has_prefix(w, "cut:") {
+				c.cut = w[len("cut:"):]
 			} else if strings.has_prefix(w, "known:") {
 				c.known = w[len("known:"):]
 			}
@@ -831,10 +834,40 @@ _rs_case :: proc(w: ^World, cs: Rs_Case, alloc: runtime.Allocator) {
 }
 
 @(private = "file")
-_rs_crash_case :: proc(w: ^World, cs: Rs_Case, k: u64, fault: bool, alloc: runtime.Allocator) -> (crashed: bool) {
+_rs_base :: proc(p: string) -> string {
+	return p[strings.last_index_byte(p, '/') + 1:]
+}
+
+@(private = "file")
+_rs_cut :: proc(t: ^Rs_Tree, base: string) {
+	for k in prim.sorted_keys(t^) {
+		if _rs_base(k) == base {
+			delete_key(t, k)
+		}
+	}
+}
+
+Rs_Arm :: enum {
+	Power,
+	Process,
+	Reuse_Lowest,
+	Reuse_Last,
+	Cut_Down,
+	Cut_Up,
+	Fault,
+}
+
+@(private = "file")
+_rs_crash_case :: proc(w: ^World, cs: Rs_Case, k: u64, arm: Rs_Arm, alloc: runtime.Allocator) -> (crashed: bool) {
+	fault := arm == .Fault
 	c, cok := _rs_setup(w, cs, alloc)
 	if !cok {
 		return
+	}
+	if arm == .Reuse_Lowest {
+		c.n.disk.reuse = .Lowest
+	} else if arm == .Reuse_Last {
+		c.n.disk.reuse = .Last
 	}
 	r, tok := _rs_turn(c, cs)
 	if !tok {
@@ -847,6 +880,8 @@ _rs_crash_case :: proc(w: ^World, cs: Rs_Case, k: u64, fault: bool, alloc: runti
 		n.disk.fail_nth = k
 	} else {
 		n.disk.crash_at = n.disk.stats.ops + k
+		n.disk.force_process = arm != .Power
+		n.disk.force_power = arm == .Power
 	}
 	undo: prim.Id
 	start: {
@@ -866,8 +901,29 @@ _rs_crash_case :: proc(w: ^World, cs: Rs_Case, k: u64, fault: bool, alloc: runti
 			node_crash_now(n, .Power, k)
 		}
 	}
+	if arm == .Cut_Down || arm == .Cut_Up {
+		until := w.now + 20_000_000_000
+		for w.now < until && w.stats.crashes == crashes {
+			run_until(w, w.now + 1_000_000, true)
+		}
+		for w.now < until && arm == .Cut_Up && w.stats.crashes > crashes && !n.alive {
+			run_until(w, w.now + 1_000_000, true)
+		}
+		if w.stats.crashes > crashes {
+			_rs_cut(&r.undoneq, cs.cut)
+			_rs_cut(&r.post, cs.cut)
+			now := _rs_read(c, c.alloc)
+			for p in prim.sorted_keys(now) {
+				if _rs_base(p) == cs.cut {
+					prim.remove(c.vfs, _rs_abs(p))
+				}
+			}
+		}
+	}
 	run_until(w, w.now + 20_000_000_000, true)
 	n.disk.crash_at = 0
+	n.disk.force_process = false
+	n.disk.force_power = false
 	crashed = w.stats.crashes > crashes
 	run_until(w, w.now + 20_000_000_000, true)
 	if !n.alive {
@@ -918,7 +974,7 @@ _rs_crash_case :: proc(w: ^World, cs: Rs_Case, k: u64, fault: bool, alloc: runti
 	return
 }
 
-revert_shapes_crash_run :: proc(seed: u64, only: string, stride: u64, limit: u64, fault: bool) -> (failures: [dynamic]string, points: int) {
+revert_shapes_crash_run :: proc(seed: u64, only: string, stride: u64, limit: u64, arm: Rs_Arm) -> (failures: [dynamic]string, points: int, reused: u64) {
 	failures = make([dynamic]string)
 	arena: virtual.Arena
 	if virtual.arena_init_growing(&arena, 1 << 20) != nil {
@@ -927,6 +983,9 @@ revert_shapes_crash_run :: proc(seed: u64, only: string, stride: u64, limit: u64
 	defer virtual.arena_destroy(&arena)
 	for cs in _rs_cases(virtual.arena_allocator(&arena)) {
 		if len(only) > 0 && cs.name != only || len(only) == 0 && len(cs.known) > 0 && !_rs_all() {
+			continue
+		}
+		if (arm == .Cut_Down || arm == .Cut_Up) && len(cs.cut) == 0 {
 			continue
 		}
 		for k := env_u64("SHAPES_FROM", 1); k <= limit; k += stride {
@@ -946,7 +1005,8 @@ revert_shapes_crash_run :: proc(seed: u64, only: string, stride: u64, limit: u64
 			ca: virtual.Arena
 			crashed := false
 			if virtual.arena_init_growing(&ca, 1 << 20) == nil {
-				crashed = _rs_crash_case(w, cs, k, fault, virtual.arena_allocator(&ca))
+				crashed = _rs_crash_case(w, cs, k, arm, virtual.arena_allocator(&ca))
+				reused += w.nodes[0].disk.reused
 				virtual.arena_destroy(&ca)
 			}
 			for f in w.failures {
@@ -1010,7 +1070,8 @@ revert_shapes :: proc(t: ^testing.T) {
 	}
 	test_begin(t)
 	defer test_end(t)
-	only, _ := os.lookup_env("SHAPES_ONLY", context.temp_allocator)
+	only, _ := os.lookup_env("SHAPES_ONLY", context.allocator)
+	defer delete(only)
 	failures, cases := revert_shapes_run(1, only)
 	for f in failures {
 		fmt.eprintf("revert_shapes: %s\n", f)
@@ -1029,23 +1090,25 @@ revert_shapes_crash :: proc(t: ^testing.T) {
 	}
 	test_begin(t)
 	defer test_end(t)
-	only, _ := os.lookup_env("SHAPES_ONLY", context.temp_allocator)
-	for fault in ([2]bool{false, true}) {
-		_rs_sweep(t, only, fault)
+	only, _ := os.lookup_env("SHAPES_ONLY", context.allocator)
+	defer delete(only)
+	for arm in Rs_Arm {
+		_rs_sweep(t, only, arm)
 	}
 }
 
 @(private = "file")
-_rs_sweep :: proc(t: ^testing.T, only: string, fault: bool) {
-	failures, points := revert_shapes_crash_run(1, only, env_u64("SHAPES_STRIDE", 11 if fault else 37), env_u64("SHAPES_LIMIT", 4000), fault)
+_rs_sweep :: proc(t: ^testing.T, only: string, arm: Rs_Arm) {
+	failures, points, reused := revert_shapes_crash_run(1, only, env_u64("SHAPES_STRIDE", 11 if arm == .Fault else 37), env_u64("SHAPES_LIMIT", 4000), arm)
 	for f, i in failures {
 		if u64(i) < env_u64("SHAPES_PRINT", 40) {
-			fmt.eprintf("revert_shapes_crash: %s\n", f)
+			fmt.eprintf("revert_shapes_crash: %v %s\n", arm, f)
 		}
 		delete(f)
 	}
-	fmt.eprintf("revert_shapes_crash: %d %s points, %d failures\n", points, "fault" if fault else "crash", len(failures))
+	fmt.eprintf("revert_shapes_crash: %v %d points, %d inode numbers reused, %d failures\n", arm, points, reused, len(failures))
 	testing.expect(t, points > 0, "revert_shapes_crash: nothing crashed")
+	testing.expect(t, (reused > 0) == (arm == .Reuse_Lowest || arm == .Reuse_Last), "revert_shapes_crash: inode numbers are reused exactly in the reuse arms")
 	testing.expect(t, len(failures) == 0, "revert_shapes_crash failed")
 	delete(failures)
 }
