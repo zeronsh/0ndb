@@ -1,5 +1,7 @@
 package fs
 
+import "core:fmt"
+
 import "base:runtime"
 import "core:crypto/blake2b"
 import "core:slice"
@@ -1608,6 +1610,16 @@ mat_snapshot_named :: proc(m: ^Mount, it: ^Mat_Item, at: []fstree.Op_Id, base, p
 	e := it.entry
 	e.stat = st
 	e.oid = oid
+	{
+		at_, has_ := m.attrib[it.old]
+		vl_ := make([dynamic]crdt.Lv, context.temp_allocator)
+		blk_ := false
+		if kn_ := crdt.graph_known(&h.g, base); kn_ > 0 {
+			own_, ok_ := crdt.graph_lv(&h.g, crdt.Op_Id{base, kn_ - 1})
+			blk_ = !ok_ || crdt.graph_version_lvs(&h.g, v, &vl_) != .None || !crdt.graph_contains(&h.g, vl_[:], own_)
+		}
+		fmt.eprintf("SNAPNAMED changed=%v attrib=%v used=%v blocked=%v\n", string(old) != string(data), has_, at_.used, blk_)
+	}
 	if string(old) != string(data) {
 		history_register_actor(h, base, pseudo) or_return
 		actor := event_actor(m, base, v, _event_digest(inode_op(h, it.inode), data)) or_return
