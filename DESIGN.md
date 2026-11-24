@@ -703,7 +703,12 @@ equal in both directions.
   covers them is written. Recovery re-derives the shadow entries of the
   inodes its intents touched from the tree at the synced version it saves
   (the old synced frontier plus the intents), never from the history's
-  current tree, whose later local operations the disk does not reflect yet. The mount state also records the shadow's
+  current tree, whose later local operations the disk does not reflect yet.
+  An inode removed at that version whose shadow path still holds its text at
+  the end of an intent that touched it (a based write onto a removed inode
+  whose restore was deferred) keeps its entry at that intent's version, and
+  the path is owed: the disk returns to `synced` once it may, and the file
+  is never ingested again as a new one. The mount state also records the shadow's
   generation and log end it was saved against; on open a longer shadow is
   rolled back to that end, so shadow and synced frontier are always one
   saved state and a crash between the shadow flush and the state save is
