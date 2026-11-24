@@ -98,14 +98,9 @@ _index_open :: proc(e: ^Engine) -> Error {
 		return _xerr(err)
 	}
 	e.index_open = true
-	if !rebuilt && _search_restore_interrupted(e) {
-		search.reset(&e.index)
-		rebuilt = true
-	}
 	if rebuilt {
 		_index_all(e)
 	}
-	_search_drop_markers(e) or_return
 	return .None
 }
 
