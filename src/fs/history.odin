@@ -1114,7 +1114,11 @@ import_apply :: proc(h: ^History, b: ^crdt.Batch, stream: u32, off: u64) -> Erro
 history_commit_local :: proc(h: ^History, b: ^crdt.Batch, line: Maybe(string) = nil) -> (off: i64, err: Error) {
 	history_wake(h) or_return
 	parents := make([dynamic]crdt.Lv, context.temp_allocator)
+	h.src_err = .None
 	skip, gerr := crdt.graph_check(&h.g, b, &parents)
+	if gerr != .None && h.src_err != .None {
+		return 0, h.src_err
+	}
 	if gerr != .None || skip != 0 {
 		return 0, .Invalid
 	}
@@ -2298,6 +2302,7 @@ copy_read_depth :: proc(h: ^History, src: crdt.Op_Id, dst: []u8, authors: ^[dyna
 		}
 		b, err := history_read_batch(h, stream, off, context.temp_allocator)
 		if err != .None || b.actor != id.actor || id.seq < b.seq {
+			src_fault(h, err)
 			break
 		}
 		rel := int(id.seq - b.seq)
@@ -2353,6 +2358,7 @@ content_read :: proc(data: rawptr, oid: crdt.Oid, offset: int, dst: []u8) -> boo
 			if d != nil {
 				delete(d, h.allocator)
 			}
+			src_fault(h, from_odb(err))
 			return false
 		}
 		h.blob_data = d
@@ -2363,6 +2369,16 @@ content_read :: proc(data: rawptr, oid: crdt.Oid, offset: int, dst: []u8) -> boo
 	}
 	copy(dst, h.blob_data[offset:])
 	return true
+}
+
+@(private)
+src_fault :: proc "contextless" (h: ^History, err: Error) {
+	#partial switch err {
+	case .Io, .No_Space, .No_Memory, .Busy:
+		if h.src_err == .None {
+			h.src_err = err
+		}
+	}
 }
 
 @(private)
@@ -2407,6 +2423,7 @@ load_text :: proc(h: ^History, f: ^File_State, v: []crdt.Lv, full := false) -> E
 			}
 			t, d, rerr := odb.read(h.db, odb.Oid(oid), allocator)
 			if rerr != .None || t != .Blob || i64(len(d)) != size {
+				src_fault(h, from_odb(rerr))
 				return nil, .Not_Found
 			}
 			return d, .None
@@ -2933,6 +2950,7 @@ graph_load :: proc(data: rawptr, key: crdt.Page_Key, out: ^[dynamic]u8) -> bool 
 	h := (^History)(data)
 	v, found, err := kv_get(&h.kv, page_key(key), context.temp_allocator)
 	if err != .None || !found {
+		src_fault(h, err)
 		return false
 	}
 	clear(out)
