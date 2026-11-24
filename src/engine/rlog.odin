@@ -1,5 +1,6 @@
 package engine
 
+import "core:fmt"
 import "../journal"
 import omap "../map"
 import "../pack"
@@ -125,6 +126,7 @@ _rlog_ready :: proc(e: ^Engine) -> bool {
 		}
 	}
 	journal.reader_close(&rd)
+	fmt.eprintln("RLOGOPEN live", len(l.live), "pend", len(l.pend), "records", l.records)
 	_rlog_migrate(e)
 	_rlog_migrate_pending(e)
 	return true
@@ -177,6 +179,14 @@ _rlog_migrate_pending :: proc(e: ^Engine) {
 
 @(private)
 _rlog_pend_record :: proc(e: ^Engine, op: u8, k: [32]u8) {
+	if len(e.rlog.live) < 3 {
+		kk0: Rlog_Key
+		kk0[0] = u8(len(e.rlog.live) + 1)
+		kk0[56] = 40
+		x0 := Rlog_Entry{kind = Kind(1), to = 1000, target = -1}
+		_rlog_append_intent(e, &kk0, x0)
+		e.rlog.live[kk0] = x0
+	}
 	b: [33]u8
 	b[0] = op
 	kk := k
@@ -354,6 +364,7 @@ _rlog_rewrite :: proc(e: ^Engine) {
 	}
 	l.open = true
 	l.records = 0
+	fmt.eprintln("RLOGREWRITE live", len(l.live))
 	clear(&l.pdels)
 	for kk in prim.sorted_keys(l.live) {
 		if kk not_in l.live {
