@@ -66,11 +66,7 @@ _rc_open :: proc(d: ^Disk) -> (r: ^Rc_Rig, ok: bool) {
 	}}
 	opts.wake = proc(data: rawptr) {}
 	opts.wake_data = r
-	err := pack.open(&r.pk, v, RC_PACK, opts, runtime.heap_allocator())
-	if err != .None {
-		fmt.eprintln("open", err)
-	}
-	return r, err == .None
+	return r, pack.open(&r.pk, v, RC_PACK, opts, runtime.heap_allocator()) == .None
 }
 
 @(private = "file")
@@ -113,7 +109,11 @@ _rc_idle :: proc(r: ^Rc_Rig) -> (turns: int, ok: bool) {
 			return turns, false
 		}
 	}
-	return turns, !r.job
+	if r.job {
+		return turns, false
+	}
+	more, e := pack.step(&r.pk)
+	return turns, e == .None && !more && !r.job
 }
 
 @(private = "file")
@@ -176,7 +176,7 @@ _rc_case :: proc(attempts: int, k: u64) -> (msg: string, crashed: bool, reclaime
 		turns, done := _rc_idle(r)
 		if !d.dead {
 			if !done {
-				return fmt.tprintf("compaction was still running after %d completions with no writer", turns), false, 0
+				return fmt.tprintf("compaction stopped or was still running with work left after %d completions and no writer", turns), false, 0
 			}
 			if b := disk_bytes(&d); b > RC_IDLE {
 				return fmt.tprintf("idle: the disk holds %d bytes after the last job finished; the bound is %d (%d jobs followed)", b, RC_IDLE, turns), false, 0
@@ -184,15 +184,14 @@ _rc_case :: proc(attempts: int, k: u64) -> (msg: string, crashed: bool, reclaime
 		}
 	}
 	reclaimed = pack.stats(&r.pk).compact_conts
+	pack.close(&r.pk)
 	if d.dead {
 		crashed = true
 		rng: Rng
 		rng_init(&rng, 1, k)
-		pack.close(&r.pk)
 		disk_crash(&d, .Power, &rng)
-	} else {
-		pack.close(&r.pk)
 	}
+	d.crash_at = 0
 	r2, ok2 := _rc_open(&d)
 	defer free(r2, runtime.heap_allocator())
 	if !ok2 {
@@ -212,6 +211,9 @@ _rc_case :: proc(attempts: int, k: u64) -> (msg: string, crashed: bool, reclaime
 	if !_rc_keep(r2, false) {
 		return "compaction lost the synced file's content", crashed, reclaimed
 	}
+	if env_u64("SIM_RECLAIM_DUMP", 0) > 0 && k == 0 {
+		fmt.eprintfln("peak %d logged %d compacted %d idle turns %d disk %d", peak, logged, reclaimed, turns, disk_bytes(&d))
+	}
 	return "", crashed, reclaimed
 }
 
@@ -228,8 +230,9 @@ pack_reclaim :: proc(t: ^testing.T) {
 	if len(msg) > 0 {
 		return
 	}
+	free_all(context.temp_allocator)
 	points := 0
-	for k := u64(1); k < 100000; k += 1 + k / 40 {
+	for k in u64(1) ..< 4000 {
 		m, crashed, _ := _rc_case(8, k)
 		if len(m) > 0 {
 			testing.expectf(t, false, "crash at disk op %d: %s", k, m)
