@@ -572,6 +572,13 @@ free_result :: proc(res: ^Run_Result) {
 
 @(test)
 simulate :: proc(t: ^testing.T) {
+	if env_u64("SIM_RACE_K", 0) > 0 {
+		race_k = env_u64("SIM_RACE_K", 0)
+		sync.atomic_store(&race_on, true)
+		for i := 0; i < 3000 && !sync.atomic_load(&race_held); i += 1 {
+			time.sleep(time.Millisecond)
+		}
+	}
 	test_begin(t)
 	defer test_end(t)
 	verbose := env_u64("SIM_VERBOSE", 0) != 0

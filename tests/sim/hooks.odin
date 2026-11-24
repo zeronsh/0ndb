@@ -4,6 +4,8 @@ import "base:runtime"
 import "core:fmt"
 import "core:os"
 import "core:slice"
+import "core:sync"
+import "core:time"
 import "core:strings"
 import eng "../../src/engine"
 import "../../src/prim"
@@ -98,18 +100,42 @@ Registry :: struct {
 @(private = "file")
 reg: Registry
 
+race_on: bool
+race_k: u64
+race_cmp: u64
+race_held: bool
+race_passed: bool
+race_done: bool
+
+@(private = "file")
+_sort_lock: sync.Mutex
+
 @(private = "file")
 _sorted :: proc() {
 	assert(!reg.overflow)
+	if sync.atomic_load_explicit(&reg.sorted, .Acquire) {
+		return
+	}
+	sync.guard(&_sort_lock)
 	if reg.sorted {
 		return
 	}
-	reg.sorted = true
 	by :: proc(a, b: Ordered($P)) -> bool {
 		return a.order < b.order
 	}
 	slice.stable_sort_by(reg.final_checks.items[:reg.final_checks.n], by)
-	slice.stable_sort_by(reg.inits.items[:reg.inits.n], by)
+	at :: proc(a, b: Ordered(World_Hook)) -> bool {
+		race_cmp += 1
+		if race_on && race_cmp == race_k {
+			sync.atomic_store(&race_held, true)
+			for i := 0; i < 3000 && !sync.atomic_load(&race_passed); i += 1 {
+				time.sleep(time.Millisecond)
+			}
+		}
+		return a.order < b.order
+	}
+	slice.stable_sort_by(reg.inits.items[:reg.inits.n], at)
+	sync.atomic_store(&race_held, true)
 	slice.stable_sort_by(reg.destroys.items[:reg.destroys.n], by)
 	slice.stable_sort_by(reg.collects.items[:reg.collects.n], by)
 	slice.stable_sort_by(reg.steps.items[:reg.steps.n], by)
@@ -126,6 +152,8 @@ _sorted :: proc() {
 	slice.stable_sort_by(reg.lines.items[:reg.lines.n], proc(a, b: Stat_Line) -> bool {
 		return a.order < b.order
 	})
+	sync.atomic_store(&race_done, true)
+	sync.atomic_store_explicit(&reg.sorted, true, .Release)
 }
 
 @(private = "file")
@@ -350,6 +378,12 @@ run_world_init :: proc(w: ^World) {
 	_sorted()
 	for h in reg.inits.items[:reg.inits.n] {
 		h.call(w)
+	}
+	if race_on {
+		sync.atomic_store(&race_passed, true)
+		for i := 0; i < 3000 && !sync.atomic_load(&race_done); i += 1 {
+			time.sleep(time.Millisecond)
+		}
 	}
 }
 

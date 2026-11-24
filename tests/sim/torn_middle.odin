@@ -2,7 +2,9 @@ package sim
 
 import "base:runtime"
 import "core:fmt"
+import "core:sync"
 import "core:testing"
+import "core:time"
 import "../../src/journal"
 import "../../src/prim"
 
@@ -72,6 +74,9 @@ _torn_case :: proc(seed: u64) -> (shaped: bool, msg: string) {
 
 @(test)
 torn_middle :: proc(t: ^testing.T) {
+	for env_u64("SIM_RACE_K", 0) > 0 && !sync.atomic_load(&race_on) {
+		time.sleep(time.Millisecond)
+	}
 	shaped := 0
 	for seed in 1 ..= 256 {
 		ok, msg := _torn_case(u64(seed))
