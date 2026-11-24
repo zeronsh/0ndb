@@ -2157,6 +2157,121 @@ shown_free :: proc(shown: ^map[string][]crdt.Op_Id, allocator: runtime.Allocator
 	shown^ = nil
 }
 
+Shown_Path :: struct {
+	path: string,
+	ids:  []crdt.Op_Id,
+}
+
+@(private)
+shown_paths_free :: proc(shown: ^map[string][dynamic]Shown_Path, allocator: runtime.Allocator) {
+	for k, l in shown {
+		for sp in l {
+			delete(sp.path, allocator)
+			delete(sp.ids, allocator)
+		}
+		delete(l)
+		delete(k, allocator)
+	}
+	delete(shown^)
+	shown^ = nil
+}
+
+@(private)
+shown_paths_reset :: proc(shown: ^map[string][dynamic]Shown_Path, line: string, allocator: runtime.Allocator) {
+	if l, ok := &shown[line]; ok {
+		for sp in l {
+			delete(sp.path, allocator)
+			delete(sp.ids, allocator)
+		}
+		clear(l)
+	}
+}
+
+@(private)
+shown_path_add :: proc(shown: ^map[string][dynamic]Shown_Path, line: string, path: string, ids: []crdt.Op_Id, allocator: runtime.Allocator) {
+	if shown^ == nil {
+		shown^ = make(map[string][dynamic]Shown_Path, allocator)
+	}
+	if line not_in shown^ {
+		k, _ := clone_string(line, allocator)
+		shown[k] = make([dynamic]Shown_Path, allocator)
+	}
+	p, _ := clone_string(path, allocator)
+	append(&shown[line], Shown_Path{path = p, ids = slice.clone(ids, allocator)})
+}
+
+SHOWN_NAMED_MAX :: 4096
+
+@(private)
+shown_named :: proc(m: ^Mount) -> Error {
+	shown_paths_reset(&m.shown_paths, m.line, m.allocator)
+	if len(m.shadow.ver_ids) == 0 {
+		return .None
+	}
+	stack := make([dynamic]string, context.temp_allocator)
+	append(&stack, "")
+	count := 0
+	for len(stack) > 0 && count < SHOWN_NAMED_MAX {
+		dir := pop(&stack)
+		kids := make([dynamic]Shadow_Child, context.temp_allocator)
+		shadow_children(&m.shadow, dir, &kids, context.temp_allocator) or_return
+		for k in kids {
+			path := k.name
+			if dir != "" {
+				path = strings.concatenate({dir, "/", k.name}, context.temp_allocator)
+			}
+			if k.entry.kind == .Dir {
+				append(&stack, path)
+				continue
+			}
+			if k.entry.kind != .File || k.entry.ver == 0 || !disk_matches(m, path, k.entry) {
+				continue
+			}
+			ids, ok := shadow_version(&m.shadow, k.entry)
+			if !ok || len(ids) == 0 {
+				continue
+			}
+			out := make([]crdt.Op_Id, len(ids), context.temp_allocator)
+			for id, i in ids {
+				out[i] = inode_op(m.history, id)
+			}
+			shown_path_add(&m.shown_paths, m.line, path, out, m.allocator)
+			count += 1
+		}
+	}
+	return .None
+}
+
+@(private)
+shown_apply :: proc(m: ^Mount, line: string) -> Error {
+	h := m.history
+	l, ok := m.shown_paths[line]
+	if !ok {
+		return .None
+	}
+	for sp in l {
+		e, found := shadow_get(&m.shadow, sp.path) or_return
+		if !found || e.kind != .File || e.ver != 0 {
+			continue
+		}
+				t, terr := history_text_at(h, e.inode, sp.ids, context.temp_allocator)
+		if terr != .None {
+			continue
+		}
+		fids := make([]fstree.Op_Id, len(sp.ids), context.temp_allocator)
+		for id, i in sp.ids {
+			fids[i] = op_inode(h, id)
+		}
+		oid, _ := odb.hash(m.db.format, .Blob, t)
+		e.ver = shadow_version_add(&m.shadow, fids[:]) or_return
+		e.oid = oid
+		e.stat = {}
+		shadow_put(&m.shadow, sp.path, e) or_return
+		mount_reshow_add(m, sp.path)
+	}
+	return .None
+}
+
 @(private)
 shown_put :: proc(shown: ^map[string][]crdt.Op_Id, line: string, v: []crdt.Op_Id, allocator: runtime.Allocator) {
 	if shown^ == nil {
@@ -2213,6 +2328,7 @@ shown_with_own :: proc(m: ^Mount, line: string, row: Version) -> (v: Version, er
 line_follow :: proc(m: ^Mount, key: string, replayed: ^Replayed) -> Error {
 	h := m.history
 	shown_put(&m.shown, m.line, m.synced[:], m.allocator)
+	shown_named(m) or_return
 	v, found := history_line(h, key, context.temp_allocator) or_return
 	if !found || len(v) == 0 {
 		sl := make([dynamic]crdt.Lv, context.temp_allocator)
@@ -2233,6 +2349,7 @@ line_follow :: proc(m: ^Mount, key: string, replayed: ^Replayed) -> Error {
 			target = shown_with_own(m, key, row) or_return
 		}
 		line_retarget(m, target, replayed.inodes) or_return
+		shown_apply(m, key) or_return
 	}
 	delete(m.line, m.allocator)
 	m.line, _ = clone_string(key, m.allocator)

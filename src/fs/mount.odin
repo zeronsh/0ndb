@@ -443,6 +443,7 @@ Mount :: struct {
 	ignore:      Ignore,
 	awake:       bool,
 	shown:       map[string][]crdt.Op_Id,
+	shown_paths: map[string][dynamic]Shown_Path,
 	synced:      [dynamic]crdt.Op_Id,
 	placed:      [dynamic]crdt.Op_Id,
 	has_placed:  bool,
@@ -977,6 +978,7 @@ mount_close :: proc(m: ^Mount) {
 	delete(m.open_scopes)
 	delete(m.synced)
 	shown_free(&m.shown, m.allocator)
+	shown_paths_free(&m.shown_paths, m.allocator)
 	delete(m.placed)
 	for p in m.reverts {
 		delete(p.before)
@@ -2296,6 +2298,27 @@ load_mount_state :: proc(m: ^Mount) -> (fresh: bool, err: Error) {
 			}
 		}
 	}
+	if prim.reader_remaining(&rd) > 0 {
+		np := prim.read_uvarint(&rd)
+		if np > u64(prim.reader_remaining(&rd)) {
+			return false, .Corrupt
+		}
+		for _ in 0 ..< np {
+			k := prim.read_str(&rd)
+			nl := prim.read_uvarint(&rd)
+			if nl > u64(prim.reader_remaining(&rd)) {
+				return false, .Corrupt
+			}
+			for _ in 0 ..< nl {
+				path := prim.read_str(&rd)
+				ids := decode_version(prim.read_bytes(&rd), context.temp_allocator) or_return
+				if !prim.reader_ok(&rd) {
+					return false, .Corrupt
+				}
+				shown_path_add(&m.shown_paths, k, path, ids, m.allocator)
+			}
+		}
+	}
 	m.jpend = m.jpos
 	if !prim.reader_ok(&rd) {
 		return false, .Corrupt
@@ -2365,6 +2388,7 @@ Mount_Image :: struct {
 	line:       string,
 	absent:     [dynamic]string,
 	shown:      map[string][]crdt.Op_Id,
+	shown_paths: map[string][dynamic]Shown_Path,
 }
 
 Mount_Wait :: struct {
@@ -2412,6 +2436,11 @@ image_take :: proc(m: ^Mount, img: ^Mount_Image) {
 	for k, v in prim.unordered(m.shown) {
 		shown_put(&img.shown, k, v, m.allocator)
 	}
+	for k, l in prim.unordered(m.shown_paths) {
+		for sp in l {
+			shown_path_add(&img.shown_paths, k, sp.path, sp.ids, m.allocator)
+		}
+	}
 }
 
 @(private)
@@ -2429,6 +2458,7 @@ image_free :: proc(m: ^Mount, img: ^Mount_Image) {
 	}
 	delete(img.absent)
 	shown_free(&img.shown, m.allocator)
+	shown_paths_free(&img.shown_paths, m.allocator)
 	img^ = {}
 }
 
@@ -2829,6 +2859,18 @@ save_mount_state :: proc(m: ^Mount) -> Error {
 		prim.write_id(&w, attrib[k].step)
 		prim.write_ivarint(&w, attrib[k].at)
 		step_base_write(&w, attrib[k].base)
+	}
+	prim.write_uvarint(&w, u64(len(img.shown_paths)))
+	for k in sorted_strings(img.shown_paths) {
+		prim.write_str(&w, k)
+		l := img.shown_paths[k]
+		prim.write_uvarint(&w, u64(len(l)))
+		for sp in l {
+			prim.write_str(&w, sp.path)
+			pv := make([dynamic]u8, context.temp_allocator)
+			encode_version(&pv, sp.ids)
+			prim.write_bytes(&w, pv[:])
+		}
 	}
 	sum := xxhash.XXH3_64_with_seed(buf[:], 0) | 1
 	if sum == m.saved {
