@@ -121,11 +121,11 @@ _nw_run :: proc(w: ^World, c: Named_Case) {
 	input := ""
 	switch c {
 	case .Write_Named:
-		input = fmt.tprintf(`{{"file_path":"%s/%s","content":"tool line\n"}}`, NW_ROOT, file)
+		input = fmt.aprintf(`{{"file_path":"%s/%s","content":"tool line\n"}}`, NW_ROOT, file, allocator = w.allocator)
 	case .Shell_Named_After, .Codex_Order:
-		input = fmt.tprintf(`{{"command":"printf 'tool line\\n' > %s","cwd":"%s"}}`, file, NW_ROOT)
+		input = fmt.aprintf(`{{"command":"printf 'tool line\\n' > %s","cwd":"%s"}}`, file, NW_ROOT, allocator = w.allocator)
 	case .Shell_Unnamed_After, .Person_During:
-		input = fmt.tprintf(`{{"command":"make generate","cwd":"%s"}}`, NW_ROOT)
+		input = fmt.aprintf(`{{"command":"make generate","cwd":"%s"}}`, NW_ROOT, allocator = w.allocator)
 	}
 	agent := prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng))
 	open := new(Nw_Open)
@@ -138,7 +138,9 @@ _nw_run :: proc(w: ^World, c: Named_Case) {
 		defer node_after(n)
 		since = fs.Observe_Since{mono = prim.clock_mono_ns(n.e.cfg.clock), wall = prim.clock_wall_ns(n.e.cfg.clock)}
 	}
-	path := strings.concatenate({NW_ROOT, "/", file}, context.temp_allocator)
+	defer delete(input, w.allocator)
+	path := strings.concatenate({NW_ROOT, "/", file}, w.allocator)
+	defer delete(path, w.allocator)
 	if c == .Codex_Order {
 		_nw_put(n, path, "tool line\n")
 		run_until(w, w.now + 3_000_000, false)
