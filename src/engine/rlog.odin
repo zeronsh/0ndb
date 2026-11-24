@@ -38,7 +38,6 @@ Rlog :: struct {
 	open:    bool,
 	failed:  bool,
 	live:    map[Rlog_Key]Rlog_Entry,
-	clears:  [dynamic]Rlog_Key,
 	pend:    map[[32]u8]i64,
 	pdels:   [dynamic][32]u8,
 	records: int,
@@ -83,7 +82,6 @@ _rlog_ready :: proc(e: ^Engine) -> bool {
 	}
 	l.open = true
 	l.live = make(map[Rlog_Key]Rlog_Entry, e.allocator)
-	l.clears = make([dynamic]Rlog_Key, e.allocator)
 	l.pend = make(map[[32]u8]i64, e.allocator)
 	l.scanned = make(map[prim.Id]bool, e.allocator)
 	l.pdels = make([dynamic][32]u8, e.allocator)
@@ -305,55 +303,6 @@ _rlog_append_intent :: proc(e: ^Engine, k: ^Rlog_Key, x: Rlog_Entry) -> Error {
 }
 
 @(private)
-_rlog_get :: proc(e: ^Engine, key: []u8) -> (x: Rlog_Entry, found: bool) {
-	if !_rlog_ready(e) {
-		return
-	}
-	return e.rlog.live[_rlog_key(key)]
-}
-
-@(private)
-_rlog_intent :: proc(e: ^Engine, key: []u8, x: Rlog_Entry, durable: bool) -> Error {
-	if !_rlog_ready(e) {
-		return .Io
-	}
-	k := _rlog_key(key)
-	_rlog_append_intent(e, &k, x) or_return
-	_jerr(journal.journal_commit(&e.rlog.j)) or_return
-	e.rlog.live[k] = x
-	if durable {
-		_perr(pack.batch_end(&e.pk)) or_return
-		pack.batch_begin(&e.pk)
-	}
-	_touch(e)
-	return .None
-}
-
-@(private)
-_rlog_done :: proc(e: ^Engine, key: []u8) {
-	if !_rlog_ready(e) {
-		return
-	}
-	k := _rlog_key(key)
-	if x, ok := &e.rlog.live[k]; ok {
-		x.done = true
-	}
-}
-
-@(private)
-_rlog_clear :: proc(e: ^Engine, key: []u8) {
-	if !_rlog_ready(e) {
-		return
-	}
-	k := _rlog_key(key)
-	if _, ok := e.rlog.live[k]; !ok {
-		return
-	}
-	delete_key(&e.rlog.live, k)
-	append(&e.rlog.clears, k)
-}
-
-@(private)
 _rlog_idle :: proc(e: ^Engine) {
 	if e.tick == e.rlog.tick {
 		return
@@ -370,10 +319,10 @@ _rlog_settle :: proc(e: ^Engine, closing: bool) {
 	l.idle = false
 	dels := len(l.pdels) if idle || len(l.pdels) >= RLOG_CLEARS_MAX else 0
 	empty := len(l.live) == 0 && len(l.pend) == 0
-	if !l.open || (len(l.clears) == 0 && dels == 0 && (l.records == 0 || !empty || !idle)) {
+	if !l.open || (dels == 0 && (l.records == 0 || !empty || !idle)) {
 		return
 	}
-	if !closing && !pack.pending(&e.pk) && len(l.clears) + dels < RLOG_CLEARS_MAX {
+	if !closing && !pack.pending(&e.pk) && dels < RLOG_CLEARS_MAX {
 		return
 	}
 	if empty || l.records > 4 * (len(l.live) + len(l.pend)) + RLOG_CLEARS_MAX {
@@ -386,19 +335,6 @@ _rlog_settle :: proc(e: ^Engine, closing: bool) {
 		}
 		clear(&l.pdels)
 	}
-	for &k in l.clears {
-		key := _rlog_bytes(&k)
-		b: [2 + 56]u8
-		b[0] = RLOG_CLEAR
-		b[1] = u8(len(key))
-		n := 2 + copy(b[2:], key)
-		if _, err := journal.journal_append(&l.j, b[:n]); err != .None {
-			_fatal(e, _jerr(err))
-			return
-		}
-		l.records += 1
-	}
-	clear(&l.clears)
 	_rlog_commit(e)
 }
 
@@ -418,7 +354,6 @@ _rlog_rewrite :: proc(e: ^Engine) {
 	}
 	l.open = true
 	l.records = 0
-	clear(&l.clears)
 	clear(&l.pdels)
 	for kk in prim.sorted_keys(l.live) {
 		if kk not_in l.live {
@@ -446,7 +381,6 @@ _rlog_close :: proc(e: ^Engine) {
 	}
 	l.open = false
 	delete(l.live)
-	delete(l.clears)
 	delete(l.pend)
 	delete(l.pdels)
 	delete(l.scanned)
