@@ -1019,6 +1019,197 @@ _br_remote :: proc(w: ^World, arena: ^virtual.Arena) {
 	_ = b
 }
 
+@(private = "file")
+_br_send :: proc(c: ^Br_Ctx, n: ^Node, text: string) -> (msg: obj.Rid, ok: bool) {
+	context = instance_context(&n.inst)
+	defer node_after(n)
+	res, err := eng.exec(&n.e, eng.Cmd_Send{object = c.conv, text = text})
+	if err != .None && err != .Pending {
+		world_fail(c.w, "branch stale: send on %s: %v", n.name, err)
+		return {}, false
+	}
+	return res.item, true
+}
+
+@(private = "file")
+_br_stale :: proc(w: ^World, arena: ^virtual.Arena, undo_first: bool, turn: bool) {
+	c, u_a, u_b, u_c, ok := _br_pair(w, arena)
+	if !ok {
+		return
+	}
+	_, _ = u_a, u_c
+	a, b := w.nodes[0], w.nodes[1]
+	label := fmt.aprintf("%s%s", "the undo first" if undo_first else "the send first", " with a turn" if turn else "", allocator = c.alloc)
+	disk_r0 := _br_map({"a.txt", "<b1>\n<b2>\n<b3>\n"}, {"b.txt", "<b4>\n<b5>\n<t0>\n"})
+	disk_b := _br_map({"a.txt", "<B1>\n<b2>\n<b3>\n"}, {"b.txt", "<b4>\n<b5>\n<t0>\n"}, {"y.txt", "<B2>\n"})
+	disk_t := _br_map({"a.txt", "<B1>\n<b2>\n<b3>\n"}, {"b.txt", "<b4>\n<b5>\n<t0>\n"}, {"y.txt", "<B2>\n"}, {"z.txt", "<Z>\n"})
+	defer {
+		delete(disk_r0)
+		delete(disk_b)
+		delete(disk_t)
+	}
+	undo :: proc(c: ^Br_Ctx, at: obj.Rid) -> bool {
+		n := c.w.nodes[0]
+		context = instance_context(&n.inst)
+		defer node_after(n)
+		_, err := eng.convo_undo(&n.e, c.conv, at)
+		if err != .None && err != .Pending {
+			world_fail(c.w, "branch stale: undo: %v", err)
+			return false
+		}
+		return true
+	}
+	stale :: proc(c: ^Br_Ctx, turn: bool) -> (msg: obj.Rid, ok: bool) {
+		n := c.w.nodes[1]
+		msg = _br_send(c, n, "from the stale device") or_return
+		if !turn {
+			return msg, true
+		}
+		saved, vfs, agent := c.n, c.vfs, c.agent
+		c.n, c.vfs = n, disk_vfs(&n.disk)
+		c.agent = prim.id_new_with(node_clock(&n.clock), rng_random(&c.w.rng))
+		defer {
+			c.n, c.vfs, c.agent = saved, vfs, agent
+		}
+		c.parent = msg
+		_, reply := _br_turn(c, false, {{"z.txt", "<Z>\n"}}) or_return
+		return reply, true
+	}
+	run_until(w, w.now + 5_000_000_000, true)
+	_br_cut(a, true)
+	_br_cut(b, true)
+	last: obj.Rid
+	if undo_first {
+		if !undo(c, u_b) {
+			return
+		}
+		run_until(w, w.now + 3_000_000_000, false)
+		m, sok := stale(c, turn)
+		if !sok {
+			return
+		}
+		last = m
+	} else {
+		m, sok := stale(c, turn)
+		if !sok {
+			return
+		}
+		last = m
+		run_until(w, w.now + 3_000_000_000, false)
+		if !undo(c, u_b) {
+			return
+		}
+	}
+	run_until(w, w.now + 3_000_000_000, false)
+	_br_cut(a, false)
+	_br_cut(b, false)
+	for _ in 0 ..< 3 {
+		run_until(w, w.now + 60_000_000_000, true)
+		for n in w.nodes[:2] {
+			_br_position(c, n)
+		}
+	}
+	want_pos := last
+	want := disk_b
+	send_wins := undo_first
+	{
+		context = instance_context(&a.inst)
+		list, lerr := eng.convo_undos(&a.e, c.conv, c.alloc)
+		s := last
+		sm, serr := eng.convo_message(&a.e, c.conv, {msg = s}, c.alloc)
+		if serr == .None && sm.role == .Assistant {
+			sm, serr = eng.convo_message(&a.e, c.conv, {msg = sm.parent}, c.alloc)
+		}
+		node_after(a)
+		if lerr != .None || serr != .None {
+			world_fail(w, "branch stale, %s: convo_undos %v, the send %v", label, lerr, serr)
+			return
+		}
+		for u in list {
+			if u.cause == .Undo {
+				send_wins = sm.hlc > u.stamp
+			}
+		}
+	}
+	if send_wins {
+		want = disk_t if turn else disk_b
+	} else {
+		want = disk_r0
+		context = instance_context(&a.inst)
+		m, err := eng.convo_message(&a.e, c.conv, {msg = u_b}, c.alloc)
+		node_after(a)
+		if err != .None {
+			world_fail(w, "branch stale: the undone message: %v", err)
+			return
+		}
+		want_pos = m.parent
+	}
+	for n in w.nodes[:2] {
+		p, pok := _br_position(c, n)
+		if !pok || p != want_pos {
+			world_fail(w, "branch stale, %s: %s sits at %v off %d, not %v off %d", label, n.name, p.seg[0:2], p.off, want_pos.seg[0:2], want_pos.off)
+		}
+		if got := _br_disk_of(c, n); !_br_same_disk(got, want) {
+			world_fail(w, "branch stale, %s: %s holds %v, not %v", label, n.name, got, want)
+		}
+		context = instance_context(&n.inst)
+		un := eng.convo_unsettled(&n.e, c.conv)
+		_, merr := eng.convo_message(&n.e, c.conv, {msg = last}, c.alloc)
+		node_after(n)
+		if un {
+			world_fail(w, "branch stale, %s: %s is still unsettled", label, n.name)
+		}
+		if merr != .None {
+			world_fail(w, "branch stale, %s: %s lost the stale send: %v", label, n.name, merr)
+		}
+	}
+}
+
+@(test)
+branch_stale :: proc(t: ^testing.T) {
+	if s, ok := os.lookup_env("SIM_SEED", context.temp_allocator); ok && len(s) > 0 {
+		return
+	}
+	test_begin(t)
+	defer test_end(t)
+	bad := 0
+	count := env_u64("BR_STALE_SEEDS", 5)
+	for seed in u64(1) ..= count {
+		for undo_first in ([2]bool{false, true}) {
+			for turn in ([2]bool{false, true}) {
+				cfg := default_config(seed)
+				cfg.nodes = 2
+				cfg.spaces = 0
+				cfg.ops = 0
+				cfg.crash_rate = 0
+				cfg.fault_rate = 0
+				cfg.io_rate = 0
+				cfg.byzantine = false
+				cfg.bulk = false
+				cfg.mem_max = 1500
+				cfg.verbose = env_u64("SIM_VERBOSE", 0) != 0
+				w := new(World)
+				world_init(w, cfg)
+				a: virtual.Arena
+				_br_stale(w, &a, undo_first, turn)
+				for f in w.failures {
+					if bad < 30 {
+						fmt.eprintf("branch_stale seed %d: %s\n", seed, f)
+					}
+				}
+				if len(w.failures) > 0 {
+					bad += 1
+				}
+				world_destroy(w)
+				free(w)
+				virtual.arena_destroy(&a)
+			}
+		}
+	}
+	fmt.eprintf("branch_stale: %d seeds, %d failed\n", count, bad)
+	testing.expect(t, bad == 0, fmt.tprintf("branch_stale: %d failures", bad))
+}
+
 @(test)
 branch_remote :: proc(t: ^testing.T) {
 	if s, ok := os.lookup_env("SIM_SEED", context.temp_allocator); ok && len(s) > 0 {

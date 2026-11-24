@@ -129,7 +129,7 @@ evaluate :: proc(r: ^Runtime, o: Object) {
 			return
 		}
 		waiting_msg = head
-		if eng.convo_move_pending(r.e, o) {
+		if eng.convo_move_pending(r.e, o) || eng.convo_unsettled(r.e, o) {
 			return
 		}
 		if _placed_here(r, o, v, &t, &hm) {
