@@ -305,6 +305,17 @@ convo_files_at :: proc(e: ^Engine, o: Object, msg: Rid, allocator := context.all
 	return f, .None
 }
 
+convo_turn_scope :: proc(e: ^Engine, o: Object, at: Rid, allocator := context.allocator, ready: Ready = {}) -> (out: convo.Turn_Scope, err: Error) {
+	context = context_for(e)
+	h := _handle_get(e, o, .Conversation) or_return
+	_handle_refresh(h)
+	t, terr := convo.turn_scope_at(&h.view, at, allocator)
+	if terr != .None {
+		return {}, _pending_result(e, h, _oerr(terr), ready)
+	}
+	return t, .None
+}
+
 convo_compactions :: proc(e: ^Engine, o: Object, floor: prim.Hlc = 0, allocator := context.allocator, ready: Ready = {}) -> (out: []convo.Compaction, err: Error) {
 	context = context_for(e)
 	h := _handle_get(e, o, .Conversation) or_return

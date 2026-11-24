@@ -363,6 +363,15 @@
  *                 budget_tokens: uvarint, budget_usd: f64,
  *                 isolate: enum isolate, conflicts: strs
  *   Change     := mount: str, path: str, change: str
+ *   Turn       := msg: rid, actor: id, stamp: uvarint, ended: bool,
+ *                 added: uvarint, removed: uvarint, more_files: uvarint,
+ *                 files: [ {mount: str, path: str, from: str,
+ *                 status: str (added, removed, modified, moved),
+ *                 binary: bool, added: uvarint, removed: uvarint,
+ *                 patch: str, clipped: bool, blame: [ {line_lo: uvarint,
+ *                 line_hi: uvarint, actor: id, owner: id (the
+ *                 conversation whose turn wrote the lines, zero for a
+ *                 person), device: id} ]} ]
  *   Schedule   := id: str, owner: object, prompt: str, cron: str, at: ivarint,
  *                 tz: str, conversation: id, fresh: bool, next: ivarint,
  *                 last: ivarint, creator: id, agent: id
@@ -1430,6 +1439,14 @@ int ondb_tool_result(ondb *h, const uint8_t space[16], const uint8_t object[16],
 #define ONDB_OP_REDO 175u
 /* undo.resume(object: object) -> resumed:uvarint */
 #define ONDB_OP_UNDO_RESUME 176u
+/* regenerate(object: object, msg: rid) -> undo:id done:bool */
+#define ONDB_OP_REGENERATE 177u
+/* convo.undone(object: object) -> undone:[Undone] */
+#define ONDB_OP_CONVO_UNDONE 178u
+/* convo.turn_diff(object: object, msg: rid, patch: bool, blame: bool, max_chars: uvarint) -> Turn */
+#define ONDB_OP_CONVO_TURN_DIFF 179u
+/* convo.history(object: object, from: rid, from_seal: rid, from_known: bool, limit: uvarint, max_files: uvarint) -> turns:[Turn] next:rid next_seal:rid next_known:bool more:bool */
+#define ONDB_OP_CONVO_HISTORY 180u
 /* ONDB_OPS_END */
 
 #ifdef __cplusplus

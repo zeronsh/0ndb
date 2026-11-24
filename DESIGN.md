@@ -1143,6 +1143,28 @@ equal in both directions.
   (create, move, remove, flags, target) or a side lost ops. A frame goes out
   only when the listed result changed, so an idle fork costs nothing.
   `task.changes` reads the same view once.
+- **Turn diff and history.** A turn's `Scope{kind = Turn}` record holds each
+  mounted tree's version at the turn's start (`before`) and end (`after`),
+  and the reply's `Seal.scope` names that record, so a turn is found from its
+  message in O(1). A reply whose run is still open has no scope yet: its
+  start is the fold of `Msg.files` at the reply and its end is the head of
+  each line its `Claim` names, so any device can read it. `convo.turn_diff`
+  shows exactly the turn's own changes: the conversation's owned actors (its
+  scope and line actors) are the turn's, everyone else's ops between start
+  and end (a person's disk or buffer edits, another conversation's turn) are
+  foreign. The ops between the two versions classify each touched inode
+  (O(changes)); an inode only foreign ops touched is not listed. A file's
+  own view keeps the start text except what own ops deleted, adds the text
+  own ops inserted, keeps text only foreign ops deleted, and leaves out
+  foreign insertions (the set revert's item classification, read without
+  writing ops); its presence and place follow own ops only. Each file whose
+  own view differs from the start is listed as added, removed, moved (with
+  `from`) or modified, with line counts, a unified patch under a shared
+  character budget, and blame for the own view: runs of lines, each credited
+  to the actor that wrote most of its bytes, the conversation that owns that
+  actor (zero for a person) and its device. `convo.history` pages a
+  conversation's replies newest first, like `convo.page`, and gives each turn
+  its per-file counts without patches.
 - **Blame** is a span lookup. **Revert** of a scope creates ops that undo
   exactly that scope's ops, transformed through everything since. Actors are
   bounded (one per conversation, mount and line, plus the ingestion actors),
@@ -1831,9 +1853,10 @@ concurrent typing is never lost or reverted.
   a view and converts back within that view use `obj.vref_pos`.
 - Every stored reference is safe by one of these rules:
   - *Same segment, backward* (links `event/segs/prev`; convo `Msg.parent,
-    jump, intent, parent_seal, files_prev, claim`, `Block.msg/prev`, `Seal`,
-    `Leaf`, `Fork`, `Remember`, `Spine`, `Files.next`, intent and run
-    targets, `Compact`, `Scope.msg`, `Interrupted`, `Revived`, `Recorded`;
+    jump, intent, parent_seal, files_prev, claim`, `Block.msg/prev`, `Seal`
+    (with `Seal.scope`), `Leaf`, `Fork`, `Remember`, `Spine`, `Files.next`,
+    intent and run targets, `Compact`, `Scope.msg`, `Interrupted`, `Revived`,
+    `Recorded`;
     `Redact.from/target` in the writer's own segment; map `Del` dots naming
     own `Add`s): refs only point to earlier offsets and journals are
     prefix-durable, so if the referencing record survives so does its target.
