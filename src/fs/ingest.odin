@@ -2,6 +2,7 @@ package fs
 
 import "base:runtime"
 import "core:bytes"
+import "core:fmt"
 import "core:crypto/blake2b"
 import "core:strings"
 import "core:mem/virtual"
@@ -1730,11 +1731,21 @@ mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> (err: Error) {
 line_follow :: proc(m: ^Mount, key: string) -> Error {
 	h := m.history
 	v, found := history_line(h, key, context.temp_allocator) or_return
+	{
+		e, f, _ := shadow_get(&m.shadow, "a.txt")
+		fmt.eprintf("DBGF follow %q from %q found %v a.txt entry %v ver %d\n", key, m.line, found, f, e.ver)
+		defer {
+			e2, f2, _ := shadow_get(&m.shadow, "a.txt")
+			fmt.eprintf("DBGF  entry-now %v ver %d\n", f2, e2.ver)
+		}
+	}
 	if !found || len(v) == 0 {
 		fork := fork_version(m) or_return
 		history_set_line(h, key, fork) or_return
 	} else {
 		line_retarget(m, v) or_return
+		e3, f3, _ := shadow_get(&m.shadow, "a.txt")
+		fmt.eprintf("DBGF  after retarget entry %v ver %d\n", f3, e3.ver)
 	}
 	delete(m.line, m.allocator)
 	m.line, _ = clone_string(key, m.allocator)
@@ -3421,6 +3432,9 @@ emit_modify :: proc(p: ^Pass, b: ^Builder, c: ^Change, e: Entry) -> Error {
 	}
 	copy_begin(m, c, data) or_return
 	defer m.copy = nil
+	if path == "a.txt" {
+		fmt.eprintf("DBGF emit_modify line %q ver %d old %q new %q\n", m.line, c.old.ver, string(old), string(data))
+	}
 	emit_text_edits(m, b, e.inode, path, old, data) or_return
 	return shadow_put(&m.shadow, path, ne)
 }
