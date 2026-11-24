@@ -921,20 +921,26 @@ _reclaim :: proc(p: ^Pack) -> (more: bool, err: Error) {
 	}
 	p.reclaiming = true
 	defer p.reclaiming = false
-	more = _compact_work(p, RECLAIM_SLICE, false) or_return
-	if more {
+	for _ in 0 ..< RECLAIM_SLICES {
+		more = _compact_work(p, RECLAIM_SLICE, false) or_return
+		if !more {
+			return false, .None
+		}
 		p.reclaimed = true
-		if !p.fl.on {
-			p.fl.kind = .Commit
-			_submit(p) or_return
+		if p.fl.on {
+			return true, .None
+		}
+		_start_async(p) or_return
+		if p.fl.on {
+			return true, .None
 		}
 	}
-	return more, .None
+	return true, .None
 }
 
 @(private)
 _reclaim_idle :: proc(p: ^Pack) -> Error {
-	if p.fl.on || !_async(p) || _polled(p) || p.opts.compact_ratio <= 0 || p.nrec > 0 || len(p.dirty) > 0 || len(p.waiters) > 0 || p.closing {
+	if p.fl.on || !_async(p) || _polled(p) || p.opts.compact_ratio <= 0 || p.batch > 0 || len(p.waiters) > 0 || p.closing {
 		return .None
 	}
 	if more := _reclaim(p) or_return; more {

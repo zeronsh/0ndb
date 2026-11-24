@@ -74,6 +74,9 @@ RECLAIM_WINDOWS :: 2
 RECLAIM_SLICE :: i64(256 * 1024)
 
 @(private)
+RECLAIM_SLICES :: 64
+
+@(private)
 _reclaim_owed :: proc "contextless" (p: ^Pack) -> bool {
 	if p.opts.compact_ratio <= 0 {
 		return false

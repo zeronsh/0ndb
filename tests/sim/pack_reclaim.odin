@@ -20,7 +20,7 @@ RC_CONTAINER :: 2 << 20
 RC_FILE :: 64 << 10
 
 @(private = "file")
-RC_FILES :: 64
+RC_FILES :: 16
 
 @(private = "file")
 RC_KEEP :: 3000
@@ -29,7 +29,7 @@ RC_KEEP :: 3000
 RC_LIMIT :: u64(14 << 20)
 
 @(private = "file")
-RC_IDLE :: u64(8 << 20)
+RC_IDLE :: u64(3 << 20)
 
 @(private = "file")
 Rc_Rig :: struct {
@@ -100,9 +100,11 @@ _rc_attempt :: proc(r: ^Rc_Rig, d: ^Disk, n: int, peak: ^u64) -> (done: bool) {
 }
 
 @(private = "file")
-_rc_idle :: proc(r: ^Rc_Rig) -> (turns: int, ok: bool) {
-	if _, e := pack.step(&r.pk); e != .None {
-		return 0, false
+_rc_idle :: proc(r: ^Rc_Rig, tick: bool) -> (turns: int, ok: bool) {
+	if tick {
+		if _, e := pack.step(&r.pk); e != .None {
+			return 0, false
+		}
 	}
 	for turns = 0; r.job && turns < 4000; turns += 1 {
 		if _rc_finish(r) != .None {
@@ -110,7 +112,7 @@ _rc_idle :: proc(r: ^Rc_Rig) -> (turns: int, ok: bool) {
 		}
 	}
 	for c, i in r.pk.conts {
-		data := c.size - 4096
+		data := c.size - 64
 		if i == r.pk.active || data <= 0 {
 			continue
 		}
@@ -178,7 +180,7 @@ _rc_case :: proc(attempts: int, k: u64) -> (msg: string, crashed: bool, reclaime
 		if peak > RC_LIMIT {
 			return fmt.tprintf("the disk reached %d bytes while abandoned writers logged %d; the bound is %d", peak, logged, RC_LIMIT), false, 0
 		}
-		turns, done := _rc_idle(r)
+		turns, done := _rc_idle(r, false)
 		if !d.dead {
 			if !done {
 				return fmt.tprintf("compaction stopped or was still running with work left after %d completions and no writer", turns), false, 0
@@ -206,7 +208,7 @@ _rc_case :: proc(attempts: int, k: u64) -> (msg: string, crashed: bool, reclaime
 	if !_rc_keep(r2, false) {
 		return "the synced file lost its content", crashed, reclaimed
 	}
-	turns, done := _rc_idle(r2)
+	turns, done := _rc_idle(r2, true)
 	if !done {
 		return fmt.tprintf("after reopening, compaction was still running after %d completions", turns), crashed, reclaimed
 	}
