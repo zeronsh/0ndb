@@ -6,6 +6,9 @@ import "../pack"
 import "../prim"
 
 @(private)
+ROOT_REDACT :: 4
+
+@(private)
 RLOG_INTENT :: u8(1)
 @(private)
 RLOG_CLEAR :: u8(2)
@@ -40,6 +43,7 @@ Rlog :: struct {
 	pdels:   [dynamic][32]u8,
 	records: int,
 	idle:    bool,
+	tick:    u64,
 	scanned: map[prim.Id]bool,
 }
 
@@ -347,6 +351,16 @@ _rlog_clear :: proc(e: ^Engine, key: []u8) {
 	}
 	delete_key(&e.rlog.live, k)
 	append(&e.rlog.clears, k)
+}
+
+@(private)
+_rlog_idle :: proc(e: ^Engine) {
+	if e.tick == e.rlog.tick {
+		return
+	}
+	e.rlog.tick = e.tick
+	e.rlog.idle = true
+	_rlog_ready(e)
 }
 
 @(private)
