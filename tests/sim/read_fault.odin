@@ -296,9 +296,6 @@ read_fault :: proc(t: ^testing.T) {
 	if s, ok := os.lookup_env("SIM_SEED", context.temp_allocator); ok && len(s) > 0 {
 		return
 	}
-	if env_u64("SIM_READ_FAULT", 0) == 0 {
-		return
-	}
 	test_begin(t)
 	defer test_end(t)
 	most := int(env_u64("RF_MAX", 400))

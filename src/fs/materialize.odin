@@ -299,6 +299,8 @@ materialize_to :: proc(m: ^Mount, target: Version, merge: bool) -> Error {
 			err = materialize_one(m, &it, tl[:])
 		}
 		if err != .None {
+			delete(m.fail_path, m.allocator)
+			m.fail_path, _ = clone_string(it.path if it.present else it.old, m.allocator)
 			mat_unstage(m, &ms, 0)
 			mat_owe(m, &ms)
 			if mat_structural(items[i:]) {

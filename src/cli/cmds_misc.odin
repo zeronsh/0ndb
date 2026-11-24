@@ -153,6 +153,12 @@ cmd_status :: proc(a: ^Args) -> int {
 	for m in jarr(mt, "mounts") {
 		ob, _ := api.parse_object(jstr(m, "object"))
 		fmt.printfln("mount    %s → tree %s (%s)", jstr(m, "root"), short(hex(ob.id)), jstr(m, "line"))
+		if f := jstr(m, "failed"); len(f) > 0 {
+			fmt.printfln("         failing: %s", f)
+		}
+		for p in jarr(m, "held") {
+			fmt.printfln("         held: %s: its record is damaged and the file matches neither version it could be at; change it to one of them", p)
+		}
 	}
 	if rr.status == .Ok {
 		role := "runner" if jbool(rr.value, "runner") else "client"

@@ -233,7 +233,8 @@
  *                 whose turn wrote the bytes, zero for a person), scope: id
  *                 (the turn or tool call scope, zero when unscoped), device: id
  *                 (zero or a raw author when owner is unresolved)
- *   Mounted    := object: object, root: str, line: str
+ *   Mounted    := object: object, root: str, line: str, failed: str,
+ *                 held: [str]
  *   Hit        := object: object, participant: id, msg: rid, ref: bytes,
  *                 part: uvarint, kind: enum kind, title: bool, hlc: uvarint,
  *                 score: f64, snippet: str, snippet_at: uvarint,
