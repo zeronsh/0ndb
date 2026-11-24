@@ -166,15 +166,8 @@ _local_verify_hollow :: proc(r: ^Replicator, l: ^Local, base: i64) {
 		r.rx_local = nil
 	}
 	if l.checking {
-		at := l.recheck
 		l.checking = false
 		l.recheck = -1
-		if at >= 0 && at < l.arc_sealed {
-			theirs, ok := _arc_own_records(r, l, at, min(l.cursor, at + UPLOAD_CHUNK))
-			if ok && _local_repair(r, l, theirs, at, true) {
-				return
-			}
-		}
 		_local_checked(r, l)
 		_local_pump(r, l)
 		return

@@ -292,17 +292,7 @@ record := len:u32le  tag:[16]u8  body:[len]u8  len:u32le
   device's tree has already punctured restores as redacted (it is never
   taken for tampering), and a redaction that lands while a repair is pending
   wins, because `journal_restore` accepts a record that is now validly
-  redacted on disk. When the relay
-  answers that its base is above the damage and the range is archived, the
-  source is the writer's own archive journal instead: the covering group is
-  opened with the segment's keys, verified against its chain heads and
-  rebuilt in local form, which reproduces every record body exactly.
-  Signature records are elided in groups and come back as inert signature
-  records of the same length; a valid local signature record is kept, and
-  only a damaged one is replaced, since below the archive point signatures
-  are never uploaded, served or checked again. An archive that cannot supply
-  the range yet (a redaction punctured the group's key and its re-archive
-  has not landed) leaves the record for the next scrub; it is never fatal.
+  redacted on disk.
 - Epochs: a writer may start a new epoch of a stream (compaction) beginning
   with a snapshot record; the old epoch file is deleted after the new one is
   uploaded.

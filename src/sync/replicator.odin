@@ -1464,7 +1464,7 @@ _local_checked :: proc(r: ^Replicator, l: ^Local) {
 }
 
 @(private)
-_local_repair :: proc(r: ^Replicator, l: ^Local, theirs: []u8, base: i64, archived := false) -> (held: bool) {
+_local_repair :: proc(r: ^Replicator, l: ^Local, theirs: []u8, base: i64) -> (held: bool) {
 	if l.fd < 0 {
 		l.fd, _ = prim.open_file(r.vfs, l.path)
 	}
@@ -1490,11 +1490,6 @@ _local_repair :: proc(r: ^Replicator, l: ^Local, theirs: []u8, base: i64, archiv
 				kind := journal.classify(raw[pos:][:ln], off)
 				valid = kind == .Plain || kind == .Redacted
 				same = ln == n && _ct_eq(raw[pos:][:n], theirs[pos:][:n])
-				if archived && valid && !same && ln == n {
-					if body, berr := journal.record_body(theirs[pos:][:n]); berr == .None && journal.is_sig(body) {
-						same = true
-					}
-				}
 				if valid && !same && kind != .Redacted && journal.classify(theirs[pos:][:n], off) != .Redacted {
 					_local_fatal(r, l, .Conflict, off)
 					return true
