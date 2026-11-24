@@ -1,5 +1,7 @@
 package engine
 
+import "core:fmt"
+
 import "core:crypto/blake2b"
 import "core:mem/virtual"
 import "core:slice"
@@ -355,6 +357,9 @@ _scan_object :: proc(e: ^Engine, h: ^Handle, budget: int) -> (used: int, more: b
 					continue
 				}
 				if je == .Missing && h.sp.repl_on {
+					if e.stats.ticks > 20000 && e.stats.ticks < 20004 {
+						fmt.eprintf("DBGSCAN pos=%d end=%d next=%d have=%v rep_len=%d relay=%d\n", pos, end, next, journal.replica_have(s.rep), journal.replica_length(s.rep), osync.replicator_relay_length(&h.sp.repl, &h.scope, s.device, h.name, 0))
+					}
 					r := [1]journal.Range{{pos, end}}
 					osync.replicator_want(&h.sp.repl, &h.scope, s.device, h.name, 0, r[:])
 					if osync.replicator_relay_length(&h.sp.repl, &h.scope, s.device, h.name, 0) < 0 {

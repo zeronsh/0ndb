@@ -1,6 +1,10 @@
 #+build linux, darwin, windows
 package osync
 
+import "core:fmt"
+
+dbg_calls: int
+
 import "base:runtime"
 import "core:crypto"
 import "core:crypto/ecdh"
@@ -661,7 +665,11 @@ replicator_unfollow :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, na
 	_remote_maybe_free(r, rm)
 }
 
-replicator_want :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, name: string, epoch: u64, ranges: []journal.Range) -> Error {
+replicator_want :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, name: string, epoch: u64, ranges: []journal.Range, loc := #caller_location) -> Error {
+	dbg_calls += 1
+	if dbg_calls > 200000 && dbg_calls < 200030 {
+		fmt.eprintf("DBGWANT name=%s loc=%v\n", name, loc)
+	}
 	_enter(r)
 	defer _leave(r)
 	for g in ranges {
@@ -698,7 +706,11 @@ replicator_want :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, name: 
 	return .None
 }
 
-replicator_want_tail :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, name: string, epoch: u64, n: i64 = TAIL_DEFAULT) -> Error {
+replicator_want_tail :: proc(r: ^Replicator, scope: ^Scope, device: Device_Id, name: string, epoch: u64, n: i64 = TAIL_DEFAULT, loc := #caller_location) -> Error {
+	dbg_calls += 1
+	if dbg_calls > 200000 && dbg_calls < 200030 {
+		fmt.eprintf("DBGWANT name=%s loc=%v\n", name, loc)
+	}
 	_enter(r)
 	defer _leave(r)
 	rm := _remote_get(r, scope, device, name, epoch) or_return
