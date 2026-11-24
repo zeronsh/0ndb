@@ -121,6 +121,32 @@ history_version_has :: proc(h: ^History, version: Version, actor: prim.Id) -> (h
 	return actor_bound(h, cl[:], actor) > 0, .None
 }
 
+history_unseen :: proc(h: ^History, version, current: Version, actors: []prim.Id, allocator := context.allocator) -> (unseen: []prim.Id, joined: Version, err: Error) {
+	history_ready(h) or_return
+	vl := make([dynamic]crdt.Lv, context.temp_allocator)
+	cl := make([dynamic]crdt.Lv, context.temp_allocator)
+	if crdt.graph_version_lvs(&h.g, version, &vl) != .None || crdt.graph_version_lvs(&h.g, current, &cl) != .None {
+		return nil, nil, .Not_Found
+	}
+	list := make([dynamic]prim.Id, allocator)
+	for a in actors {
+		n := actor_bound(h, cl[:], a)
+		if n <= actor_bound(h, vl[:], a) {
+			continue
+		}
+		append(&list, a)
+		lv, ok := crdt.graph_lv(&h.g, crdt.Op_Id{a, n - 1})
+		if !ok {
+			return nil, nil, .Not_Found
+		}
+		one := [1]crdt.Lv{lv}
+		out := make([dynamic]crdt.Lv, context.temp_allocator)
+		crdt.version_union(&h.g, vl[:], one[:], &out)
+		vl = out
+	}
+	return list[:], crdt.graph_version_ids(&h.g, vl[:], allocator), .None
+}
+
 history_undo_revert :: proc(h: ^History, current: Version, undo: prim.Id) -> (revert: prim.Id, found: bool, err: Error) {
 	history_ready(h) or_return
 	list, ok := kv_get(&h.kv, revert_key("ru:", undo), context.temp_allocator) or_return

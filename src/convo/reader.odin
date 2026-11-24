@@ -1906,9 +1906,12 @@ notices :: proc(v: ^obj.View, floor: prim.Hlc = 0, allocator := context.allocato
 	return acc.list[:], .None
 }
 
-scope_actors :: proc(v: ^obj.View, allocator := context.allocator) -> (out: []prim.Id, err: Error) {
+scope_actors :: proc(v: ^obj.View, allocator := context.allocator, by: prim.Id = {}) -> (out: []prim.Id, err: Error) {
 	list := make([dynamic]prim.Id, allocator)
 	for s in 0 ..< len(v.segs) {
+		if by != {} && v.segs[s].id != by {
+			continue
+		}
 		end := obj.end(v, s)
 		pos := i64(0)
 		for pos < end {
