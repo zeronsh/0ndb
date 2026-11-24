@@ -99,6 +99,7 @@ hold_drop :: proc(x: Hold) {
 History :: struct {
 	opts:       History_Options,
 	redactions: u64,
+	resolved:   u64,
 	vfs:        prim.Vfs,
 	allocator:  runtime.Allocator,
 	id:         prim.Id,
@@ -3147,6 +3148,9 @@ apply_actor_record :: proc(h: ^History, device: prim.Id, body: []u8) -> Error {
 		kv_put(&h.kv, fshist.actor_key(la), b[:]) or_return
 		kv_put(&h.kv, line_base_key(la), b[:]) or_return
 		line_actor_index(h, base, la) or_return
+		if !author_known(h, base) {
+			kv_put(&h.kv, author_wanted_key(base), b[:]) or_return
+		}
 		if owner, owned := history_owner_of(h, base); owned {
 			return owned_add(h, owner, la)
 		}
@@ -3158,10 +3162,36 @@ apply_actor_record :: proc(h: ^History, device: prim.Id, body: []u8) -> Error {
 	}
 	d := device
 	kv_put(&h.kv, fshist.actor_key(a), d[:]) or_return
+	if _, wanted := kv_get(&h.kv, author_wanted_key(a), context.temp_allocator) or_return; wanted {
+		kv_del(&h.kv, author_wanted_key(a)) or_return
+		h.resolved += 1
+	}
 	if owner == {} {
 		return .None
 	}
 	return owned_add(h, owner, a)
+}
+
+@(private)
+author_wanted_key :: proc(actor: prim.Id) -> []u8 {
+	k := make([]u8, 3 + 16, context.temp_allocator)
+	copy(k, "au:")
+	a := actor
+	copy(k[3:], a[:])
+	return k
+}
+
+@(private)
+author_known :: proc(h: ^History, actor: prim.Id) -> bool {
+	if _, ok := history_actor_owner(h, actor); ok || actor == h.self {
+		return true
+	}
+	for id in h.stream_ids {
+		if id == actor {
+			return true
+		}
+	}
+	return false
 }
 
 @(private)
@@ -3333,6 +3363,76 @@ history_actor_owner :: proc(h: ^History, actor: prim.Id) -> (owner: prim.Id, ok:
 	return owner, true
 }
 
+Owner_Kind :: enum u8 {
+	Person,
+	Agent,
+	Unresolved,
+}
+
+Span_Owner :: struct {
+	kind:         Owner_Kind,
+	conversation: prim.Id,
+	scope:        prim.Id,
+	device:       prim.Id,
+}
+
+history_span_owner :: proc(h: ^History, op: crdt.Op_Id, devices: []prim.Id) -> (o: Span_Owner, err: Error) {
+	history_ready(h) or_return
+	a := op.actor
+	for _ in 0 ..< 4 {
+		if o.conversation == {} {
+			o.conversation, _ = history_owner_of(h, a)
+		}
+		next, ok := history_actor_owner(h, a)
+		if !ok {
+			break
+		}
+		a = next
+	}
+	o.device = a
+	known := author_known(h, a)
+	for d in devices {
+		known ||= d == a
+	}
+	if o.conversation != {} {
+		o.kind = .Agent
+		o.scope, _, err = history_scope_of(h, op)
+		return
+	}
+	if !known {
+		return Span_Owner{kind = .Unresolved}, .None
+	}
+	if lv, ok := crdt.graph_lv(&h.g, op); ok && a == op.actor {
+		if _, _, stream, _, found := history_batch_at(h, lv); found && int(stream) < len(h.stream_ids) {
+			o.device = h.stream_ids[stream]
+		}
+	}
+	return
+}
+
+history_span_owners :: proc(h: ^History, spans: []crdt.Author_Span, devices: []prim.Id, allocator := context.allocator) -> (split: []crdt.Author_Span, owners: []Span_Owner, err: Error) {
+	out := make([dynamic]crdt.Author_Span, 0, len(spans), allocator)
+	own := make([dynamic]Span_Owner, 0, len(spans), allocator)
+	for s in spans {
+		at := 0
+		for at < s.len {
+			piece := s
+			piece.id.seq += u64(at)
+			piece.op.seq += u64(at)
+			o := history_span_owner(h, piece.id, devices) or_return
+			n := s.len - at
+			if o.kind == .Agent {
+				n = min(n, history_scope_run(h, piece.id) or_return)
+			}
+			piece.len = n
+			append(&out, piece)
+			append(&own, o)
+			at += n
+		}
+	}
+	return out[:], own[:], .None
+}
+
 history_present_spans :: proc(h: ^History, spans: []crdt.Author_Span) {
 	for &s in spans {
 		s.id.actor = history_present_actor(h, s.id.actor)
@@ -3459,10 +3559,23 @@ scope_index :: proc(h: ^History, b: ^crdt.Batch, content: []u8) -> Error {
 }
 
 history_scope_of :: proc(h: ^History, op: crdt.Op_Id) -> (scope: prim.Id, found: bool, err: Error) {
+	scope, _, found, err = scope_at(h, op)
+	return
+}
+
+@(private)
+history_scope_run :: proc(h: ^History, op: crdt.Op_Id) -> (n: int, err: Error) {
+	_, left, _ := scope_at(h, op) or_return
+	return max(left, 1), .None
+}
+
+@(private)
+scope_at :: proc(h: ^History, op: crdt.Op_Id) -> (scope: prim.Id, left: int, found: bool, err: Error) {
+	left = max(int)
 	history_ready(h) or_return
 	n := scope_count(h, op.actor) or_return
 	if n == 0 {
-		return {}, false, .None
+		return {}, left, false, .None
 	}
 	pages := (n + SCOPE_PAGE - 1) / SCOPE_PAGE
 	lo, hi := u64(0), pages
@@ -3476,7 +3589,11 @@ history_scope_of :: proc(h: ^History, op: crdt.Op_Id) -> (scope: prim.Id, found:
 		}
 	}
 	if lo == 0 {
-		return {}, false, .None
+		pg, _ := kv_get(&h.kv, scope_page_key(op.actor, 0), context.temp_allocator) or_return
+		if len(pg) >= SCOPE_ENTRY {
+			left = int(prim.get_u64le(pg[0:8]) - op.seq)
+		}
+		return {}, left, false, .None
 	}
 	list, _ := kv_get(&h.kv, scope_page_key(op.actor, lo - 1), context.temp_allocator) or_return
 	m := len(list) / SCOPE_ENTRY
@@ -3490,13 +3607,20 @@ history_scope_of :: proc(h: ^History, op: crdt.Op_Id) -> (scope: prim.Id, found:
 		}
 	}
 	if a == 0 {
-		return {}, false, .None
+		return {}, left, false, .None
+	}
+	next := list[a * SCOPE_ENTRY:] if a < m else nil
+	if next == nil && lo < pages {
+		next, _ = kv_get(&h.kv, scope_page_key(op.actor, lo), context.temp_allocator) or_return
+	}
+	if len(next) >= 8 {
+		left = int(prim.get_u64le(next[0:8]) - op.seq)
 	}
 	e := list[(a - 1) * SCOPE_ENTRY:][:SCOPE_ENTRY]
 	first, count := prim.get_u64le(e[0:8]), prim.get_u64le(e[8:16])
 	if op.seq >= first + count {
-		return {}, false, .None
+		return {}, left, false, .None
 	}
 	copy(scope[:], e[16:32])
-	return scope, true, .None
+	return scope, int(first + count - op.seq), true, .None
 }

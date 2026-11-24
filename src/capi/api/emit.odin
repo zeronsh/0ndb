@@ -32,7 +32,8 @@ TAKEOVER_LEVEL_NAMES := [3]string{"conversation", "agent", "workspace"}
 RUNNER_KIND_NAMES := [2]string{"device", "pool"}
 ISOLATE_NAMES := [3]string{"unset", "true", "false"}
 RUNNER_STATE_NAMES := [3]string{"offline", "online", "wakeable"}
-EVENT_NAMES := [34]string{"connected", "disconnected", "durable", "uploaded", "quarantined", "refused", "fatal", "space_joined", "object_seen", "failure", "placement", "relay_misbehaving", "presence", "caught_up", "indexer_wanted", "unavailable", "available", "promoted", "peer_misbehaving", "members_changed", "epoch_changed", "access_revoked", "runner_enrolled", "runner_anomaly", "approval_requested", "login_done", "login_failed", "lease_lapsed", "space_left", "line_switched", "replica_redacted", "rename_offered", "redact_unreached", "models_changed"}
+OWNER_NAMES := [3]string{"person", "agent", "unresolved"}
+EVENT_NAMES := [35]string{"connected", "disconnected", "durable", "uploaded", "quarantined", "refused", "fatal", "space_joined", "object_seen", "failure", "placement", "relay_misbehaving", "presence", "caught_up", "indexer_wanted", "unavailable", "available", "promoted", "peer_misbehaving", "members_changed", "epoch_changed", "access_revoked", "runner_enrolled", "runner_anomaly", "approval_requested", "login_done", "login_failed", "lease_lapsed", "space_left", "line_switched", "replica_redacted", "rename_offered", "redact_unreached", "models_changed", "authors_resolved"}
 
 event_code :: proc "contextless" (kind: eng.Event_Kind) -> u64 {
 	switch kind {
@@ -84,6 +85,8 @@ event_code :: proc "contextless" (kind: eng.Event_Kind) -> u64 {
 		return 32
 	case .Models_Changed:
 		return 33
+	case .Authors_Resolved:
+		return 34
 	}
 	return u64(len(EVENT_NAMES))
 }
