@@ -330,10 +330,10 @@ _sa_raced :: proc(kind: Switch_Race_Kind) -> (path: string, data: string) {
 	return
 }
 
-switch_ingest_race_run :: proc(seed: u64, kind: Switch_Race_Kind) -> (failures: [dynamic]string, raced: bool) {
+switch_ingest_race_run :: proc(seed: u64, kind: Switch_Race_Kind, lost: bool) -> (failures: [dynamic]string, raced: bool) {
 	failures = make([dynamic]string)
 	w := _sa_world(seed)
-	raced = _switch_ingest_race(w, kind)
+	raced = _switch_ingest_race(w, kind, lost)
 	for f in w.failures {
 		append(&failures, fmt.aprintf("%s", f))
 	}
@@ -353,7 +353,7 @@ _sa_step :: proc(w: ^World) -> bool {
 }
 
 @(private = "file")
-_switch_ingest_race :: proc(w: ^World, kind: Switch_Race_Kind) -> (raced: bool) {
+_switch_ingest_race :: proc(w: ^World, kind: Switch_Race_Kind, lost: bool) -> (raced: bool) {
 	n, tree, ok := _sa_setup(w)
 	if !ok {
 		return
@@ -409,14 +409,26 @@ _switch_ingest_race :: proc(w: ^World, kind: Switch_Race_Kind) -> (raced: bool) 
 	}
 	n.watch_scheduled = true
 	raced = true
-	run_until(w, w.now + 3_000_000_000, false)
-	sm = _sa_mount(n)
-	if sm == nil {
-		world_fail(w, "switch ingest race: mount missing during the switch")
-		return
+	if lost {
+		run_until(w, w.now + 20_000_000_000, false)
+	} else {
+		run_until(w, w.now + fs.SWITCH_FENCE_MS * 1_000_000 / 2, false)
+		sm = _sa_mount(n)
+		if sm == nil {
+			world_fail(w, "switch ingest race: mount missing during the switch")
+			return
+		}
+		if _, pending := fs.mount_switch_pending(sm.m); !pending || sm.m.switch_phase != fs.SWITCH_INGEST {
+			world_fail(w, "switch ingest race: the line flipped to %s while the watch events of a %v made during ingest were still undelivered", SA_FEATURE, kind)
+		}
 	}
-	if _, pending := fs.mount_switch_pending(sm.m); !pending || sm.m.switch_phase != fs.SWITCH_INGEST {
-		world_fail(w, "switch ingest race: the line flipped to %s while the watch events of a %v made during ingest were still undelivered", SA_FEATURE, kind)
+	if lost {
+		sm = _sa_mount(n)
+		if sm != nil {
+			if _, pending := fs.mount_switch_pending(sm.m); pending {
+				world_fail(w, "switch ingest race: with its watch events lost the switch to %s never finished (phase %d)", SA_FEATURE, sm.m.switch_phase)
+			}
+		}
 	}
 	n.watch_scheduled = false
 	node_after(n)
@@ -446,22 +458,24 @@ line_switch_ingest_race :: proc(t: ^testing.T) {
 	}
 	test_begin(t)
 	defer test_end(t)
-	for kind in Switch_Race_Kind {
-		raced := 0
-		for seed in u64(1) ..= 20 {
-			failures, r := switch_ingest_race_run(seed, kind)
-			for f in failures {
-				fmt.eprintf("line_switch_ingest_race %v seed %d: %s\n", kind, seed, f)
-				delete(f)
+	for lost in ([]bool{false, true}) {
+		for kind in Switch_Race_Kind {
+			raced := 0
+			for seed in u64(1) ..= 20 {
+				failures, r := switch_ingest_race_run(seed, kind, lost)
+				for f in failures {
+					fmt.eprintf("line_switch_ingest_race %v lost %v seed %d: %s\n", kind, lost, seed, f)
+					delete(f)
+				}
+				testing.expect(t, len(failures) == 0, fmt.tprintf("line_switch_ingest_race %v lost %v seed %d failed", kind, lost, seed))
+				delete(failures)
+				if r {
+					raced += 1
+				}
 			}
-			testing.expect(t, len(failures) == 0, fmt.tprintf("line_switch_ingest_race %v seed %d failed", kind, seed))
-			delete(failures)
-			if r {
-				raced += 1
-			}
+			fmt.eprintf("line_switch_ingest_race: %v, events %s: %d of 20 seeds raced into the ingest window\n", kind, "lost" if lost else "late", raced)
+			testing.expect(t, raced > 0, fmt.tprintf("line_switch_ingest_race %v lost %v: no seed opened the ingest window", kind, lost))
 		}
-		fmt.eprintf("line_switch_ingest_race: %v: %d of 20 seeds raced into the ingest window\n", kind, raced)
-		testing.expect(t, raced > 0, fmt.tprintf("line_switch_ingest_race %v: no seed opened the ingest window", kind))
 	}
 }
 

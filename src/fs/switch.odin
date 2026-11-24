@@ -141,6 +141,10 @@ switch_advance :: proc(m: ^Mount) -> (finished: bool, err: Error) {
 						m.switch_fence = 0
 						return false, ferr
 					}
+					m.switch_fences += 1
+					if m.switch_fence != 0 && m.reg.loop != nil {
+						m.switch_timer = prim.timer(m.reg.loop, SWITCH_FENCE_MS, m, switch_fence_expired)
+					}
 				}
 				return false, .None
 			}
@@ -216,10 +220,31 @@ switch_advance :: proc(m: ^Mount) -> (finished: bool, err: Error) {
 	return true, .None
 }
 
+SWITCH_FENCE_MS :: 2000
+
+@(private)
+switch_fence_expired :: proc(l: ^prim.Loop, data: rawptr) {
+	m := (^Mount)(data)
+	if m.switch_fence == 0 {
+		return
+	}
+	mount_mark_rescan(m)
+	for &f in m.fences {
+		if f.cb == switch_fenced && u64(uintptr(f.data)) == m.switch_fence {
+			f.arrived = true
+			f.observed = true
+		}
+	}
+	mount_schedule(m, 0)
+}
+
 @(private)
 switch_fenced :: proc(m: ^Mount, data: rawptr, err: Error) {
 	if u64(uintptr(data)) != m.switch_fence {
 		return
+	}
+	if m.reg != nil && m.reg.loop != nil {
+		prim.timer_cancel(m.reg.loop, m.switch_timer)
 	}
 	m.switch_fence = 0
 	m.switch_fence_ok = err == .None && len(m.dirty) == 0 && !m.rescan && mount_durable_now(m)
@@ -243,6 +268,9 @@ switch_clear :: proc(m: ^Mount) {
 	delete(m.switch_from, m.allocator)
 	m.switch_from = ""
 	m.switch_phase = 0
+	if m.switch_fence != 0 && m.reg != nil && m.reg.loop != nil {
+		prim.timer_cancel(m.reg.loop, m.switch_timer)
+	}
 	m.switch_fence = 0
 	m.switch_fence_ok = false
 	m.switch_done = nil

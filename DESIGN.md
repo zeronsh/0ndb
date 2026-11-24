@@ -991,7 +991,12 @@ equal in both directions.
   If the pass that the barrier released ingested anything, the step waits for
   durability and a new barrier. The cost is O(changes); a mount without a
   watcher, or one whose watcher overflowed (rescan), runs one full pass
-  instead. Lines are
+  instead, and a barrier whose event has not arrived after 2 s (a coalesced
+  create and remove) marks a rescan and counts as arrived, so a switch always
+  completes or fails. The op holds the source line's runs before the record
+  starts, so only a person writing without pause can keep the barrier
+  refencing; the mount counts its fences (`switch_fences`) so a switch that
+  keeps refencing shows. Lines are
   named by their git key (`git:refs/heads/<name>`; the mount's own branch maps
   to its line). Runtime-managed mounts are refused until run lines retire. **A
   0ndb switch keeps each line's uncommitted state with that line (an automatic
