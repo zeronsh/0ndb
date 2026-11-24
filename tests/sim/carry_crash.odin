@@ -5,6 +5,7 @@ import "core:os"
 import "core:strings"
 import "core:testing"
 import eng "../../src/engine"
+import "../../src/crdt"
 import "../../src/fs"
 import "../../src/prim"
 
@@ -167,6 +168,7 @@ _carry_crash :: proc(w: ^World, crash_at: u64) -> (crashed: bool) {
 	if string(data) != string(disk) {
 		world_fail(w, "carry: a.txt on main is %q, disk %q", string(data), string(disk))
 	}
+	_carry_committed(w, sm.m, agent, crash_at)
 	at := 0
 	agent_bytes := 0
 	for sp in spans {
@@ -189,6 +191,62 @@ _carry_crash :: proc(w: ^World, crash_at: u64) -> (crashed: bool) {
 		world_fail(w, "carry: a.txt on main credits %d of the agent's %d carried bytes to it (crash at disk op %d)", agent_bytes, len("agent line\n"), crash_at)
 	}
 	return
+}
+
+@(private = "file")
+_carry_committed :: proc(w: ^World, m: ^fs.Mount, agent: prim.Id, crash_at: u64) {
+	h := m.history
+	if werr := fs.mount_wake(m); werr != .None {
+		world_fail(w, "carry: mount wake: %v", werr)
+		return
+	}
+	v, found, verr := fs.history_line(h, "main", context.temp_allocator)
+	e, has, serr := fs.shadow_get(&m.shadow, "a.txt")
+	lvs := make([dynamic]crdt.Lv, context.temp_allocator)
+	if verr != .None || !found || serr != .None || !has || crdt.graph_version_lvs(&h.g, v, &lvs) != .None {
+		world_fail(w, "carry: main's a.txt is unreadable: %v %v %v %v", verr, found, serr, has)
+		return
+	}
+	data, spans, terr := fs.history_text_spans_at(h, e.inode, lvs[:], context.temp_allocator)
+	if terr != .None {
+		world_fail(w, "carry: main's a.txt spans: %v", terr)
+		return
+	}
+	at := 0
+	for sp in spans {
+		text := string(data[at:][:sp.len])
+		registered := sp.op.actor != agent && fs.history_line_base(h, sp.op.actor) == agent && fs.scope_line_actor(m, agent) == sp.op.actor
+		if sp.op.actor != m.actor && !registered {
+			world_fail(w, "carry: %q on main was committed by %s, not the mount or the agent's line actor (crash at disk op %d)", text, id_short(sp.op.actor), crash_at)
+		} else if registered && _carry_op_kind(h, sp.op) != .Insert_Carry {
+			world_fail(w, "carry: %q on main was written by the agent's line actor, not carried (crash at disk op %d)", text, crash_at)
+		}
+		at += sp.len
+	}
+}
+
+@(private = "file")
+_carry_op_kind :: proc(h: ^fs.History, id: crdt.Op_Id) -> crdt.Op_Kind {
+	lv, ok := crdt.graph_lv(&h.g, id)
+	if !ok {
+		return .Opaque
+	}
+	_, _, stream, off, found := fs.history_batch_at(h, lv)
+	if !found {
+		return .Opaque
+	}
+	b, err := fs.history_read_batch(h, stream, off, context.temp_allocator)
+	if err != .None {
+		return .Opaque
+	}
+	pos := b.seq
+	for op in b.ops {
+		if id.seq >= pos && id.seq < pos + u64(op.len) {
+			return op.kind
+		}
+		pos += u64(op.len)
+	}
+	return .Opaque
 }
 
 @(test)

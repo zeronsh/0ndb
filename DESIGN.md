@@ -940,7 +940,11 @@ equal in both directions.
   that base's line actor on the target line
   (`ingestion_actor(device, blake2b-128("0ndb scope line" || base ||
   line))`, kind 3, base the author actor blame presents, a base that is
-  itself a line actor unwrapped to its base). The line is held across the
+  itself a line actor unwrapped to its base). Text a switch carries onto a
+  line is committed by the mount's actor on that line or by the registered
+  line actor of its author there, never by the author's scope itself; blame
+  presents both as the author, so a check of it reads the raw op actor. The
+  line is held across the
   main batch and its carry batches, so no reader or peer sees the line
   between them; a carry batch that fails clears the stat of its paths and
   marks them, and a crash between them leaves the pre-pass mount state, so
