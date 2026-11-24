@@ -103,7 +103,7 @@ mount_at :: proc(a: ^Api, path: string) -> (m: ^Mounted, rel: string) {
 
 mount_missing :: proc(a: ^Api, path: string) -> Status {
 	for r in eng.tree_refused(a.e) {
-		if path == r.root || (strings.has_prefix(path, r.root) && path[len(r.root)] == '/') {
+		if _, ok := fs.path_rel(path, r.root); ok {
 			return .Newer
 		}
 	}
