@@ -448,6 +448,8 @@ Mount :: struct {
 	switch_phase: u8,
 	switch_fence: u64,
 	switch_fence_ok: bool,
+	switch_timer: prim.Timer,
+	switch_fences: u64,
 	switch_done: Switch_Done,
 	switch_data: rawptr,
 	link_mode:   Link_Mode,
@@ -792,6 +794,7 @@ mount_close :: proc(m: ^Mount) {
 	if m.reg != nil && m.reg.loop != nil {
 		prim.timer_cancel(m.reg.loop, m.timer)
 		prim.timer_cancel(m.reg.loop, m.idle_timer)
+		prim.timer_cancel(m.reg.loop, m.switch_timer)
 	}
 	for s in m.reg.scopes {
 		if s.mount == m {
