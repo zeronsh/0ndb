@@ -30,6 +30,7 @@ Install :: struct {
 	roots: [2]string,
 	nsync: u64,
 	owed:  bool,
+	order_only: bool,
 }
 
 @(private)
@@ -211,7 +212,7 @@ install_run :: proc(b: ^Install) -> Error {
 		return err
 	}
 	install_rename(b) or_return
-	return sync_paths(db, nil, ud, b.roots[:])
+	return sync_paths(db, nil, ud, b.roots[:], b.order_only)
 }
 
 @(private)
