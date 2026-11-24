@@ -194,6 +194,7 @@ Config :: struct {
 	durability:  eng.Durability,
 	promote:     i64,
 	persist_fault: bool,
+	marks:       bool,
 	index_trust: bool,
 }
 
@@ -216,6 +217,7 @@ World :: struct {
 	conn_ids:  u64,
 	conns:     [dynamic]^Conn,
 	trace:     u64,
+	marks:     [dynamic]Ev_Mark,
 	stats:     World_Stats,
 	failures:  [dynamic]string,
 	log:       [dynamic]string,
@@ -483,6 +485,7 @@ world_init :: proc(w: ^World, cfg: Config) {
 }
 
 world_destroy :: proc(w: ^World) {
+	delete(w.marks)
 	run_world_destroy(w)
 	for n in w.nodes {
 		if n.alive {
