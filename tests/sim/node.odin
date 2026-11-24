@@ -213,6 +213,7 @@ node_kill :: proc(n: ^Node) {
 	n.alive = false
 	n.e_open = false
 	n.key_open = false
+	pack.drop_caches(&n.e.pk)
 	instance_kill(&n.inst)
 	virtual.arena_destroy(&n.e.temp)
 	n.e = {}
@@ -664,6 +665,7 @@ relay_kill :: proc(rn: ^Relay_Node) {
 	conns_drop_relay(rn.w)
 	rn.alive = false
 	rn.r_on = false
+	pack.drop_caches(&rn.pk)
 	instance_kill(&rn.inst)
 	stat_add(rn.w, STAT_RELAY_REDACTED_IN, rn.r.stats.redacted_in)
 	stat_add(rn.w, STAT_RELAY_REFUSED_IN, rn.r.stats.refused_in)

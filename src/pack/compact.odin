@@ -298,6 +298,17 @@ compact_all :: proc(p: ^Pack, budget: i64 = 4 * 1024 * 1024) -> (more: bool, err
 	return more, .None
 }
 
+drop_caches :: proc(p: ^Pack) {
+	if p.bcache != nil {
+		virtual.release(raw_data(p.bcache), uint(BCACHE * size_of(Bc_Entry)))
+		p.bcache = nil
+	}
+	for r in p.runs {
+		_run_filter_drop(p, r)
+	}
+	p.filters_cold = true
+}
+
 @(private)
 _shrink :: proc(p: ^Pack) {
 	if len(p.buf) == 0 && cap(p.buf) > 0 {
@@ -327,14 +338,7 @@ _shrink :: proc(p: ^Pack) {
 	if p.mem.count == 0 {
 		_mem_reset(&p.mem)
 	}
-	if p.bcache != nil {
-		virtual.release(raw_data(p.bcache), uint(BCACHE * size_of(Bc_Entry)))
-		p.bcache = nil
-	}
-	for r in p.runs {
-		_run_filter_drop(p, r)
-	}
-	p.filters_cold = true
+	drop_caches(p)
 	for &c, i in p.conts {
 		if i != p.active && c.fd >= 0 && !c.dirty {
 			prim.close_file(p.base, c.fd)
