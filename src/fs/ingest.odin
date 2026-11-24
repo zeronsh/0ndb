@@ -3071,8 +3071,11 @@ trust_drop :: proc(m: ^Mount) {
 @(private)
 read_content :: proc(m: ^Mount, rel: string, stat: Stat, old := fstree.Inode_Id{}, has_old := false) -> (data: []u8, oid: odb.Oid, binary: bool, ok: bool, err: Error) {
 	if m.trusted != nil && m.db != nil && stat.size <= m.opts.large_limit {
-		if e, has := &m.trusted[rel]; has && index_clean(e, stat, .File, m.trust_mtime, mount_trust_exec(m), mount_symlinks(m)) {
-			if t, d, rerr := odb.read(m.db, e.oid, context.temp_allocator); rerr == .None && t == .Blob {
+		if e, has := &m.trusted[rel]; has {
+			if !index_clean(e, stat, .File, m.trust_mtime, mount_trust_exec(m), mount_symlinks(m)) {
+				m.trust_refused += 1
+			} else if t, d, rerr := odb.read(m.db, e.oid, context.temp_allocator); rerr == .None && t == .Blob {
+				m.trust_reads += 1
 				return d, e.oid, textdiff.is_binary(d), true, .None
 			}
 		}
