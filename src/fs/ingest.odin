@@ -1725,18 +1725,18 @@ shown_free :: proc(shown: ^map[string][]crdt.Op_Id, allocator: runtime.Allocator
 }
 
 @(private)
-shown_put :: proc(m: ^Mount, line: string, v: []crdt.Op_Id) {
-	if m.shown == nil {
-		m.shown = make(map[string][]crdt.Op_Id, m.allocator)
+shown_put :: proc(shown: ^map[string][]crdt.Op_Id, line: string, v: []crdt.Op_Id, allocator: runtime.Allocator) {
+	if shown^ == nil {
+		shown^ = make(map[string][]crdt.Op_Id, allocator)
 	}
-	c := slice.clone(v, m.allocator)
-	if old, ok := &m.shown[line]; ok {
-		delete(old^, m.allocator)
+	c := slice.clone(v, allocator)
+	if old, ok := &shown[line]; ok {
+		delete(old^, allocator)
 		old^ = c
 		return
 	}
-	k, _ := clone_string(line, m.allocator)
-	m.shown[k] = c
+	k, _ := clone_string(line, allocator)
+	shown[k] = c
 }
 
 @(private)
@@ -1757,7 +1757,7 @@ shown_version :: proc(m: ^Mount, line: string, head: Version) -> (v: Version, ok
 @(private)
 line_follow :: proc(m: ^Mount, key: string) -> Error {
 	h := m.history
-	shown_put(m, m.line, m.synced[:])
+	shown_put(&m.shown, m.line, m.synced[:], m.allocator)
 	v, found := history_line(h, key, context.temp_allocator) or_return
 	if !found || len(v) == 0 {
 		history_set_line(h, key, m.synced[:]) or_return
