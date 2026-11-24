@@ -1399,8 +1399,9 @@ _observe_begin :: proc(m: ^Mount, rel: string, scope: ^Scope, since: Observe_Sin
 	if c, ok := m.attrib[rel]; ok && c.actor == scope.actor && !c.used {
 		return false, .None
 	}
-	attrib_set(m, rel, scope.actor, false, {}, scope.id)
-	if aerr := attrib_log_append(m, rel, scope.actor, {}, scope.id); aerr != .None {
+	base := observe_base(m, rel, scope)
+	attrib_set(m, rel, scope.actor, false, {}, scope.id, base)
+	if aerr := attrib_log_append(m, rel, scope.actor, {}, scope.id, base); aerr != .None {
 		return false, aerr
 	}
 	return m.log_fd >= 0, .None
@@ -1544,6 +1545,20 @@ attrib_log_open :: proc(m: ^Mount) -> Error {
 		if prim.reader_remaining(&rd) >= len(sc) {
 			sc = prim.read_id(&rd)
 		}
+		base: Step_Base
+		if prim.reader_remaining(&rd) > 0 {
+			base.kind = prim.read_u8(&rd)
+			prim.read_fixed(&rd, base.oid[:])
+			bn := prim.read_uvarint(&rd)
+			if bn > STEP_BASE_HEADS {
+				break
+			}
+			base.n = u8(bn)
+			for i in 0 ..< int(bn) {
+				base.ver[i].actor = prim.read_id(&rd)
+				base.ver[i].seq = prim.read_uvarint(&rd)
+			}
+		}
 		if !prim.reader_ok(&rd) {
 			break
 		}
@@ -1554,9 +1569,9 @@ attrib_log_open :: proc(m: ^Mount) -> Error {
 					delete(key, m.allocator)
 				}
 			} else {
-				attrib_set(m, path, actor, false, o, sc)
+				attrib_set(m, path, actor, false, o, sc, base)
 				if o != {} {
-					attrib_chain_add(m, path, Attrib_Step{actor, o, sc})
+					attrib_chain_add(m, path, Attrib_Step{actor, o, sc, base})
 				}
 			}
 		}
@@ -1567,7 +1582,7 @@ attrib_log_open :: proc(m: ^Mount) -> Error {
 }
 
 @(private)
-attrib_log_append :: proc(m: ^Mount, rel: string, actor: prim.Id, oid := odb.Oid{}, scope := prim.Id{}) -> Error {
+attrib_log_append :: proc(m: ^Mount, rel: string, actor: prim.Id, oid := odb.Oid{}, scope := prim.Id{}, base := Step_Base{}) -> Error {
 	if m.log_fd < 0 {
 		return save_mount_state(m)
 	}
@@ -1575,12 +1590,23 @@ attrib_log_append :: proc(m: ^Mount, rel: string, actor: prim.Id, oid := odb.Oid
 	w := prim.writer(&body)
 	prim.write_str(&w, rel)
 	prim.write_id(&w, actor)
-	if oid != {} || scope != {} {
+	if oid != {} || scope != {} || base.kind != STEP_BASE_NONE {
 		o := oid
 		prim.write_raw(&w, o[:])
 	}
-	if scope != {} {
+	if scope != {} || base.kind != STEP_BASE_NONE {
 		prim.write_id(&w, scope)
+	}
+	if base.kind != STEP_BASE_NONE {
+		prim.write_u8(&w, base.kind)
+		bo := base.oid
+		prim.write_raw(&w, bo[:])
+		prim.write_uvarint(&w, u64(base.n))
+		bv := base.ver
+		for id in bv[:base.n] {
+			prim.write_id(&w, id.actor)
+			prim.write_uvarint(&w, id.seq)
+		}
 	}
 	rec := make([]u8, 8 + len(body), context.temp_allocator)
 	prim.put_u32le(rec[0:4], u32(len(body)))
@@ -1595,6 +1621,7 @@ Attrib_Step :: struct {
 	actor: prim.Id,
 	oid:   odb.Oid,
 	scope: prim.Id,
+	base:  Step_Base,
 }
 
 @(private)
@@ -1686,8 +1713,8 @@ mount_closed :: proc(m: ^Mount, rel: string) {
 	if has_prev && prev.kind == .File && prev.oid != {} && prev.oid != oid && a.oid != prev.oid && attrib_base_stored(m, prev) {
 		attrib_log_append(m, rel, m.actor, prev.oid)
 	}
-	attrib_set(m, rel, a.actor, false, oid, a.scope)
-	if attrib_log_append(m, rel, a.actor, oid, a.scope) == .None {
+	attrib_set(m, rel, a.actor, false, oid, a.scope, a.base)
+	if attrib_log_append(m, rel, a.actor, oid, a.scope, a.base) == .None {
 		attrib_log_durable(m, nil, nil)
 	}
 }
@@ -1990,8 +2017,14 @@ scope_close :: proc(reg: ^Registry, s: ^Scope) -> Error {
 				}
 				v := sm.dirty[k]
 				if v == s {
-					attrib_set(sm, k, s.actor, false, {}, s.id)
-					attrib_log_append(sm, k, s.actor, {}, s.id)
+					base := Step_Base{}
+					if prev, had := sm.attrib[k]; had && prev.scope == s.id && prev.actor == s.actor {
+						base = prev.base
+					} else {
+						base = observe_base(sm, k, s)
+					}
+					attrib_set(sm, k, s.actor, false, {}, s.id, base)
+					attrib_log_append(sm, k, s.actor, {}, s.id, base)
 				}
 			}
 			scope_retire_unwritten(sm, s)
@@ -2406,16 +2439,106 @@ Attrib :: struct {
 	used:  bool,
 	oid:   odb.Oid,
 	scope: prim.Id,
+	base:  Step_Base,
+}
+
+STEP_BASE_NONE :: u8(0)
+STEP_BASE_VERSION :: u8(1)
+STEP_BASE_CHAIN :: u8(2)
+STEP_BASE_CONTENT :: u8(3)
+STEP_BASE_HEADS :: 4
+
+Step_Base :: struct {
+	kind: u8,
+	oid:  odb.Oid,
+	n:    u8,
+	ver:  [STEP_BASE_HEADS]crdt.Op_Id,
 }
 
 @(private)
-attrib_set :: proc(m: ^Mount, path: string, actor: prim.Id, used := false, oid := odb.Oid{}, scope := prim.Id{}) {
+attrib_set :: proc(m: ^Mount, path: string, actor: prim.Id, used := false, oid := odb.Oid{}, scope := prim.Id{}, base := Step_Base{}) {
 	if p, ok := &m.attrib[path]; ok {
-		p^ = Attrib{actor, used, oid, scope}
+		p^ = Attrib{actor, used, oid, scope, base}
 		return
 	}
 	k, _ := clone_string(path, m.allocator)
-	m.attrib[k] = Attrib{actor, used, oid, scope}
+	m.attrib[k] = Attrib{actor, used, oid, scope, base}
+}
+
+@(private)
+step_base_version :: proc(v: []crdt.Op_Id, oid: odb.Oid) -> (b: Step_Base) {
+	if len(v) == 0 || len(v) > STEP_BASE_HEADS {
+		return Step_Base{kind = STEP_BASE_CONTENT, oid = oid}
+	}
+	b.kind = STEP_BASE_VERSION
+	b.oid = oid
+	b.n = u8(len(v))
+	copy(b.ver[:], v)
+	return
+}
+
+@(private)
+observe_base :: proc(m: ^Mount, rel: string, scope: ^Scope) -> Step_Base {
+	h := m.history
+	if h == nil || m.db == nil {
+		return {}
+	}
+	if p := _pin(scope, rel, false); p != nil {
+		if p.has_read {
+			if t, err := history_text_at(h, p.read_inode, p.read[:], context.temp_allocator); err == .None && _content_hash(t) == p.read_hash {
+				if oid, werr := odb.write(m.db, .Blob, t); werr == .None {
+					return step_base_version(p.read[:], oid)
+				}
+			}
+		}
+		if p.has_write && p.has_base {
+			if t, err := history_text_at(h, p.write_inode, p.write[:], context.temp_allocator); err == .None && _content_hash(t) == p.base_hash {
+				if oid, werr := odb.write(m.db, .Blob, t); werr == .None {
+					return step_base_version(p.write[:], oid)
+				}
+			}
+		}
+	}
+	e, found, serr := shadow_get(&m.shadow, rel)
+	if serr != .None || !found || e.kind != .File {
+		return {}
+	}
+	if !disk_matches(m, rel, e) {
+		abuf: prim.Path_Buf
+		abs := abs_path(m, rel, abuf[:])
+		st, lerr := prim.lstat(m.vfs, abs)
+		if lerr != .None || st.kind != .File || st.size > m.opts.large_limit {
+			return Step_Base{kind = STEP_BASE_CHAIN}
+		}
+		data, rerr := prim.read_file(m.vfs, abs, context.temp_allocator)
+		if rerr != .None {
+			return Step_Base{kind = STEP_BASE_CHAIN}
+		}
+		clean, cok := eol_clean(m, rel, data, e.inode, true)
+		if !cok {
+			return Step_Base{kind = STEP_BASE_CHAIN}
+		}
+		oid, werr := odb.write(m.db, .Blob, clean)
+		if werr != .None {
+			return Step_Base{kind = STEP_BASE_CHAIN}
+		}
+		return Step_Base{kind = STEP_BASE_CHAIN, oid = oid}
+	}
+	at, text, terr := _pin_at(m, rel, e.inode)
+	if terr != .None {
+		return {}
+	}
+	oid, werr := odb.write(m.db, .Blob, text)
+	if werr != .None {
+		return {}
+	}
+	if oid != e.oid {
+		if e.oid != {} && odb.exists(m.db, e.oid) {
+			return Step_Base{kind = STEP_BASE_CONTENT, oid = e.oid}
+		}
+		return {}
+	}
+	return step_base_version(at, oid)
 }
 
 @(private)
