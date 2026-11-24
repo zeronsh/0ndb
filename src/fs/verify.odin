@@ -107,7 +107,7 @@ verify_skip :: proc(m: ^Mount, p: string, disk: bool) -> bool {
 verify_tree :: proc(m: ^Mount, snap: ^fstree.Snapshot, dir: fstree.Inode_Id, prefix: string, disk: bool, seen: ^map[string]bool, out: ^[dynamic]string, allocator := context.allocator) -> Error {
 	kids, kerr := fstree.children(snap, dir, nil, 0, context.temp_allocator)
 	if kerr != nil {
-		return .Corrupt
+		return tree_error(kerr)
 	}
 	for c in kids {
 		p, _ := path_join(prefix, c.name, context.temp_allocator)
@@ -190,7 +190,7 @@ verify_at :: proc(m: ^Mount, synced: ^fstree.Snapshot, p: string, e: Entry, disk
 	defer fstree.snapshot_destroy(&snap)
 	info, iok, ierr := fstree.info(&snap, e.inode, context.temp_allocator)
 	if ierr != nil {
-		return .Corrupt
+		return tree_error(ierr)
 	}
 	if !iok || !info.present {
 		append(out, fmt.aprintf("%s: shadow inode %v is not in its own version", p, e.inode, allocator = allocator))
@@ -198,12 +198,12 @@ verify_at :: proc(m: ^Mount, synced: ^fstree.Snapshot, p: string, e: Entry, disk
 	}
 	id, ok, lerr := fstree.lookup(&snap, p)
 	if lerr != nil {
-		return .Corrupt
+		return tree_error(lerr)
 	}
 	if !ok || id != e.inode {
 		sid, sok, serr := fstree.lookup(synced, p)
 		if serr != nil {
-			return .Corrupt
+			return tree_error(serr)
 		}
 		if !sok || sid != e.inode {
 			append(out, fmt.aprintf("%s: shadow inode %v is at this path neither at its own version (%v, found %v) nor in synced (%v, found %v)", p, e.inode, id, ok, sid, sok, allocator = allocator))
@@ -270,7 +270,7 @@ mount_synced_text :: proc(m: ^Mount, rel: string, allocator := context.allocator
 	defer fstree.snapshot_destroy(&snap)
 	id, ok, lerr := fstree.lookup(&snap, rel)
 	if lerr != nil {
-		return nil, false, .Corrupt
+		return nil, false, tree_error(lerr)
 	}
 	if !ok {
 		return nil, false, .None

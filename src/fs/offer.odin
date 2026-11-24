@@ -58,12 +58,12 @@ offer_put :: proc(h: ^History, o: Offer) -> Error {
 @(private)
 offer_pending :: proc(h: ^History, o: Offer, lvs: []crdt.Lv, snap: ^fstree.Snapshot) -> (pending: bool, err: Error) {
 	if info, ok, ierr := fstree.info(snap, o.source, context.temp_allocator); ierr != nil {
-		return false, .Corrupt
+		return false, tree_error(ierr)
 	} else if ok && info.present {
 		return false, .None
 	}
 	if info, ok, ierr := fstree.info(snap, o.dest, context.temp_allocator); ierr != nil {
-		return false, .Corrupt
+		return false, tree_error(ierr)
 	} else if !ok || !info.present {
 		return false, .None
 	}

@@ -408,15 +408,15 @@ tree_source :: proc(r: ^Reader) -> fstree.Source {
 			}
 			return {}
 		},
-		load_inode = proc(data: rawptr, id: fstree.Inode_Id) -> ([]u8, bool) {
+		load_inode = proc(data: rawptr, id: fstree.Inode_Id) -> ([]u8, bool, fstree.Error) {
 			r := (^Reader)(data)
 			v, ok := r.kv[string(inode_key("ti", id))]
-			return v, ok
+			return v, ok, nil
 		},
-		load_node = proc(data: rawptr, key: fstree.Node_Key) -> ([]u8, bool) {
+		load_node = proc(data: rawptr, key: fstree.Node_Key) -> ([]u8, bool, fstree.Error) {
 			r := (^Reader)(data)
 			v, ok := r.kv[string(node_key(key))]
-			return v, ok
+			return v, ok, nil
 		},
 		load_moves = proc(data: rawptr, from_lamport: u64, out: ^[dynamic]fstree.Move_Ref) -> bool {
 			r := (^Reader)(data)

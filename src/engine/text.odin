@@ -128,7 +128,7 @@ _tree_read :: proc(e: ^Engine, o: Object, path: string, allocator := context.all
 	}
 	id, ok, lerr := fstree.lookup(&at.snap, path)
 	if lerr != nil {
-		return nil, .Corrupt
+		return nil, _ferr(fs.tree_error(lerr))
 	}
 	if !ok {
 		if blocked && ready.call != nil {
@@ -191,7 +191,7 @@ _tree_entries :: proc(e: ^Engine, o: Object, path: string, allocator: runtime.Al
 	if len(path) > 0 && path != "/" {
 		id, ok, lerr := fstree.lookup(&at.snap, path)
 		if lerr != nil {
-			return nil, .Corrupt
+			return nil, _ferr(fs.tree_error(lerr))
 		}
 		if !ok {
 			if blocked && ready.call != nil {
@@ -206,7 +206,7 @@ _tree_entries :: proc(e: ^Engine, o: Object, path: string, allocator: runtime.Al
 	}
 	kids, cerr := fstree.children(&at.snap, dir, nil, 0, context.temp_allocator)
 	if cerr != nil {
-		return nil, .Corrupt
+		return nil, _ferr(fs.tree_error(cerr))
 	}
 	out := make([]Tree_Entry, len(kids), allocator)
 	for k, i in kids {
@@ -214,7 +214,7 @@ _tree_entries :: proc(e: ^Engine, o: Object, path: string, allocator: runtime.Al
 		x.name = _clone(k.name, allocator) or_return
 		info, iok, ierr := fstree.info(&at.snap, k.inode, context.temp_allocator)
 		if ierr != nil {
-			return nil, .Corrupt
+			return nil, _ferr(fs.tree_error(ierr))
 		}
 		switch k.kind {
 		case .Dir:
@@ -264,7 +264,7 @@ _tree_dirs :: proc(e: ^Engine, h: ^Handle, at: ^Tree_At, dir: string) -> (id: fs
 		}
 		next, found, lerr := fstree.lookup_child(&at.snap, id, part)
 		if lerr != nil {
-			return id, .Corrupt
+			return id, _ferr(fs.tree_error(lerr))
 		}
 		if !found {
 			_hist_tree_op(e, h, fstree.Op_Create{parent = id, name = part, kind = .Dir}, "", at) or_return
@@ -301,7 +301,7 @@ tree_write :: proc(e: ^Engine, o: Object, path: string, data: []u8, base: fs.Ver
 	defer fstree.snapshot_destroy(&bat.snap)
 	id, ok, lerr := fstree.lookup(&bat.snap, path)
 	if lerr != nil {
-		return .Corrupt
+		return _ferr(fs.tree_error(lerr))
 	}
 	if info, iok, ierr := fstree.info(&bat.snap, id, context.temp_allocator); ok && ierr == nil && iok && info.kind != .File {
 		return .Invalid
@@ -366,7 +366,7 @@ tree_remove :: proc(e: ^Engine, o: Object, path: string, line := "") -> Error {
 	at := _tree_at(e, h, line, nil) or_return
 	id, ok, lerr := fstree.lookup(&at.snap, path)
 	if lerr != nil {
-		return .Corrupt
+		return _ferr(fs.tree_error(lerr))
 	}
 	if !ok {
 		return .Not_Found
@@ -617,7 +617,7 @@ _text_inode :: proc(h: ^Handle) -> (id: fstree.Inode_Id, found: bool, err: Error
 	snap := fstree.current(&h.hist.tree)
 	i, ok, lerr := fstree.lookup(&snap, TEXT_NAME)
 	if lerr != nil {
-		return {}, false, .Corrupt
+		return {}, false, _ferr(fs.tree_error(lerr))
 	}
 	return i, ok, .None
 }
@@ -1074,7 +1074,7 @@ tree_blame :: proc(e: ^Engine, o: Object, path: string, allocator := context.all
 	at := _tree_at(e, h, line, nil) or_return
 	id, ok, lerr := fstree.lookup(&at.snap, path)
 	if lerr != nil {
-		return nil, nil, .Corrupt
+		return nil, nil, _ferr(fs.tree_error(lerr))
 	}
 	if !ok {
 		return nil, nil, .Not_Found

@@ -116,8 +116,8 @@ Node_State :: struct {
 Source :: struct {
 	data:       rawptr,
 	actor:      proc(data: rawptr, actor: u32) -> prim.Id,
-	load_inode: proc(data: rawptr, id: Inode_Id) -> (record: []u8, found: bool),
-	load_node:  proc(data: rawptr, key: Node_Key) -> (record: []u8, found: bool),
+	load_inode: proc(data: rawptr, id: Inode_Id) -> (record: []u8, found: bool, err: Error),
+	load_node:  proc(data: rawptr, key: Node_Key) -> (record: []u8, found: bool, err: Error),
 	load_moves: proc(data: rawptr, from_lamport: u64, out: ^[dynamic]Move_Ref) -> bool,
 }
 

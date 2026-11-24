@@ -192,12 +192,12 @@ materialize_to :: proc(m: ^Mount, target: Version, merge: bool) -> Error {
 		}
 		info, ok, ierr := fstree.info(&snap, ino, context.temp_allocator)
 		if ierr != nil {
-			return .Corrupt
+			return tree_error(ierr)
 		}
 		if ok && info.present {
 			p, pok, perr := fstree.path(&snap, ino, context.temp_allocator)
 			if perr != nil {
-				return .Corrupt
+				return tree_error(perr)
 			}
 			if pok {
 				it.present = true
@@ -793,7 +793,7 @@ dir_place_changed :: proc(m: ^Mount, snap: ^fstree.Snapshot, touched: map[fstree
 		old, e, had := shadow_by_inode(&m.shadow, ino, context.temp_allocator) or_return
 		info, ok, ierr := fstree.info(snap, ino, context.temp_allocator)
 		if ierr != nil {
-			return false, .Corrupt
+			return false, tree_error(ierr)
 		}
 		dir := (had && e.kind == .Dir) || (ok && info.present && info.kind == .Dir)
 		if !dir {
@@ -804,7 +804,7 @@ dir_place_changed :: proc(m: ^Mount, snap: ^fstree.Snapshot, touched: map[fstree
 		}
 		p, pok, perr := fstree.path(snap, ino, context.temp_allocator)
 		if perr != nil {
-			return false, .Corrupt
+			return false, tree_error(perr)
 		}
 		if !pok || p != old {
 			return true, .None
@@ -817,7 +817,7 @@ dir_place_changed :: proc(m: ^Mount, snap: ^fstree.Snapshot, touched: map[fstree
 place_reconcile :: proc(m: ^Mount, snap: ^fstree.Snapshot, dir: fstree.Inode_Id, prefix: string, touched: ^map[fstree.Inode_Id]bool) -> Error {
 	kids, kerr := fstree.children(snap, dir, nil, 0, context.temp_allocator)
 	if kerr != nil {
-		return .Corrupt
+		return tree_error(kerr)
 	}
 	for c in kids {
 		p, _ := path_join(prefix, c.name, context.temp_allocator)
@@ -851,7 +851,7 @@ moved_ancestors_touch :: proc(h: ^History, snap: ^fstree.Snapshot, sl: []crdt.Lv
 			touched[cur] = true
 			info, ok, ierr := fstree.info(s, cur, context.temp_allocator)
 			if ierr != nil {
-				return .Corrupt
+				return tree_error(ierr)
 			}
 			if !ok {
 				return .None
@@ -864,7 +864,7 @@ moved_ancestors_touch :: proc(h: ^History, snap: ^fstree.Snapshot, sl: []crdt.Lv
 		ti, tok, terr := fstree.info(snap, ino, context.temp_allocator)
 		si, sok, serr := fstree.info(&ssnap, ino, context.temp_allocator)
 		if terr != nil || serr != nil {
-			return .Corrupt
+			return tree_error(terr if terr != nil else serr)
 		}
 		if tok && sok && ti.parent == si.parent && ti.name == si.name {
 			continue
@@ -895,14 +895,14 @@ displaced_touch :: proc(m: ^Mount, snap: ^fstree.Snapshot, touched: ^map[fstree.
 		}
 		info, ok, ierr := fstree.info(snap, ino, context.temp_allocator)
 		if ierr != nil {
-			return .Corrupt
+			return tree_error(ierr)
 		}
 		if !ok || !info.present {
 			continue
 		}
 		p, pok, perr := fstree.path(snap, ino, context.temp_allocator)
 		if perr != nil {
-			return .Corrupt
+			return tree_error(perr)
 		}
 		if !pok {
 			continue
@@ -1621,7 +1621,7 @@ version_snapshot :: proc(h: ^History, lvs: []crdt.Lv) -> (snap: fstree.Snapshot,
 	}
 	s, serr := fstree.snapshot(&h.tree, view, context.temp_allocator)
 	if serr != nil {
-		return {}, .Corrupt
+		return {}, tree_error(serr)
 	}
 	return s, .None
 }

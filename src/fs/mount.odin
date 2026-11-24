@@ -2678,7 +2678,7 @@ mount_recover :: proc(m: ^Mount) -> Error {
 		for ino in sorted_inodes(touched) {
 			info, found, ierr := fstree.info(&snap, ino, context.temp_allocator)
 			if ierr != nil {
-				return .Corrupt
+				return tree_error(ierr)
 			}
 			old, oe, had := shadow_by_inode(&m.shadow, ino, context.temp_allocator) or_return
 			if !found || !info.present {

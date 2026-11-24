@@ -1144,7 +1144,7 @@ adopt_one :: proc(p: ^Pass, snap: ^fstree.Snapshot, ll: []crdt.Lv, line: Version
 	h := m.history
 	ino, at_line, lerr := fstree.lookup(snap, c.path)
 	if lerr != nil {
-		return false, .Corrupt
+		return false, tree_error(lerr)
 	}
 	if c.kind == .Remove {
 		if (c.old.kind != .File && c.old.kind != .Dir) || (at_line && ino == c.old.inode) {
@@ -1153,7 +1153,7 @@ adopt_one :: proc(p: ^Pass, snap: ^fstree.Snapshot, ll: []crdt.Lv, line: Version
 		if c.old.kind == .Dir {
 			info, ok, ierr := fstree.info(snap, c.old.inode, context.temp_allocator)
 			if ierr != nil {
-				return false, .Corrupt
+				return false, tree_error(ierr)
 			}
 			if ok && info.present {
 				p, pok, perr := fstree.path(snap, c.old.inode, context.temp_allocator)
@@ -1819,14 +1819,14 @@ line_retarget :: proc(m: ^Mount, target: Version) -> Error {
 		for ino in order {
 			info, ok, ierr := fstree.info(&snap, ino, context.temp_allocator)
 			if ierr != nil {
-				return .Corrupt
+				return tree_error(ierr)
 			}
 			if !ok || !info.present {
 				continue
 			}
 			p, pok, perr := fstree.path(&snap, ino, context.temp_allocator)
 			if perr != nil {
-				return .Corrupt
+				return tree_error(perr)
 			}
 			if !pok {
 				continue
@@ -1858,14 +1858,14 @@ departed_entries :: proc(m: ^Mount, out: ^map[string]Commit_Entry) -> bool {
 retarget_subtree :: proc(snap: ^fstree.Snapshot, dir: fstree.Inode_Id, touched: ^map[fstree.Inode_Id]bool) -> Error {
 	info, ok, ierr := fstree.info(snap, dir, context.temp_allocator)
 	if ierr != nil {
-		return .Corrupt
+		return tree_error(ierr)
 	}
 	if !ok || !info.present || info.kind != .Dir {
 		return .None
 	}
 	kids, kerr := fstree.children(snap, dir, nil, 0, context.temp_allocator)
 	if kerr != nil {
-		return .Corrupt
+		return tree_error(kerr)
 	}
 	for c in kids {
 		touched[c.inode] = true
@@ -2762,7 +2762,7 @@ synced_snapshot :: proc(m: ^Mount) -> (snap: fstree.Snapshot, err: Error) {
 snapshot_removed :: proc(snap: ^fstree.Snapshot, inode: fstree.Inode_Id) -> (removed: bool, err: Error) {
 	info, ok, ierr := fstree.info(snap, inode, context.temp_allocator)
 	if ierr != nil {
-		return false, .Corrupt
+		return false, tree_error(ierr)
 	}
 	return ok && !info.present, .None
 }

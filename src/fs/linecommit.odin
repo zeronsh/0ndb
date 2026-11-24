@@ -55,13 +55,13 @@ line_from_commit :: proc(m: ^Mount, line: string, base: Version, commit_hex: str
 		kind := commit_kind(e.mode)
 		cur, found, lerr := fstree.lookup(&snap, p)
 		if lerr != nil {
-			return nil, .Corrupt
+			return nil, tree_error(lerr)
 		}
 		info: fstree.Info
 		if found {
 			i, iok, ierr := fstree.info(&snap, cur, context.temp_allocator)
 			if ierr != nil {
-				return nil, .Corrupt
+				return nil, tree_error(ierr)
 			}
 			info = i
 			if !iok || !i.present || i.kind != kind {
@@ -206,7 +206,7 @@ tree_entries :: proc(db: ^odb.Odb, tree: odb.Oid, prefix: string, out: ^map[stri
 commit_removals :: proc(snap: ^fstree.Snapshot, dir: fstree.Inode_Id, prefix: string, keep: ^map[string]Commit_Entry, out: ^[dynamic]fstree.Inode_Id) -> Error {
 	kids, err := fstree.children(snap, dir, nil, 0, context.temp_allocator)
 	if err != nil {
-		return .Corrupt
+		return tree_error(err)
 	}
 	for k in kids {
 		p := k.name if len(prefix) == 0 else strings.concatenate({prefix, "/", k.name}, context.temp_allocator)

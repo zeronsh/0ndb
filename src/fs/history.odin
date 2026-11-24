@@ -2952,17 +2952,42 @@ tree_actor :: proc(data: rawptr, actor: u32) -> prim.Id {
 }
 
 @(private)
-tree_load_inode :: proc(data: rawptr, id: fstree.Inode_Id) -> (record: []u8, found: bool) {
-	h := (^History)(data)
-	v, ok, err := kv_get(&h.kv, inode_key("ti", id), context.temp_allocator)
-	return v, ok && err == .None
+tree_load_err :: proc(err: Error) -> fstree.Error {
+	#partial switch err {
+	case .None:
+		return nil
+	case .Corrupt:
+		return .Corrupt
+	case .No_Memory:
+		return runtime.Allocator_Error.Out_Of_Memory
+	}
+	return .Unavailable
+}
+
+tree_error :: proc(err: fstree.Error) -> Error {
+	switch x in err {
+	case fstree.Tree_Error:
+		if x == .Unavailable {
+			return .Io
+		}
+	case runtime.Allocator_Error:
+		return .No_Memory
+	}
+	return .Corrupt
 }
 
 @(private)
-tree_load_node :: proc(data: rawptr, key: fstree.Node_Key) -> (record: []u8, found: bool) {
+tree_load_inode :: proc(data: rawptr, id: fstree.Inode_Id) -> (record: []u8, found: bool, err: fstree.Error) {
 	h := (^History)(data)
-	v, ok, err := kv_get(&h.kv, node_key(key), context.temp_allocator)
-	return v, ok && err == .None
+	v, ok, kerr := kv_get(&h.kv, inode_key("ti", id), context.temp_allocator)
+	return v, ok, tree_load_err(kerr)
+}
+
+@(private)
+tree_load_node :: proc(data: rawptr, key: fstree.Node_Key) -> (record: []u8, found: bool, err: fstree.Error) {
+	h := (^History)(data)
+	v, ok, kerr := kv_get(&h.kv, node_key(key), context.temp_allocator)
+	return v, ok, tree_load_err(kerr)
 }
 
 @(private)

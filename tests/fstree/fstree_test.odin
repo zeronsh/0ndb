@@ -71,20 +71,20 @@ actor_of :: proc(data: rawptr, actor: u32) -> prim.Id {
 	return r.world.actors[actor]
 }
 
-load_inode :: proc(data: rawptr, id: fs.Inode_Id) -> ([]u8, bool) {
+load_inode :: proc(data: rawptr, id: fs.Inode_Id) -> ([]u8, bool, fs.Error) {
 	r := (^Replica)(data)
 	if b, ok := r.store.inodes[id]; ok {
-		return b[:], true
+		return b[:], true, nil
 	}
-	return nil, false
+	return nil, false, nil
 }
 
-load_node :: proc(data: rawptr, key: fs.Node_Key) -> ([]u8, bool) {
+load_node :: proc(data: rawptr, key: fs.Node_Key) -> ([]u8, bool, fs.Error) {
 	r := (^Replica)(data)
 	if b, ok := r.store.nodes[key]; ok {
-		return b[:], true
+		return b[:], true, nil
 	}
-	return nil, false
+	return nil, false, nil
 }
 
 load_moves :: proc(data: rawptr, from: u64, out: ^[dynamic]fs.Move_Ref) -> bool {

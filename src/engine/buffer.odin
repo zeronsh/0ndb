@@ -297,7 +297,7 @@ buffer_open :: proc(e: ^Engine, o: Object, opts: Buffer_Options, allocator := co
 		snap := tree_at.snap
 		id, ok, lerr := fstree.lookup(&snap, opts.path)
 		if lerr != nil {
-			return {}, .Corrupt
+			return {}, _ferr(fs.tree_error(lerr))
 		}
 		if !ok {
 			return {}, .Not_Found

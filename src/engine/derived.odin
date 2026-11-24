@@ -616,7 +616,7 @@ _tree_digest :: proc(hist: ^fs.History, out: ^strings.Builder) -> Error {
 	walk :: proc(hist: ^fs.History, snap: ^fstree.Snapshot, dir: fstree.Inode_Id, prefix: string, out: ^strings.Builder) -> Error {
 		kids, cerr := fstree.children(snap, dir, nil, 0, context.temp_allocator)
 		if cerr != nil {
-			return .Corrupt
+			return _ferr(fs.tree_error(cerr))
 		}
 		for k in kids {
 			p := fmt.tprintf("%s/%s", prefix, k.name)

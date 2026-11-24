@@ -254,7 +254,7 @@ get :: proc(t: ^Tree, id: Inode_Id) -> (node: ^Inode, err: Error) {
 	if id == ROOT || t.source.load_inode == nil {
 		return nil, nil
 	}
-	record, found := t.source.load_inode(t.source.data, id)
+	record, found := t.source.load_inode(t.source.data, id) or_return
 	if !found {
 		return nil, nil
 	}
@@ -294,7 +294,12 @@ node_get :: proc(t: ^Tree, key: Node_Key) -> (node: ^Node, err: Error) {
 	found := false
 	if t.source.load_node != nil {
 		record: []u8
-		record, found = t.source.load_node(t.source.data, key)
+		lerr: Error
+		record, found, lerr = t.source.load_node(t.source.data, key)
+		if lerr != nil {
+			node_free(t, n)
+			return nil, lerr
+		}
 		if found {
 			if derr := decode_node_into(record, n, t.allocator); derr != nil {
 				node_free(t, n)
