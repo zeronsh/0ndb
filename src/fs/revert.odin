@@ -1,5 +1,7 @@
 package fs
 
+import "core:fmt"
+
 import "core:crypto/blake2b"
 import "core:mem/virtual"
 import "core:slice"
@@ -398,6 +400,7 @@ event_actor :: proc(m: ^Mount, base: prim.Id, parents: []crdt.Op_Id, digest: [32
 	if _, known := history_actor_owner(h, actor); !known {
 		history_register_line_actor(h, actor, pseudo, base) or_return
 		m.event_actors += 1
+		fmt.eprintf("EVENTACTOR %v\n", m.line)
 	}
 	return actor, .None
 }
