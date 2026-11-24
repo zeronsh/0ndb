@@ -1258,6 +1258,8 @@ Pass :: struct {
 	reflog_pos: i64,
 	running:    bool,
 	side:       bool,
+	redo:       [dynamic]string,
+	overridden: [dynamic]string,
 }
 
 @(private)
@@ -1679,9 +1681,7 @@ pass_open :: proc(p: ^Pass) -> Error {
 	}
 	if p.git_wrote {
 		collect_alias_sources(m, p)
-		if m.opts.index_trust {
-			trust_index(m)
-		}
+		trust_index(m)
 	}
 	p.changes = make([dynamic]Change, p.long)
 	p.held = make([dynamic]Change, p.long)
@@ -1701,25 +1701,47 @@ pass_open :: proc(p: ^Pass) -> Error {
 		m.hold_line = p.git_wrote
 	}
 	p.keys = make([dynamic]string, 0, len(m.dirty), p.long)
-	for k in prim.sorted_keys(m.dirty) {
-		if k not_in m.dirty {
-			continue
-		}
-		v := m.dirty[k]
-		c, _ := clone_string(k, p.long)
-		p.scope_of[c] = v
-		append(&p.keys, c)
-	}
-	for k in m.dirty {
-		delete(k, m.allocator)
-	}
-	clear(&m.dirty)
 	p.dirty_at = make(map[string]i64, p.long)
-	for k, v in prim.unordered(m.dirty_at) {
-		c, _ := clone_string(k, p.long)
-		p.dirty_at[c] = v
+	p.redo = make([dynamic]string, p.long)
+	p.overridden = make([dynamic]string, p.long)
+	if p.side {
+		for k in prim.sorted_keys(m.dirty) {
+			if k not_in m.dirty || side_owned(m, k) {
+				continue
+			}
+			v := m.dirty[k]
+			c, _ := clone_string(k, p.long)
+			p.scope_of[c] = v
+			append(&p.keys, c)
+			if at, ok := m.dirty_at[k]; ok {
+				p.dirty_at[c] = at
+			}
+		}
+		for c in p.keys {
+			key, _ := delete_key(&m.dirty, c)
+			delete(key, m.allocator)
+			dirty_at_drop(m, c)
+		}
+	} else {
+		for k in prim.sorted_keys(m.dirty) {
+			if k not_in m.dirty {
+				continue
+			}
+			v := m.dirty[k]
+			c, _ := clone_string(k, p.long)
+			p.scope_of[c] = v
+			append(&p.keys, c)
+		}
+		for k in m.dirty {
+			delete(k, m.allocator)
+		}
+		clear(&m.dirty)
+		for k, v in prim.unordered(m.dirty_at) {
+			c, _ := clone_string(k, p.long)
+			p.dirty_at[c] = v
+		}
+		dirty_at_clear(m)
 	}
-	dirty_at_clear(m)
 	if !p.side {
 		p.rescan_was = m.rescan
 		m.rescan = false
@@ -1784,6 +1806,13 @@ pass_finish :: proc(p: ^Pass) -> Error {
 			dirty_at_note(m, y, at)
 		}
 	}
+	for y in p.redo {
+		if y in m.dirty {
+			continue
+		}
+		k, _ := clone_string(y, m.allocator)
+		m.dirty[k] = p.scope_of[y]
+	}
 	if rerr := rebase_materialize(m, p.rebased[:], p.restored); rerr != .None && rerr != .Deferred {
 		return rerr
 	}
@@ -1805,7 +1834,7 @@ pass_finish :: proc(p: ^Pass) -> Error {
 		m.reflog_pos = p.reflog_pos
 		m.stamp = p.stamp
 	}
-	if len(m.dirty) > len(p.holding) {
+	if len(m.dirty) > len(p.holding) || len(p.redo) > 0 {
 		mount_schedule(m, m.opts.settle_ms)
 	}
 	m.passes += 1
@@ -2334,6 +2363,7 @@ pass_flush :: proc(p: ^Pass, final := true) -> Error {
 	mount_settle(m) or_return
 	history_trim(m.history)
 	clear(&p.changes)
+	split_clear(p)
 	mem.dynamic_arena_free_all(&p.chunk)
 	return .None
 }
@@ -2407,6 +2437,7 @@ collect_path :: proc(p: ^Pass, rel: string, listed := false) -> Error {
 		if d.kind == .Dir && nested_repo(m, rel) {
 			return .None
 		}
+		git_split(p, rel, &d, {})
 		add_create(p, rel, d) or_return
 		if d.kind == .Dir {
 			collect_subtree(p, rel) or_return
@@ -2450,12 +2481,71 @@ collect_path :: proc(p: ^Pass, rel: string, listed := false) -> Error {
 				defer_ino(p, e)
 				return .None
 			}
+			git_split(p, rel, &d, e.oid)
 			add_modify(p, rel, d, e)
 		}
 	case d.kind == .Symlink:
 		add_modify(p, rel, d, e)
 	}
 	return .None
+}
+
+@(private)
+git_split :: proc(p: ^Pass, rel: string, d: ^Probe, old: odb.Oid) {
+	m := p.m
+	if !p.git_wrote || p.side || m.trusted == nil || m.db == nil || d.kind != .File {
+		return
+	}
+	e, has := &m.trusted[rel]
+	if !has || e.stage != 0 || e.oid == old || e.mode & 0o170000 != 0o100000 {
+		return
+	}
+	mtime := i64(e.mtime_s) * 1_000_000_000 + i64(e.mtime_ns)
+	if mtime == d.stat.mtime_ns && i64(e.size) == d.stat.size {
+		return
+	}
+	if !odb.exists(m.db, e.oid) {
+		return
+	}
+	if m.override == nil {
+		m.override = make(map[string]odb.Oid, m.allocator)
+	}
+	if rel not_in m.override {
+		k, _ := clone_string(rel, m.allocator)
+		m.override[k] = e.oid
+		append(&p.overridden, clone_string(rel, p.long) or_else "")
+	}
+	append(&p.redo, clone_string(rel, p.long) or_else "")
+	d.stat = {}
+}
+
+@(private)
+split_clear :: proc(p: ^Pass) {
+	m := p.m
+	for k in p.overridden {
+		if k in m.override {
+			key, _ := delete_key(&m.override, k)
+			delete(key, m.allocator)
+		}
+	}
+	clear(&p.overridden)
+}
+
+@(private)
+side_owned :: proc(m: ^Mount, rel: string) -> bool {
+	q := m.pass
+	if q == nil || !q.git_wrote || m.trusted == nil {
+		return false
+	}
+	ie, indexed := &m.trusted[rel]
+	se, found, serr := shadow_get(&m.shadow, rel)
+	if serr != .None {
+		return true
+	}
+	if indexed {
+		return !found || se.oid != ie.oid
+	}
+	return false
 }
 
 @(private)
@@ -3274,7 +3364,7 @@ trust_drop :: proc(m: ^Mount) {
 
 @(private)
 read_content :: proc(m: ^Mount, rel: string, stat: Stat, old := fstree.Inode_Id{}, has_old := false) -> (data: []u8, oid: odb.Oid, binary: bool, ok: bool, err: Error) {
-	if m.trusted != nil && m.db != nil && stat.size <= m.opts.large_limit {
+	if m.opts.index_trust && m.trusted != nil && m.db != nil && stat.size <= m.opts.large_limit {
 		if e, has := &m.trusted[rel]; has {
 			if !index_clean(e, stat, .File, m.trust_mtime, mount_trust_exec(m), mount_symlinks(m)) {
 				m.trust_refused += 1
