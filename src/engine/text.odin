@@ -425,6 +425,7 @@ _odb_queue_pending :: proc(e: ^Engine) -> bool {
 		return false
 	}
 	if b != nil {
+		b.order_only = true
 		pack.queue_hook(&e.pk, pack.Commit_Hook{run = _odb_install_run, done = _odb_install_done, data = b})
 	}
 	return true

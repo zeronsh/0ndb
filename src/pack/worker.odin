@@ -256,6 +256,7 @@ _build_run :: proc(base: prim.Vfs, fd: prim.Fd, imm: ^Mem, drop: bool) -> (run: 
 @(private)
 _job_exec :: proc(fl: ^Inflight) -> Error {
 	base := fl.base
+	last := prim.INVALID_FD
 	for h in fl.hooks {
 		n, herr := h.run(h.data)
 		fl.nsync += n
@@ -281,25 +282,37 @@ _job_exec :: proc(fl: ^Inflight) -> Error {
 	if fl.wrote {
 		prim.write_at(base, fl.fd, fl.crec[:], fl.crec_off) or_return
 		fl.nsync += 1
-		prim.datasync(base, fl.fd) or_return
+		prim.barrier(base, fl.fd) or_return
+		last = fl.fd
 	}
 	for z in fl.zjobs {
 		_zero_range(base, z.fd, z.off, z.len) or_return
 	}
 	for c in fl.syncs {
 		fl.nsync += 1
-		prim.datasync(base, c.fd) or_return
+		prim.barrier(base, c.fd) or_return
+		last = c.fd
 	}
 	if fl.scan_fd >= 0 && len(fl.scans) > 0 {
 		_scan_erase(base, fl.scan_fd, fl.scans[:]) or_return
 		fl.nsync += 1
-		prim.datasync(base, fl.scan_fd) or_return
+		prim.barrier(base, fl.scan_fd) or_return
+		last = fl.scan_fd
+	}
+	if last < 0 && len(fl.hooks) > 0 {
+		last = fl.super_fd
 	}
 	switch fl.kind {
 	case .Commit:
+		if last >= 0 {
+			return prim.datasync(base, last)
+		}
 	case .Super:
 		return _snap_write(base, fl.super_fd, &fl.snap, &fl.nsync)
 	case .Delete:
+		if last >= 0 {
+			prim.datasync(base, last) or_return
+		}
 		if e := prim.remove(base, string(fl.del_path[:fl.del_len])); e != .None && e != .Not_Found {
 			return e
 		}

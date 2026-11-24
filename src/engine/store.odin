@@ -165,7 +165,7 @@ _reg_queue_publish :: proc(e: ^Engine) {
 @(private)
 _reg_publish_run :: proc(data: rawptr) -> (nsync: u64, err: pack.Error) {
 	x := (^Reg_Publish)(data)
-	if omap.db_publish_run(x.db, &x.meta) != .None {
+	if omap.db_publish_run(x.db, &x.meta, true) != .None {
 		x.failed = true
 		return 2, .Io
 	}
@@ -177,7 +177,7 @@ _reg_publish_done :: proc(data: rawptr, ok: bool) {
 	x := (^Reg_Publish)(data)
 	e := x.e
 	context = context_for(e)
-	omap.db_publish_done(x.db, !x.failed)
+	omap.db_publish_done(x.db, !x.failed, ok)
 	free(x, e.allocator)
 	if ok && e.reg.open {
 		if cerr := omap.db_compact_due(&e.reg.db); cerr != .None {
