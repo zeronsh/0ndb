@@ -4,8 +4,10 @@ import "core:fmt"
 import "core:os"
 import "core:strings"
 import "core:testing"
+import "../../src/crdt"
 import eng "../../src/engine"
 import "../../src/fs"
+import "../../src/fstree"
 import "../../src/prim"
 
 @(private = "file")
@@ -39,7 +41,11 @@ Named_Arm :: struct {
 	edit:    bool,
 	fork_check: bool,
 	two: bool,
+	rejected: bool,
 }
+
+@(private = "file")
+NV_FOREIGN :: "alien line\n"
 
 @(private = "file")
 NV_D_BASE :: "d base\n"
@@ -211,6 +217,9 @@ _named_crash :: proc(w: ^World, arm: Named_Arm, crash_at: u64) -> (res: Named_Re
 			if arm.two {
 				fs.scope_write_begin(hold, "d.txt")
 			}
+			if arm.rejected {
+				fs.scope_write_begin(hold, "b.txt")
+			}
 		}
 		reader := fs.scope_open(n.reg, sm.m, prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng)), agent)
 		fs.scope_read_base(reader, "a.txt", transmute([]u8)string(NV_BASE))
@@ -244,6 +253,15 @@ _named_crash :: proc(w: ^World, arm: Named_Arm, crash_at: u64) -> (res: Named_Re
 				return
 			}
 		}
+		alien: fs.Version
+		if arm.rejected {
+			got, fok := _nv_foreign(w, n, tree)
+			if !fok {
+				return
+			}
+			alien = got
+		}
+		defer delete(alien, w.allocator)
 		if !arm.control {
 			other := fs.scope_open(n.reg, sm.m, prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng)), keeper)
 			fs.mount_observe_begin(sm.m, "a.txt", other)
@@ -268,6 +286,9 @@ _named_crash :: proc(w: ^World, arm: Named_Arm, crash_at: u64) -> (res: Named_Re
 		fs.scope_close(n.reg, reader)
 		_forget_scope(w, n, reader)
 		res.named = _nv_named(n)
+		if arm.rejected && !_nv_forge(w, n, sm.m, alien) {
+			return
+		}
 		node_after(n)
 	}
 	if !arm.early {
@@ -285,7 +306,9 @@ _named_crash :: proc(w: ^World, arm: Named_Arm, crash_at: u64) -> (res: Named_Re
 	crashes := w.stats.crashes
 	n.disk.force_process = arm.process
 	n.disk.crash_at = n.disk.stats.ops + crash_at
-	_nv_write(vfs, NV_ROOT + "/b.txt", "main b\nraised\n")
+	if !arm.rejected {
+		_nv_write(vfs, NV_ROOT + "/b.txt", "main b\nraised\n")
+	}
 	if !n.disk.dead {
 		switch kind {
 		case .Plain:
@@ -367,7 +390,9 @@ _named_crash :: proc(w: ^World, arm: Named_Arm, crash_at: u64) -> (res: Named_Re
 					}
 				}
 				_nv_authors(w, n, tree, arm, crash_at, NV_FEATURE, agent, keeper)
-				if sm := _nv_mount(n); sm != nil && sm.m.fork_rejected > 0 {
+				if arm.rejected {
+					_nv_rejected(w, n, tree, arm, crash_at, agent, res.crashed)
+				} else if sm := _nv_mount(n); sm != nil && sm.m.fork_rejected > 0 {
 					world_fail(w, "named fork: %v: the fork left out %d named versions the disk holds, at disk op %d", arm, sm.m.fork_rejected, crash_at)
 				}
 				if arm.two {
@@ -449,6 +474,101 @@ _nv_authors :: proc(w: ^World, n: ^Node, tree: eng.Object, arm: Named_Arm, crash
 }
 
 @(private = "file")
+_nv_foreign :: proc(w: ^World, n: ^Node, tree: eng.Object) -> (ids: fs.Version, ok: bool) {
+	base: fs.Version
+	cur, rerr := eng.tree_read(&n.e, tree, "b.txt", context.temp_allocator, {}, "", nil, &base)
+	if rerr != .None {
+		world_fail(w, "named forge: read b.txt: %v", rerr)
+		return nil, false
+	}
+	text := strings.concatenate({string(cur), NV_FOREIGN}, context.temp_allocator)
+	if err := eng.tree_write(&n.e, tree, "b.txt", transmute([]u8)text, base); err != .None {
+		world_fail(w, "named forge: tree_write b.txt: %v", err)
+		return nil, false
+	}
+	line, lerr := eng.tree_version(&n.e, tree, "main", w.allocator)
+	return line, lerr == .None
+}
+
+@(private = "file")
+_nv_forge :: proc(w: ^World, n: ^Node, m: ^fs.Mount, alien: fs.Version) -> bool {
+	e, found, serr := fs.shadow_get(&m.shadow, "a.txt")
+	if serr != .None || !found || e.ver == 0 {
+		world_fail(w, "named forge: a.txt's entry names no version")
+		return false
+	}
+	at := make([dynamic]fstree.Op_Id, context.temp_allocator)
+	before, _ := fs.shadow_version(&m.shadow, e)
+	append(&at, ..before)
+	own := make([dynamic]crdt.Op_Id, context.temp_allocator)
+	for id in before {
+		append(&own, fs.inode_op(m.history, id))
+	}
+	for id in alien {
+		append(&at, fs.op_inode(m.history, id))
+		append(&own, id)
+	}
+	text, terr := fs.history_text_at(m.history, e.inode, own[:], context.temp_allocator)
+	if terr != .None || string(text) != NV_BASE + NV_TOOL {
+		world_fail(w, "named forge: the forged version reads %q (%v), not the disk's text, so the arm proves nothing", string(text), terr)
+		return false
+	}
+	ver, verr := fs.shadow_version_add(&m.shadow, at[:])
+	if verr != .None {
+		world_fail(w, "named forge: version: %v", verr)
+		return false
+	}
+	e.ver = ver
+	return fs.shadow_put(&m.shadow, "a.txt", e) == .None
+}
+
+@(private = "file")
+_nv_rejected :: proc(w: ^World, n: ^Node, tree: eng.Object, arm: Named_Arm, crash_at: u64, agent: prim.Id, crashed: bool) {
+	sm := _nv_mount(n)
+	if sm == nil {
+		world_fail(w, "named rejected: no mount, at disk op %d", crash_at)
+		return
+	}
+	if !crashed && sm.m.fork_rejected != 1 {
+		world_fail(w, "named rejected: counted %d times, want 1, at disk op %d", sm.m.fork_rejected, crash_at)
+	}
+	b, berr := eng.tree_read(&n.e, tree, "b.txt", context.temp_allocator, {}, NV_FEATURE)
+	if berr != .None || strings.contains(string(b), NV_FOREIGN) {
+		world_fail(w, "named rejected: b.txt on the new line is %q (%v), at disk op %d", string(b), berr, crash_at)
+	}
+	mb, merr := eng.tree_read(&n.e, tree, "b.txt", context.temp_allocator, {}, "main")
+	if merr != .None || strings.count(string(mb), NV_FOREIGN) != 1 {
+		world_fail(w, "named rejected: b.txt on main is %q (%v), at disk op %d", string(mb), merr, crash_at)
+	}
+	names, _ := eng.tree_list(&n.e, tree, "", context.temp_allocator, {}, NV_FEATURE)
+	if len(names) != 3 {
+		world_fail(w, "named rejected: the new line lists %v, at disk op %d", names, crash_at)
+	}
+	a, aerr := eng.tree_read(&n.e, tree, "a.txt", context.temp_allocator, {}, NV_FEATURE)
+	n.disk.probe += 1
+	disk, _ := prim.read_file(disk_vfs(&n.disk), NV_ROOT + "/a.txt", context.temp_allocator)
+	n.disk.probe -= 1
+	if aerr != .None || string(a) != string(disk) {
+		world_fail(w, "named rejected: a.txt on disk is %q, on the new line %q (%v), at disk op %d", string(disk), string(a), aerr, crash_at)
+	}
+	if strings.count(string(a), NV_TOOL) != 1 {
+		return
+	}
+	want, _ := strings.replace_all(string(a), NV_TOOL, "", context.temp_allocator)
+	undo, uerr := eng.tree_revert_set(&n.e, tree, nil, []prim.Id{agent}, NV_FEATURE)
+	u, _ := eng.tree_read(&n.e, tree, "a.txt", context.temp_allocator, {}, NV_FEATURE)
+	if uerr != .None || string(u) != want {
+		world_fail(w, "named rejected: undo of the tool's turn leaves %q (%v), want %q, at disk op %d", string(u), uerr, want, crash_at)
+		return
+	}
+	_, derr := eng.tree_unrevert(&n.e, tree, undo, NV_FEATURE)
+	d, _ := eng.tree_read(&n.e, tree, "a.txt", context.temp_allocator, {}, NV_FEATURE)
+	if derr != .None || string(d) != string(a) {
+		world_fail(w, "named rejected: redo gives %q (%v), want %q, at disk op %d", string(d), derr, string(a), crash_at)
+	}
+}
+
+@(private = "file")
 _nv_named :: proc(n: ^Node) -> bool {
 	sm := _nv_mount(n)
 	if sm == nil || !fs.shadow_attached(&sm.m.shadow) {
@@ -495,9 +615,9 @@ named_version_crash :: proc(t: ^testing.T) {
 			testing.expect(t, arm.control || named > 0, fmt.tprintf("named_version_crash %v: no run had a named version in flight", arm))
 		}
 	}
-	for bits in ([]int{0, 1, 4, 5, 8, 9, 16, 17}) {
-		arm := Named_Arm{kind = .Checkout_New, process = bits & 1 != 0, control = bits >= 4 && bits < 16, clean = bits >= 8 && bits < 16, two = bits >= 16, fork_check = true}
-		if env_u64("NV_FORK", 0) == 2 && !arm.two {
+	for bits in ([]int{0, 1, 4, 5, 8, 9, 16, 17, 32, 33}) {
+		arm := Named_Arm{kind = .Checkout_New, process = bits & 1 != 0, control = bits >= 4 && bits < 16, clean = bits >= 8 && bits < 16, two = bits >= 16 && bits < 32, rejected = bits >= 32, fork_check = true}
+		if env_u64("NV_FORK", 0) == 2 && !arm.two && !arm.rejected {
 			continue
 		}
 		points, named, forked, bad := 0, 0, 0, 0
@@ -519,7 +639,7 @@ named_version_crash :: proc(t: ^testing.T) {
 			}
 			points += 1
 		}
-		fmt.eprintf("named_version_crash: fork process=%v control=%v clean=%v two=%v: points=%d named=%d forked=%d failed=%d\n", arm.process, arm.control, arm.clean, arm.two, points, named, forked, bad)
+		fmt.eprintf("named_version_crash: fork process=%v control=%v clean=%v two=%v rejected=%v: points=%d named=%d forked=%d failed=%d\n", arm.process, arm.control, arm.clean, arm.two, arm.rejected, points, named, forked, bad)
 		testing.expect(t, forked > 0, fmt.tprintf("named_version_crash fork %v: no run ended on the new line", arm))
 	}
 	for kind in Named_Kind {
