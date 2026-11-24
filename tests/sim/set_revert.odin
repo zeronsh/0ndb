@@ -120,6 +120,9 @@ _sr_write :: proc(c: ^Sr_Ctx, who: Sr_Who, name: string, lines: []string, remove
 	n := c.n
 	world_note(c.w, "set revert edit by %v: %s %s -> %v", who, "remove" if remove else "write", name, lines)
 	abs := strings.concatenate({SR_ROOT, "/", name}, context.temp_allocator)
+	if who == .P && !remove && rng_chance(&c.w.rng, 1, 2) {
+		return _sr_api_write(c, name, _sr_content(lines))
+	}
 	context = instance_context(&n.inst)
 	defer node_after(n)
 	scope: ^fs.Scope
@@ -154,6 +157,24 @@ _sr_write :: proc(c: ^Sr_Ctx, who: Sr_Who, name: string, lines: []string, remove
 		fs.mount_sync(c.sm.m)
 	}
 	return err == .None && !n.disk.dead
+}
+
+@(private = "file")
+_sr_api_write :: proc(c: ^Sr_Ctx, name: string, data: []u8) -> bool {
+	n := c.n
+	context = instance_context(&n.inst)
+	defer node_after(n)
+	fs.mount_sync(c.sm.m)
+	v, verr := eng.tree_version(&n.e, c.tree, "main", context.temp_allocator)
+	if verr != .None {
+		world_fail(c.w, "set revert: tree_version: %v", verr)
+		return false
+	}
+	if err := eng.tree_write(&n.e, c.tree, name, data, v); err != .None {
+		world_fail(c.w, "set revert: tree_write %s: %v", name, err)
+		return false
+	}
+	return !n.disk.dead
 }
 
 @(private = "file")
@@ -720,6 +741,70 @@ _sr_scenario :: proc(w: ^World) {
 	run_until(w, w.now + 2_000_000_000, true)
 	_sr_check(&c, nested, "nested")
 	_sr_accept(&c, "nested")
+}
+
+@(private = "file")
+_sr_adjacent :: proc(w: ^World, agent_set: bool) {
+	arena: virtual.Arena
+	if virtual.arena_init_growing(&arena, 1 << 20) != nil {
+		return
+	}
+	defer virtual.arena_destroy(&arena)
+	c, ok := _sr_setup(w, virtual.arena_allocator(&arena))
+	if !ok {
+		return
+	}
+	base := _sr_synced(&c)
+	lines := make([dynamic]string, context.temp_allocator)
+	append(&lines, ..c.model.files["a.txt"][:])
+	append(&lines, "<person>")
+	if !_sr_api_write(&c, "a.txt", _sr_content(lines[:])) {
+		return
+	}
+	run_until(w, w.now + 2_000_000_000, true)
+	append(&lines, "<agent>")
+	if !_sr_write(&c, .In, "a.txt", lines[:]) {
+		world_fail(w, "set revert adjacent: the agent's write failed")
+		return
+	}
+	run_until(w, w.now + 2_000_000_000, true)
+	_sr_synced(&c)
+	actor := c.actor[.In] if agent_set else c.n.e.self
+	_, rerr := _sr_revert(&c, base, actor)
+	if rerr != .None {
+		world_fail(w, "set revert adjacent: the revert failed: %v", rerr)
+		return
+	}
+	run_until(w, w.now + 2_000_000_000, true)
+	got := _sr_disk(&c)["a.txt"]
+	person, agent := strings.contains(got, "<person>"), strings.contains(got, "<agent>")
+	if person != agent_set || agent == agent_set {
+		world_fail(w, "set revert adjacent: reverting the %s's writes left the person's line %v and the agent's line %v: %q", "agent" if agent_set else "person", person, agent, got)
+	}
+}
+
+@(test)
+set_revert_adjacent :: proc(t: ^testing.T) {
+	if s, ok := os.lookup_env("SIM_SEED", context.temp_allocator); ok && len(s) > 0 {
+		return
+	}
+	test_begin(t)
+	defer test_end(t)
+	bad := 0
+	for agent_set in ([2]bool{true, false}) {
+		w := _sr_crash_world(1)
+		_sr_adjacent(w, agent_set)
+		for f in w.failures {
+			fmt.eprintf("set_revert_adjacent: %s\n", f)
+		}
+		if len(w.failures) > 0 {
+			bad += 1
+		}
+		world_destroy(w)
+		free(w)
+	}
+	fmt.eprintf("set_revert_adjacent: %d failed\n", bad)
+	testing.expect(t, bad == 0, fmt.tprintf("set_revert_adjacent: %d failures", bad))
 }
 
 @(test)
