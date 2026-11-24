@@ -37,6 +37,7 @@ Named_Arm :: struct {
 	control: bool,
 	clean:   bool,
 	edit:    bool,
+	fork_check: bool,
 }
 
 @(private = "file")
@@ -52,6 +53,7 @@ Named_Result :: struct {
 	edited:  bool,
 	wrong:   bool,
 	awake:   bool,
+	forked:  bool,
 	line:    string,
 }
 
@@ -183,6 +185,7 @@ _named_crash :: proc(w: ^World, arm: Named_Arm, crash_at: u64) -> (res: Named_Re
 	}
 	agent := prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng))
 	holder := prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng))
+	keeper := prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng))
 	pin: {
 		context = instance_context(&n.inst)
 		sm := _nv_mount(n)
@@ -201,7 +204,7 @@ _named_crash :: proc(w: ^World, arm: Named_Arm, crash_at: u64) -> (res: Named_Re
 			return
 		}
 		if !arm.control {
-			other := fs.scope_open(n.reg, sm.m, prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng)), prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng)))
+			other := fs.scope_open(n.reg, sm.m, prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng)), keeper)
 			fs.mount_observe_begin(sm.m, "a.txt", other)
 			_writer_set(w, n, NV_ROOT + "/a.txt", Writer_Info{scope = other, agent = true})
 			if err := _nv_write(vfs, NV_ROOT + "/a.txt", NV_BASE + NV_KEPT); err != .None {
@@ -304,6 +307,24 @@ _named_crash :: proc(w: ^World, arm: Named_Arm, crash_at: u64) -> (res: Named_Re
 			world_fail(w, "named: %v: %q appears %d times in a.txt on %s after an edit (%q), at disk op %d", arm, strings.trim_space(NV_TOOL), c, on, string(edata), crash_at)
 		}
 	}
+	if kind == .Checkout_New && arm.fork_check {
+		_nv_authors(w, n, tree, arm, crash_at, "main", agent, keeper)
+		if git_head_line(vfs, NV_ROOT) == NV_FEATURE {
+			res.forked = true
+			fdata, ferr := eng.tree_read(&n.e, tree, "a.txt", context.temp_allocator, {}, NV_FEATURE)
+			if ferr != .None {
+				world_fail(w, "named fork: %v: a.txt unreadable on the new line: %v, at disk op %d", arm, ferr, crash_at)
+			} else {
+				for line in ([]string{NV_BASE, NV_KEPT, NV_TOOL}) {
+					want := 0 if (arm.control && line == NV_KEPT) || (arm.clean && line == NV_TOOL) else 1
+					if c := strings.count(string(fdata), line); c != want {
+						world_fail(w, "named fork: %v: %q appears %d times in a.txt on the new line, want %d (%q), at disk op %d", arm, strings.trim_space(line), c, want, string(fdata), crash_at)
+					}
+				}
+				_nv_authors(w, n, tree, arm, crash_at, NV_FEATURE, agent, keeper)
+			}
+		}
+	}
 	if kind == .Checkout_Existing {
 		fdata, ferr := eng.tree_read(&n.e, tree, "a.txt", context.temp_allocator, {}, NV_FEATURE)
 		if c := strings.count(string(fdata), NV_OTHER); ferr != .None || c != 1 {
@@ -341,6 +362,34 @@ _nv_edit :: proc(w: ^World, n: ^Node) -> (edited: bool, wrong: bool, line: strin
 	edited = _nv_write(vfs, NV_ROOT + "/a.txt", strings.concatenate({string(have), NV_EDIT}, context.temp_allocator)) == .None
 	node_after(n)
 	return
+}
+
+@(private = "file")
+_nv_authors :: proc(w: ^World, n: ^Node, tree: eng.Object, arm: Named_Arm, crash_at: u64, line: string, agent: prim.Id, keeper: prim.Id) {
+	data, spans, err := eng.tree_blame(&n.e, tree, "a.txt", context.temp_allocator, line)
+	if err != .None {
+		world_fail(w, "named fork: %v: no blame for a.txt on %s: %v, at disk op %d", arm, line, err, crash_at)
+		return
+	}
+	Want :: struct {
+		text:  string,
+		actor: prim.Id,
+		skip:  bool,
+	}
+	for x in ([]Want{{NV_KEPT, keeper, arm.control}, {NV_TOOL, agent, arm.clean}}) {
+		at := strings.index(string(data), x.text)
+		if x.skip || at < 0 {
+			continue
+		}
+		pos := 0
+		for sp in spans {
+			if pos < at + len(x.text) && pos + sp.len > at && sp.id.actor != x.actor {
+				world_fail(w, "named fork: %v: %q on %s is credited to %s, not its writer %s, at disk op %d", arm, strings.trim_space(x.text), line, id_short(sp.id.actor), id_short(x.actor), crash_at)
+				break
+			}
+			pos += sp.len
+		}
+	}
 }
 
 @(private = "file")
@@ -385,6 +434,30 @@ named_version_crash :: proc(t: ^testing.T) {
 			fmt.eprintf("named_version_crash: %v process=%v early=%v control=%v clean=%v: points=%d named=%d ahead=%d failed=%d\n", kind, arm.process, arm.early, arm.control, arm.clean, points, named, ahead, bad)
 			testing.expect(t, arm.control || named > 0, fmt.tprintf("named_version_crash %v: no run had a named version in flight", arm))
 		}
+	}
+	for bits in ([]int{0, 1, 4, 5, 8, 9}) {
+		arm := Named_Arm{kind = .Checkout_New, process = bits & 1 != 0, control = bits >= 4, clean = bits >= 8, fork_check = true}
+		points, named, forked, bad := 0, 0, 0, 0
+		for k in u64(1) ..= 4000 {
+			failures, res := named_version_run(1, arm, k)
+			if len(failures) > 0 {
+				bad += 1
+			}
+			for f in failures {
+				fmt.eprintf("named_version_crash: %s\n", f)
+				delete(f)
+			}
+			testing.expect(t, len(failures) == 0, fmt.tprintf("named_version_crash fork %v at disk op %d failed", arm, k))
+			delete(failures)
+			named += 1 if res.named else 0
+			forked += 1 if res.forked else 0
+			if !res.crashed {
+				break
+			}
+			points += 1
+		}
+		fmt.eprintf("named_version_crash: fork process=%v control=%v clean=%v: points=%d named=%d forked=%d failed=%d\n", arm.process, arm.control, arm.clean, points, named, forked, bad)
+		testing.expect(t, forked > 0, fmt.tprintf("named_version_crash fork %v: no run ended on the new line", arm))
 	}
 	for kind in Named_Kind {
 		for process in ([]bool{false, true}) {
