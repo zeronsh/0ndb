@@ -5,3 +5,4 @@
 /sim
 *.log
 /bindings/rust/*/target/
+.xplat/
