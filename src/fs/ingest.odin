@@ -1588,11 +1588,19 @@ replay_departing :: proc(m: ^Mount, long: runtime.Allocator, out: ^Replayed) -> 
 				append(&out.paths, path)
 			}
 		}
+		if e.inode in out.inodes {
+			if named, found2 := shadow_get(&m.shadow, path) or_return; found2 && named.ver != 0 {
+				if ids, vok := shadow_version(&m.shadow, named); vok {
+					for id in ids {
+						append(&out.heads, inode_op(m.history, id))
+					}
+				}
+			}
+		}
 		if a, has := m.attrib[path]; has && !a.used && a.oid == cur {
 			attrib_set(m, path, a.actor, true, a.oid, a.scope, a.base)
 		}
 	}
-	append(&out.heads, ..q.rebased[:])
 	return .None
 }
 
