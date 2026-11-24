@@ -2653,7 +2653,7 @@ mount_recover :: proc(m: ^Mount) -> Error {
 			}
 			e := Entry{inode = ino, kind = info.kind}
 			if info.kind == .File {
-				recover_at(m, &e, p, ino, target, by_intent[:]) or_return
+				recover_at(m, &e, p, ino, target, by_intent[:], oe if had && oe.inode == ino else Entry{}, have[:]) or_return
 			}
 			shadow_put(&m.shadow, p, e) or_return
 		}
@@ -2710,7 +2710,7 @@ recover_orphan :: proc(m: ^Mount, p: string, e: Entry, ino: fstree.Inode_Id, int
 }
 
 @(private)
-recover_at :: proc(m: ^Mount, e: ^Entry, p: string, ino: fstree.Inode_Id, target: []crdt.Lv, intents: []Recovered_Intent) -> Error {
+recover_at :: proc(m: ^Mount, e: ^Entry, p: string, ino: fstree.Inode_Id, target: []crdt.Lv, intents: []Recovered_Intent, was: Entry, have: []crdt.Lv) -> Error {
 	h := m.history
 	d := probe(m, p) or_return
 	if d.kind != .File {
@@ -2739,6 +2739,32 @@ recover_at :: proc(m: ^Mount, e: ^Entry, p: string, ino: fstree.Inode_Id, target
 		e.oid = oid
 		mount_reshow_add(m, p)
 		return .None
+	}
+	if was.ver != 0 {
+		if ids, vok := shadow_version(&m.shadow, was); vok && len(ids) > 0 {
+			v := make([]crdt.Op_Id, len(ids), context.temp_allocator)
+			for id, i in ids {
+				v[i] = inode_op(h, id)
+			}
+			if t, terr := history_text_at(h, ino, v, context.temp_allocator); terr == .None && string(t) == string(data) {
+				e.ver = was.ver
+				e.stat = d.stat
+				e.oid = oid
+				mount_reshow_add(m, p)
+				return .None
+			}
+		}
+	}
+	held := crdt.graph_version_ids(&h.g, have, context.temp_allocator)
+	if t, terr := history_text_at(h, ino, held, context.temp_allocator); terr == .None && string(t) == string(data) {
+		at := make([]fstree.Op_Id, len(held), context.temp_allocator)
+		for id, i in held {
+			at[i] = op_inode(h, id)
+		}
+		e.ver = shadow_version_add(&m.shadow, at) or_return
+		e.stat = d.stat
+		e.oid = oid
+		mount_reshow_add(m, p)
 	}
 	return .None
 }
