@@ -490,6 +490,15 @@ _cmd_run :: proc(e: ^Engine, cmd: Command, st: ^Cmd_State) -> (res: Result, h: ^
 	switch c in cmd {
 	case Cmd_Send:
 		h = _convo_writable(e, c.object) or_return
+		if st.stage == 0 && !c.root && _handle_waiting(h) {
+			if cs, serr := convo_status(e, c.object); serr == .Missing || serr == .None && obj.rid_none(cs.head) {
+				return res, h, .Offline if _space_cut_off(e, h.sp) else .Missing
+			}
+		}
+		if st.stage == 0 && !c.root && obj.rid_none(c.parent) {
+			convo_moves_settle(e, c.object)
+			h = _convo_writable(e, c.object) or_return
+		}
 		if st.stage == 0 && (c.root || !obj.rid_none(c.parent)) && (c.role == convo.Role(0) || c.role == .User) {
 			pos := _cu_position(e, c.object) or_return
 			if c.root || pos != c.parent {
@@ -570,6 +579,9 @@ _cmd_run :: proc(e: ^Engine, cmd: Command, st: ^Cmd_State) -> (res: Result, h: ^
 		h = _convo_writable(e, c.object) or_return
 		move, leaf, x := _cu_switch(e, c.object, c.sibling)
 		err = .None if x == .Pending else x
+		if err == .Missing && _space_cut_off(e, h.sp) {
+			err = .Offline
+		}
 		res.leaf = leaf
 		res.move = move
 	case Cmd_Follow:

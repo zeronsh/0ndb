@@ -2014,6 +2014,12 @@ running on it is a record in it.
     position, with its cause and target), each switchable back with `redo`
     or `switch`. There is no leaf-only `back` and no per-turn `go_back` or
     `revert`; `follow` from a browsed position is a move to the tip first.
+    `undo`, `redo`, `regenerate` and `convo.undone` wait for a conversation
+    whose records are not on the device yet, and so does a `send` without a
+    parent when the device holds none of its messages (it would otherwise
+    start a new root); a send first follows any remote move. With the relay
+    out of reach they, and `switch`, answer `offline` at once, and on records
+    the device holds they act as usual.
 - **Undo** of turn T of A rewinds A's whole task tree to T's start, as a set
   revert (fs) per line plus leaf and session rewinds, driven by one staged
   record.
