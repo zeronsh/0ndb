@@ -1,5 +1,9 @@
 package api
 
+import "core:time"
+
+import "core:fmt"
+
 import "base:runtime"
 import "core:encoding/json"
 import "core:mem/virtual"
@@ -526,6 +530,7 @@ exec :: proc(c: ^Call, o: ^Out, cmd: eng.Command) -> Status {
 
 @(private)
 _complete :: proc(c: ^Call, st: Status, payload: []u8) {
+	fmt.eprintfln("TIMING complete %s %d", c.op.name if c.op != nil else "", time.tick_now()._nsec / 1000)
 	a := c.api
 	for x, i in a.calls {
 		if x == c {
