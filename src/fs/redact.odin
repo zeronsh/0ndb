@@ -145,7 +145,7 @@ replace_record :: proc(h: ^History, off: i64, spans: []crdt.Op_Span) -> Error {
 		if op.kind != .Opaque {
 			append(&inodes, op_inode(h, op.target))
 		}
-		if op.kind != .Insert {
+		if op.kind != .Insert && op.kind != .Insert_Carry {
 			continue
 		}
 		c := make([]u8, len(op.content), context.temp_allocator)
@@ -443,7 +443,7 @@ mount_redact_range :: proc(m: ^Mount, path: string, version: Version, from, to: 
 }
 
 @(private)
-apply_redact_record :: proc(h: ^History, body: []u8, preflight := false) -> Error {
+apply_redact_record :: proc(h: ^History, body: []u8, preflight := false, remote := false) -> Error {
 	h.redactions += 1
 	unreached: []odb.Unreached
 	defer if r := h.opts.redacted; r.call != nil {
@@ -470,18 +470,57 @@ apply_redact_record :: proc(h: ^History, body: []u8, preflight := false) -> Erro
 	if preflight {
 		redact_preflight(h, spans[:]) or_return
 	}
+	closure := make([dynamic]crdt.Op_Span, context.temp_allocator)
+	append(&closure, ..spans[:])
 	for sp in spans {
-		crdt.graph_redact(&h.g, sp.id.actor, sp.id.seq, sp.len)
+		crdt.graph_redact(&h.g, sp.id.actor, sp.id.seq, sp.len, &closure)
+	}
+	if remote {
+		owned_redacted(h, closure[:])
 	}
 	targets := make([dynamic]odb.Oid, context.temp_allocator)
 	protect := make([dynamic]odb.Oid, context.temp_allocator)
-	apply_redaction(h, spans[:], nil, &targets, &protect) or_return
+	apply_redaction(h, closure[:], nil, &targets, &protect) or_return
 	if h.db != nil && len(targets) > 0 {
 		unstage(h, targets[:], protect[:])
 		_, st, _ := odb.redact(h.db, targets[:], "refs/0ndb/", protect[:], true, context.temp_allocator)
 		unreached = st.unreached
 	}
 	return .None
+}
+
+@(private)
+owned_redacted :: proc(h: ^History, spans: []crdt.Op_Span) {
+	for sp in spans {
+		if history_owns(h, sp.id) {
+			append(&h.own_red, sp)
+		}
+	}
+}
+
+@(private)
+redact_cascade :: proc(h: ^History, spans: []crdt.Op_Span, remote: bool) -> Error {
+	if len(spans) == 0 {
+		return .None
+	}
+	if remote {
+		owned_redacted(h, spans)
+	}
+	targets := make([dynamic]odb.Oid, context.temp_allocator)
+	protect := make([dynamic]odb.Oid, context.temp_allocator)
+	apply_redaction(h, spans, nil, &targets, &protect) or_return
+	if h.db != nil && len(targets) > 0 {
+		unstage(h, targets[:], protect[:])
+		odb.redact(h.db, targets[:], "refs/0ndb/", protect[:], true, context.temp_allocator)
+	}
+	return .None
+}
+
+history_take_own_redactions :: proc(h: ^History, allocator := context.allocator) -> []crdt.Op_Span {
+	out := make([]crdt.Op_Span, len(h.own_red), allocator)
+	copy(out, h.own_red[:])
+	clear(&h.own_red)
+	return out
 }
 
 @(private)

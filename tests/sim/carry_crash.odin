@@ -167,10 +167,26 @@ _carry_crash :: proc(w: ^World, crash_at: u64) -> (crashed: bool) {
 	if string(data) != string(disk) {
 		world_fail(w, "carry: a.txt on main is %q, disk %q", string(data), string(disk))
 	}
+	at := 0
+	agent_bytes := 0
 	for sp in spans {
-		if sp.id.actor == agent {
-			world_fail(w, "carry: a.txt on main credits %d bytes git carried to the agent's scope %s", sp.len, id_short(agent))
+		text := data[at:][:sp.len]
+		line := "agent line\n"
+		lo := strings.index(string(data), line)
+		inside := lo >= 0 && at >= lo && at + sp.len <= lo + len(line)
+		if inside && sp.id.actor != agent {
+			world_fail(w, "carry: a.txt on main credits %q, which the agent wrote and git carried, to %s, not the agent %s (crash at disk op %d)", string(text), id_short(sp.id.actor), id_short(agent), crash_at)
 		}
+		if !inside && sp.id.actor == agent {
+			world_fail(w, "carry: a.txt on main credits %q, which the agent never wrote, to the agent %s (crash at disk op %d)", string(text), id_short(agent), crash_at)
+		}
+		if inside {
+			agent_bytes += sp.len
+		}
+		at += sp.len
+	}
+	if strings.contains(string(data), "agent line\n") && agent_bytes != len("agent line\n") {
+		world_fail(w, "carry: a.txt on main credits %d of the agent's %d carried bytes to it (crash at disk op %d)", agent_bytes, len("agent line\n"), crash_at)
 	}
 	return
 }

@@ -915,6 +915,13 @@ _cu_fill_actors :: proc(e: ^Engine, o: Object, convs: []Undo_Conv, lines: []conv
 		for a in oa {
 			add(&own, a)
 		}
+		la, lerr := fs.history_line_actors_of(th.hist, own[:], context.temp_allocator)
+		if lerr != .None {
+			return _ferr(lerr)
+		}
+		for a in la {
+			add(&own, a)
+		}
 		if len(mids) > 0 {
 			keys := make([dynamic]string, context.temp_allocator)
 			for x in lines {

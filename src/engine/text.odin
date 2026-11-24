@@ -807,8 +807,8 @@ _hist_catch_up :: proc(e: ^Engine, h: ^Handle) -> (blocked: bool) {
 				merge_scratch := virtual.arena_temp_begin(&e.temp)
 				_, aerr := fs.history_admit(hist, s.device, pos, owned)
 				virtual.arena_temp_end(merge_scratch)
-				if aerr == .None && len(owned) > 0 && owned[0] == fs.REC_REDACT {
-					_hist_redact_own(e, h, owned)
+				if aerr == .None {
+					_hist_redact_own(e, h, len(owned) > 0 && owned[0] == fs.REC_REDACT)
 				}
 				if aerr == .Not_Found {
 					blocked = true
@@ -843,23 +843,10 @@ _hist_redacted :: proc(data: rawptr, list: []odb.Unreached) {
 }
 
 @(private)
-_hist_redact_own :: proc(e: ^Engine, h: ^Handle, body: []u8) {
-	rd := prim.reader(body[1:])
-	n := prim.read_uvarint(&rd)
-	if n > u64(len(body)) {
+_hist_redact_own :: proc(e: ^Engine, h: ^Handle, record: bool) {
+	own := fs.history_take_own_redactions(h.hist, context.temp_allocator)
+	if len(own) == 0 && !record {
 		return
-	}
-	own := make([dynamic]crdt.Op_Span, context.temp_allocator)
-	for _ in 0 ..< n {
-		a := prim.read_id(&rd)
-		seq := prim.read_uvarint(&rd)
-		l := prim.read_uvarint(&rd)
-		if !prim.reader_ok(&rd) || l == 0 || l > crdt.MAX_RUN {
-			return
-		}
-		if a == e.self || fs.history_owns(h.hist, crdt.Op_Id{a, seq}) {
-			append(&own, crdt.Op_Span{crdt.Op_Id{a, seq}, int(l)})
-		}
 	}
 	if len(own) == 0 || !h.w_open {
 		_index_purge_object(e, h)
@@ -867,7 +854,7 @@ _hist_redact_own :: proc(e: ^Engine, h: ^Handle, body: []u8) {
 		return
 	}
 	ctx := Text_Plan{e = e, h = h}
-	res, err := fs.history_redact(h.hist, own[:], context.temp_allocator, _text_plan(&ctx))
+	res, err := fs.history_redact(h.hist, own, context.temp_allocator, _text_plan(&ctx))
 	for r in res.ranges {
 		_own_redacted(e, h, r.from, r.to)
 	}

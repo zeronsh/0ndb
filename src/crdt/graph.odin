@@ -246,7 +246,7 @@ graph_records :: proc "contextless" (g: ^Graph) -> int {
 	return n
 }
 
-graph_add :: proc(g: ^Graph, b: ^Batch) -> (first: Lv, skip: int, err: Error) {
+graph_add :: proc(g: ^Graph, b: ^Batch, redacted: ^[dynamic]Op_Span = nil) -> (first: Lv, skip: int, err: Error) {
 	n, copies := batch_check_ops(b) or_return
 	first, skip = graph_add_header(g, b.actor, b.seq, b.lamport, b.parents, n) or_return
 	if skip >= n || !copies {
@@ -257,9 +257,9 @@ graph_add :: proc(g: ^Graph, b: ^Batch) -> (first: Lv, skip: int, err: Error) {
 	for &op in b.ops {
 		lo := max(skip, o)
 		hi := o + op.len
-		if op.kind == .Insert_Copy && hi > lo {
+		if (op.kind == .Insert_Copy || op.kind == .Insert_Carry) && hi > lo {
 			k := lo - o
-			copy_register(g, Copy_Rec{src_seq = op.src.seq + u64(k), own_seq = b.seq + u64(lo), len = hi - lo, src = graph_intern(g, op.src.actor), own = own})
+			copy_register(g, Copy_Rec{src_seq = op.src.seq + u64(k), own_seq = b.seq + u64(lo), len = hi - lo, src = graph_intern(g, op.src.actor), own = own}, redacted)
 		}
 		o = hi
 	}
@@ -272,11 +272,11 @@ batch_check_ops :: proc(b: ^Batch) -> (n: int, copies: bool, err: Error) {
 		if op.len <= 0 || op.len > MAX_RUN || op.pos < -MAX_RUN || op.pos > MAX_POS {
 			return 0, false, .Invalid
 		}
-		if op.kind == .Insert && len(op.content) != op.len || op.kind == .Insert_Ref && (op.ref.offset < 0 || op.ref.offset > MAX_POS || op.ref.oid.len != 20 && op.ref.oid.len != 32) {
+		if (op.kind == .Insert || op.kind == .Insert_Carry) && len(op.content) != op.len || op.kind == .Insert_Ref && (op.ref.offset < 0 || op.ref.offset > MAX_POS || op.ref.oid.len != 20 && op.ref.oid.len != 32) {
 			return 0, false, .Invalid
 		}
-		copies ||= op.kind == .Insert_Copy
-		if op.kind == .Insert_Copy && op.src.seq >= MAX_COUNTER - u64(op.len) {
+		copies ||= op.kind == .Insert_Copy || op.kind == .Insert_Carry
+		if (op.kind == .Insert_Copy || op.kind == .Insert_Carry) && op.src.seq >= MAX_COUNTER - u64(op.len) {
 			return 0, false, .Invalid
 		}
 		n += op.len

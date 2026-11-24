@@ -206,11 +206,19 @@ apply_batch :: proc(t: ^testing.T, r: ^Replica, b: ^crdt.Batch, collect: bool) -
 	defer if use == &cut {
 		crdt.batch_destroy(&cut)
 	}
-	first, skip2, err2 := crdt.graph_add(&r.g, use)
+	cascade := make([dynamic]crdt.Op_Span)
+	defer delete(cascade)
+	first, skip2, err2 := crdt.graph_add(&r.g, use, &cascade)
 	testing.expect_value(t, err2, crdt.Error.None)
 	testing.expect_value(t, skip2, skip)
 	for f in 0 ..< FILES {
 		testing.expect_value(t, crdt.log_add_batch(&r.files[f].log, &r.g, use, target_of(f), first, skip), crdt.Error.None)
+	}
+	for a in cascade {
+		for &f in r.files {
+			crdt.log_redact(&f.log, &r.g, a.id.actor, a.id.seq, a.len)
+			crdt.text_redact(&f.text, &r.g, a.id.actor, a.id.seq, a.len)
+		}
 	}
 	for f in 0 ..< FILES {
 		file := &r.files[f]
@@ -562,6 +570,9 @@ local_edit :: proc(t: ^testing.T, rs: []Replica, who: int, rng: ^Rng) {
 					op.src = crdt.graph_id(&r.g, e.lv + k)
 					break
 				}
+			} else if r.seq >= u64(n) && chance(rng, 15) {
+				op.kind = .Insert_Carry
+				op.src = crdt.Op_Id{r.actor, u64(below(rng, int(r.seq) - n + 1))}
 			}
 			sizes[f] += n
 		} else if roll < 85 {
@@ -638,7 +649,12 @@ attack :: proc(t: ^testing.T, rs: []Replica, who: int, rng: ^Rng, counter: ^u64)
 			pos    = below(rng, 2 * size + 4),
 			len    = 1 + below(rng, 12),
 		}
-		switch below(rng, 4) {
+		switch below(rng, 5) {
+		case 4:
+			op.kind = .Insert_Carry
+			op.content = content[:op.len]
+			victim := &rs[below(rng, len(rs))]
+			op.src = crdt.Op_Id{victim.actor, u64(below(rng, int(victim.seq) + 8))}
 		case 3:
 			op.kind = .Insert_Copy
 			victim := &rs[below(rng, len(rs))]

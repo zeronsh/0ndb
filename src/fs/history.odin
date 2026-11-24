@@ -150,6 +150,7 @@ History :: struct {
 	on_offered: proc(data: rawptr, h: ^History, dest: fstree.Inode_Id, source: fstree.Inode_Id),
 	offered_data: rawptr,
 	markers:    [dynamic]Git_Marker,
+	own_red:    [dynamic]crdt.Op_Span,
 	views:      [dynamic]^Text_View,
 	scan:       Scan_Cache,
 }
@@ -535,6 +536,7 @@ history_wake :: proc(h: ^History) -> Error {
 	h.touched_set = make(map[fstree.Inode_Id]struct{}, h.allocator)
 	h.pins = make([dynamic]odb.Oid, h.allocator)
 	h.markers = make([dynamic]Git_Marker, h.allocator)
+	h.own_red = make([dynamic]crdt.Op_Span, h.allocator)
 	lp, _ := path_join(h.dir, "lv.idx", context.temp_allocator)
 	lfd, lerr := prim.open_file(h.vfs, lp, {.Write, .Create, .Group_Visible}, 0o600)
 	if lerr != .None {
@@ -809,6 +811,7 @@ history_sleep :: proc(h: ^History) {
 	delete(h.pins)
 	markers_clear(h)
 	delete(h.markers)
+	delete(h.own_red)
 	if h.blob_data != nil {
 		delete(h.blob_data, h.allocator)
 		h.blob_data = nil
@@ -1064,7 +1067,8 @@ import_valid :: proc(h: ^History, b: ^crdt.Batch) -> bool {
 
 @(private)
 import_apply :: proc(h: ^History, b: ^crdt.Batch, stream: u32, off: u64) -> Error {
-	first, _, aerr := crdt.graph_add(&h.g, b)
+	cascade := make([dynamic]crdt.Op_Span, context.temp_allocator)
+	first, _, aerr := crdt.graph_add(&h.g, b, &cascade)
 	if aerr != .None {
 		return .Corrupt
 	}
@@ -1098,7 +1102,7 @@ import_apply :: proc(h: ^History, b: ^crdt.Batch, stream: u32, off: u64) -> Erro
 			delete_key(&h.files, ino)
 		}
 	}
-	return .None
+	return redact_cascade(h, cascade[:], stream != 0)
 }
 
 history_commit_local :: proc(h: ^History, b: ^crdt.Batch, line: Maybe(string) = nil) -> (off: i64, err: Error) {
@@ -1418,7 +1422,7 @@ admit_record :: proc(h: ^History, stream: prim.Id, off: i64, body: []u8) -> (adm
 		return 0, history_persist(h)
 	}
 	if body[0] == REC_REDACT {
-		apply_redact_record(h, body, true) or_return
+		apply_redact_record(h, body, true, si != 0) or_return
 		if h.applied[si] < off + 1 {
 			h.applied[si] = off + 1
 		}
@@ -2009,7 +2013,8 @@ apply_batch :: proc(h: ^History, b: ^crdt.Batch, stream: u32, off: u64) -> Error
 		}
 		files[i] = f
 	}
-	first, skip, gerr := crdt.graph_add(&h.g, b)
+	cascade := make([dynamic]crdt.Op_Span, context.temp_allocator)
+	first, skip, gerr := crdt.graph_add(&h.g, b, &cascade)
 	if gerr != .None {
 		return .Corrupt
 	}
@@ -2035,6 +2040,7 @@ apply_batch :: proc(h: ^History, b: ^crdt.Batch, stream: u32, off: u64) -> Error
 		}
 		record_text_conflicts(h, ino, found[:]) or_return
 	}
+	redact_cascade(h, cascade[:], stream != 0) or_return
 	return offers_apply(h, b, spans)
 }
 
@@ -2299,7 +2305,7 @@ copy_read_depth :: proc(h: ^History, src: crdt.Op_Id, dst: []u8, authors: ^[dyna
 			k := rel - pos
 			avail := min(op.len - k, len(dst) - got)
 			#partial switch op.kind {
-			case .Insert:
+			case .Insert, .Insert_Carry:
 				copy(dst[got:got + avail], op.content[k:k + avail])
 				append(authors, crdt.Author_Span{id = id, op = id, len = avail})
 			case .Insert_Ref:
@@ -3132,6 +3138,8 @@ apply_actor_record :: proc(h: ^History, device: prim.Id, body: []u8) -> Error {
 	if la, base, lok := fshist.decode_line_actor_record(body, device); lok {
 		b := base
 		kv_put(&h.kv, fshist.actor_key(la), b[:]) or_return
+		kv_put(&h.kv, line_base_key(la), b[:]) or_return
+		line_actor_index(h, base, la) or_return
 		if owner, owned := history_owner_of(h, base); owned {
 			return owned_add(h, owner, la)
 		}
@@ -3147,6 +3155,68 @@ apply_actor_record :: proc(h: ^History, device: prim.Id, body: []u8) -> Error {
 		return .None
 	}
 	return owned_add(h, owner, a)
+}
+
+@(private)
+line_base_key :: proc(actor: prim.Id) -> []u8 {
+	k := make([]u8, 3 + 16, context.temp_allocator)
+	copy(k, "lb:")
+	a := actor
+	copy(k[3:], a[:])
+	return k
+}
+
+@(private)
+line_actors_key :: proc(base: prim.Id) -> []u8 {
+	k := make([]u8, 3 + 16, context.temp_allocator)
+	copy(k, "lB:")
+	a := base
+	copy(k[3:], a[:])
+	return k
+}
+
+@(private)
+line_actor_index :: proc(h: ^History, base, la: prim.Id) -> Error {
+	list, _ := kv_get(&h.kv, line_actors_key(base), context.temp_allocator) or_return
+	for i := 0; i + 16 <= len(list); i += 16 {
+		id: prim.Id
+		copy(id[:], list[i:][:16])
+		if id == la {
+			return .None
+		}
+	}
+	lb := make([dynamic]u8, 0, len(list) + 16, context.temp_allocator)
+	append(&lb, ..list)
+	x := la
+	append(&lb, ..x[:])
+	return kv_put(&h.kv, line_actors_key(base), lb[:])
+}
+
+history_line_actors_of :: proc(h: ^History, bases: []prim.Id, allocator := context.allocator) -> (out: []prim.Id, err: Error) {
+	history_ready(h) or_return
+	list := make([dynamic]prim.Id, allocator)
+	for b in bases {
+		v, found := kv_get(&h.kv, line_actors_key(b), context.temp_allocator) or_return
+		if !found {
+			continue
+		}
+		for i := 0; i + 16 <= len(v); i += 16 {
+			id: prim.Id
+			copy(id[:], v[i:][:16])
+			append(&list, id)
+		}
+	}
+	return list[:], .None
+}
+
+history_line_base :: proc(h: ^History, actor: prim.Id) -> prim.Id {
+	v, found, err := kv_get(&h.kv, line_base_key(actor), context.temp_allocator)
+	if err != .None || !found || len(v) != 16 {
+		return actor
+	}
+	base: prim.Id
+	copy(base[:], v)
+	return base
 }
 
 @(private)
