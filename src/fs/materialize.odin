@@ -659,6 +659,25 @@ mat_ancestors :: proc(m: ^Mount, abs: string) {
 }
 
 @(private)
+mat_real_dir :: proc(m: ^Mount, real: ^map[string]bool, abs: string) -> (ok: bool, err: Error) {
+	if len(abs) <= len(m.root) || abs[:len(m.root)] != m.root || abs[len(m.root)] != '/' {
+		return true, .None
+	}
+	if known, seen := real[abs]; seen {
+		return known, .None
+	}
+	if mat_real_dir(m, real, path_parent_abs(abs)) or_return {
+		st, serr := prim.lstat(m.vfs, abs)
+		if !gone(serr) {
+			from_prim(serr) or_return
+			ok = st.kind == .Dir
+		}
+	}
+	real[abs] = ok
+	return ok, .None
+}
+
+@(private)
 mat_barrier :: proc(m: ^Mount, ms: ^Mat_Sync) -> Error {
 	if len(ms.files) == 0 && len(ms.dirs) == 0 {
 		return .None
@@ -702,10 +721,14 @@ mat_barrier :: proc(m: ^Mount, ms: ^Mat_Sync) -> Error {
 		}
 		keep(m, &last, fd)
 	}
+	real := make(map[string]bool, context.temp_allocator)
 	dirs := sorted_strings(ms.dirs)
 	for d in dirs {
+		if !(mat_real_dir(m, &real, d) or_return) {
+			continue
+		}
 		fd, e := prim.open_file(m.vfs, d, {.Directory})
-		if e == .Not_Found {
+		if e == .Not_Found || e == .Not_Dir {
 			continue
 		}
 		from_prim(e) or_return
@@ -734,9 +757,13 @@ mat_writeout :: proc(m: ^Mount, ms: ^Mat_Sync) -> Error {
 		prim.close_file(m.vfs, fd)
 		from_prim(we) or_return
 	}
+	real := make(map[string]bool, context.temp_allocator)
 	for d in sorted_strings(ms.dirs) {
+		if !(mat_real_dir(m, &real, d) or_return) {
+			continue
+		}
 		fd, e := prim.open_file(m.vfs, d, {.Directory})
-		if e == .Not_Found {
+		if e == .Not_Found || e == .Not_Dir {
 			continue
 		}
 		from_prim(e) or_return
