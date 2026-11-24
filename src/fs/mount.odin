@@ -1199,11 +1199,11 @@ mount_mark :: proc(m: ^Mount, rel: string, scope: ^Scope = nil) {
 			}
 		}
 	}
-	if !explicit && !observer_installed(m.reg) {
+	if s == nil {
 		s = active_scope(m)
 	}
 	if v, ok := &m.dirty[rel]; ok {
-		if explicit || (!observer_installed(m.reg) && s != nil) {
+		if explicit || s != nil {
 			v^ = s
 		}
 	} else {
@@ -1312,6 +1312,10 @@ mount_mark_observed :: proc(m: ^Mount, rel: string, scope: ^Scope) {
 		mount_mark(m, rel)
 		return
 	}
+	scope := scope
+	if scope == nil {
+		scope = active_scope(m)
+	}
 	if v, ok := &m.open_scopes[rel]; ok {
 		v^ = scope
 	} else {
@@ -1325,6 +1329,10 @@ mount_mark_written :: proc(m: ^Mount, rel: string, scope: ^Scope) {
 	if path_internal(rel) {
 		mount_mark(m, rel)
 		return
+	}
+	scope := scope
+	if scope == nil {
+		scope = active_scope(m)
 	}
 	if v, ok := &m.dirty[rel]; ok {
 		v^ = scope
@@ -1953,7 +1961,9 @@ mount_sync :: proc(m: ^Mount) -> Error {
 }
 
 scope_open :: proc(reg: ^Registry, m: ^Mount, id: prim.Id, actor: prim.Id, pids: []prim.Pid = nil, since := Observe_Since{}) -> ^Scope {
-	if m != nil && len(m.dirty) > 0 {
+	if m != nil && since.mono == 0 && active_scope(m) == nil {
+		mount_sync(m)
+	} else if m != nil && len(m.dirty) > 0 {
 		_pass_before(m, since)
 	}
 	s := new(Scope, reg.allocator)
@@ -2059,6 +2069,13 @@ scope_retire_unwritten :: proc(m: ^Mount, s: ^Scope) {
 }
 
 @(private)
+mount_turn_owner :: proc(m: ^Mount, rel: string) -> (actor: prim.Id, scope: prim.Id, open: bool) {
+	if s := active_scope(m); s != nil {
+		return s.actor, s.id, true
+	}
+	return {}, {}, false
+}
+
 active_scope :: proc(m: ^Mount) -> ^Scope {
 	for i := len(m.reg.scopes) - 1; i >= 0; i -= 1 {
 		s := m.reg.scopes[i]
