@@ -1363,7 +1363,11 @@ op_git_switch :: proc(w: ^World, n: ^Node) {
 	if len(cands) == 0 {
 		return
 	}
-	sm := n.mounts[cands[rng_int(r, len(cands))]]
+	git_switch_run(w, n, n.mounts[cands[rng_int(r, len(cands))]])
+}
+
+git_switch_run :: proc(w: ^World, n: ^Node, sm: Sim_Mount, keep := "") {
+	r := &w.rng
 	if _, pending := fs.mount_switch_pending(sm.m); pending {
 		return
 	}
@@ -1382,20 +1386,20 @@ op_git_switch :: proc(w: ^World, n: ^Node) {
 		node_after(n)
 		return
 	}
-	force := rng_chance(r, 1, 4)
+	force := rng_chance(r, 1, 4) && keep == ""
 	dirty := git_dirty_paths(vfs, sm.root)
 	paths := TREE_PATHS
 	when_s := clock_wall(&n.clock) / 1_000_000_000
 	from_line := git_head_line(vfs, sm.root)
 	existing := git_branches_other(vfs, sm.root)
 	branch: string
-	if len(existing) > 0 && rng_chance(r, 1, 3) {
+	if len(existing) > 0 && rng_chance(r, 1, 3) && keep == "" {
 		branch = existing[rng_int(r, len(existing))]
 	} else {
 		files := make([dynamic]Git_File, context.temp_allocator)
 		removed := make([dynamic]string, context.temp_allocator)
 		for p in paths {
-			if !(rng_chance(r, 1, 2) || (force && dirty[p])) {
+			if !(rng_chance(r, 1, 2) || (force && dirty[p])) || (keep != "" && (p == keep || dirty[p])) {
 				continue
 			}
 			if rng_chance(r, 1, 6) && !(force && dirty[p]) {
@@ -1409,7 +1413,7 @@ op_git_switch :: proc(w: ^World, n: ^Node) {
 			}
 			append(&files, Git_File{name = p, data = transmute([]u8)strings.to_string(b)})
 		}
-		if len(files) == 0 && len(removed) == 0 {
+		if len(files) == 0 && len(removed) == 0 && keep == "" {
 			b := strings.builder_make(context.temp_allocator)
 			strings.write_string(&b, new_token(m, n, "s"))
 			strings.write_byte(&b, '\n')

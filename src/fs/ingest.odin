@@ -1833,6 +1833,7 @@ fork_version :: proc(m: ^Mount) -> (v: Version, err: Error) {
 		next := make([dynamic]crdt.Lv, context.temp_allocator)
 		crdt.version_union(&h.g, acc[:], x.lvs, &next)
 		acc = next
+		m.fork_named += 1
 	}
 	return crdt.graph_version_ids(&h.g, acc[:], context.temp_allocator), .None
 }
@@ -1840,9 +1841,9 @@ fork_version :: proc(m: ^Mount) -> (v: Version, err: Error) {
 @(private)
 fork_matches :: proc(m: ^Mount, line: Version) -> (same: bool, err: Error) {
 	h := m.history
-	rejected := m.fork_rejected
+	rejected, named := m.fork_rejected, m.fork_named
 	fork := fork_version(m) or_return
-	m.fork_rejected = rejected
+	m.fork_rejected, m.fork_named = rejected, named
 	fl := make([dynamic]crdt.Lv, context.temp_allocator)
 	ll := make([dynamic]crdt.Lv, context.temp_allocator)
 	sl := make([dynamic]crdt.Lv, context.temp_allocator)
