@@ -916,6 +916,7 @@ Redact_Scan :: struct {
 	ids:      [dynamic]string,
 	texts:    [dynamic]string,
 	complete: bool,
+	blobs:    bool,
 }
 
 redact_scan :: proc(v: ^obj.View, msg: Rid, allocator := context.allocator) -> (out: Redact_Scan, err: Error) {
@@ -995,11 +996,14 @@ redact_scan :: proc(v: ^obj.View, msg: Rid, allocator := context.allocator) -> (
 			break
 		}
 	}
+	blobs := complete
 	for d in damaged {
 		if refs[d.from] {
 			append(&own, d)
+			blobs = false
 		} else {
 			complete = false
+			blobs = false
 		}
 	}
 	slice_sort_redactions(own[:])
@@ -1013,6 +1017,7 @@ redact_scan :: proc(v: ^obj.View, msg: Rid, allocator := context.allocator) -> (
 	}
 	out.ranges = list[:]
 	out.complete = complete
+	out.blobs = blobs
 	return out, .None
 }
 
