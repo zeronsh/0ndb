@@ -982,6 +982,8 @@ _ferr :: proc "contextless" (e: fs.Error) -> Error {
 		return .Unsupported
 	case .Redacted:
 		return .Missing
+	case .Newer:
+		return .Newer
 	}
 	return .Io
 }

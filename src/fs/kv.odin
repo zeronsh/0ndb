@@ -8,6 +8,7 @@ import "../prim"
 
 KV_MAGIC :: u64(0x3267_6f6c_7662_6430)
 KV_MAGIC_V1 :: u64(0x3167_6f6c_7662_6430)
+KV_FAMILY :: u64(0x00ff_ffff_ffff_ffff)
 KV_IDX_MAGIC :: u64(0x3178_6469_7662_6430)
 KV_HEADER :: 4096
 KV_LOG_HEADER :: 16
@@ -799,6 +800,9 @@ kv_open_gen :: proc(kv: ^Kv) -> Error {
 		return from_prim(rerr)
 	}
 	magic := prim.get_u64le(hdr[0:8])
+	if got == KV_LOG_HEADER && magic & KV_FAMILY == KV_MAGIC & KV_FAMILY && magic > KV_MAGIC {
+		return .Newer
+	}
 	if got != KV_LOG_HEADER || (magic != KV_MAGIC && magic != KV_MAGIC_V1) {
 		return .Corrupt
 	}
