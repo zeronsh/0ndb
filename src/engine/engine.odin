@@ -4,7 +4,6 @@ import "base:runtime"
 import "core:mem/virtual"
 import "core:sync"
 import "core:thread"
-import "../convo"
 import dl "../dlog"
 import "../fs"
 import "../http"
@@ -97,23 +96,6 @@ Credentials_Source :: struct {
 	produce: proc(data: rawptr, space: prim.Id) -> (osync.Credentials, bool),
 }
 
-Purge_Request :: struct {
-	object:   Object,
-	msg:      Rid,
-	role:     convo.Role,
-	provider: string,
-	native:   string,
-	ids:      []string,
-	texts:    []string,
-	bodies:   []string,
-	claim:    Rid,
-}
-
-Purge_Hook :: struct {
-	data:  rawptr,
-	purge: proc(data: rawptr, e: ^Engine, req: ^Purge_Request),
-}
-
 Event_Kind :: enum u8 {
 	Connected,
 	Disconnected,
@@ -180,7 +162,6 @@ Config :: struct {
 	log:             Log,
 	spawner:         Spawner,
 	embedder:        search.Embedder,
-	purge:           Purge_Hook,
 	events:          Event_Hook,
 	http:            http.Client,
 	write_observer:  fs.Write_Observer,
@@ -394,7 +375,6 @@ Engine :: struct {
 	db:           odb.Odb,
 	db_open:      bool,
 	pack_more:    bool,
-	purged:       [dynamic]Rid,
 	redact_tick:  u64,
 	rlog:         Rlog,
 	dlog:         dl.Log,
@@ -456,7 +436,6 @@ open :: proc(e: ^Engine, cfg: Config, allocator := context.allocator) -> (err: E
 	e.waiters = make([dynamic]^Waiter, e.allocator)
 	e.space_waits = make([dynamic]Space_Wait, e.allocator)
 	e.held = make([dynamic]^Pending_Cmd, e.allocator)
-	e.purged = make([dynamic]Rid, e.allocator)
 	e.subs = make([dynamic]^Sub, e.allocator)
 	e.posted = make([dynamic]Posted, e.allocator)
 	e.post_swap = make([dynamic]Posted, e.allocator)
@@ -1118,7 +1097,6 @@ _teardown :: proc(e: ^Engine) {
 		_cmd_fail(e, p, .Closed)
 	}
 	delete(e.held)
-	delete(e.purged)
 	delete(e.waiters)
 	for &mw in e.move_waits {
 		_cu_free_reverts(e, &mw)
