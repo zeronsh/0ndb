@@ -1,5 +1,6 @@
 package sim
 
+import eng "../../src/engine"
 import "../../src/fs"
 import "../../src/prim"
 
@@ -42,35 +43,58 @@ _persist_outage_end :: proc(w: ^World, ev: ^Sim_Event) {
 	n := w.nodes[ev.node]
 	n.persist_outage = false
 	world_note(w, "%s history persists recover", n.name)
-	_check_node_cursors(w, n)
+	_check_node_cursors(w, n, false)
 }
 
 check_applied_cursors :: proc(w: ^World) {
 	for n in w.nodes {
-		_check_node_cursors(w, n)
+		_check_node_cursors(w, n, true)
 	}
 }
 
-_check_node_cursors :: proc(w: ^World, n: ^Node) {
+_check_node_cursors :: proc(w: ^World, n: ^Node, wake: bool) {
 	if !n.alive || n.disk.dead {
 		return
 	}
 	context = instance_context(&n.inst)
-	for id, h in n.e.handles {
-		if h.hist == nil || !h.hist.awake {
+	for id in prim.sorted_keys(n.e.handles) {
+		h := n.e.handles[id]
+		if !_checked_history(w, n, h, wake) {
 			continue
 		}
 		for s in h.segs {
 			if !s.in_view {
 				continue
 			}
-			off, gap, _ := fs.history_applied_gap(h.hist, s.device, &s.jr)
+			off, gap, gerr := fs.history_applied_gap(h.hist, s.device, &s.jr)
+			if gerr != .None && w.cfg.io_rate == 0 && !n.disk.dead {
+				world_fail(w, "%s history of %s: applied cursor of stream %s is unreadable at record %d: %v", n.name, id_short(id), id_short(s.device), off, gerr)
+			}
 			if gap {
 				world_fail(w, "%s history of %s: applied cursor of stream %s is past record %d, which is not in the graph", n.name, id_short(id), id_short(s.device), off)
 			}
 		}
 	}
 	node_after(n)
+}
+
+_checked_history :: proc(w: ^World, n: ^Node, h: ^eng.Handle, wake: bool) -> bool {
+	if h.hist == nil {
+		return false
+	}
+	if h.hist.awake {
+		return true
+	}
+	if !wake {
+		return false
+	}
+	if err := fs.history_wake(h.hist); err != .None {
+		if w.cfg.io_rate == 0 && !n.disk.dead {
+			world_fail(w, "%s history of %s does not wake for the final checks: %v", n.name, id_short(h.id), err)
+		}
+		return false
+	}
+	return true
 }
 
 check_actor_owners :: proc(w: ^World) {
@@ -89,8 +113,9 @@ check_actor_owners :: proc(w: ^World) {
 			continue
 		}
 		context = instance_context(&n.inst)
-		for id, h in n.e.handles {
-			if h.hist == nil || !h.hist.awake {
+		for id in prim.sorted_keys(n.e.handles) {
+			h := n.e.handles[id]
+			if !_checked_history(w, n, h, true) {
 				continue
 			}
 			out := make([dynamic]prim.Id, context.temp_allocator)
@@ -105,10 +130,10 @@ check_actor_owners :: proc(w: ^World) {
 	}
 }
 
-sim_scope_open :: proc(w: ^World, reg: ^fs.Registry, m: ^fs.Mount, id: prim.Id, actor: prim.Id) -> ^fs.Scope {
+sim_scope_open :: proc(w: ^World, reg: ^fs.Registry, m: ^fs.Mount, id: prim.Id, actor: prim.Id, since := fs.Observe_Since{}) -> ^fs.Scope {
 	if w.scope_actors == nil {
 		w.scope_actors = make(map[prim.Id]bool, w.allocator)
 	}
 	w.scope_actors[actor] = true
-	return fs.scope_open(reg, m, id, actor)
+	return fs.scope_open(reg, m, id, actor, nil, since)
 }
