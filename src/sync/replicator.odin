@@ -186,6 +186,7 @@ Local :: struct {
 	trim_at:   i64,
 	trim_sent: i64,
 	trim_wait: bool,
+	trim_above: bool,
 	rst_on:    bool,
 	rst_of:    Stream_Id,
 }
@@ -1398,6 +1399,10 @@ replicator_restored :: proc(r: ^Replicator, id: Stream_Id, err: Error) {
 
 @(private)
 _local_recheck_start :: proc(r: ^Replicator, l: ^Local) {
+	if l.recheck < l.arc_sealed {
+		_local_recheck_archive(r, l)
+		return
+	}
 	l.verifying = true
 	l.checking = true
 	l.beyond = false
@@ -1405,6 +1410,22 @@ _local_recheck_start :: proc(r: ^Replicator, l: ^Local) {
 	l.verify_to = min(l.cursor, l.recheck + UPLOAD_CHUNK)
 	clear(&l.verify)
 	client_read(&r.client, l.id, l.verify_at, l.verify_to)
+}
+
+@(private)
+_local_recheck_archive :: proc(r: ^Replicator, l: ^Local) {
+	at := l.recheck
+	l.recheck = -1
+	theirs, ok := _arc_own_records(r, l, at, min(l.cursor, at + UPLOAD_CHUNK))
+	if !ok {
+		_local_fatal(r, l, .Corrupt, -1)
+		_local_checked(r, l)
+		return
+	}
+	if !_local_repair(r, l, theirs, at, true) {
+		_local_checked(r, l)
+		_local_pump(r, l)
+	}
 }
 
 @(private)
@@ -1437,7 +1458,7 @@ _local_checked :: proc(r: ^Replicator, l: ^Local) {
 }
 
 @(private)
-_local_repair :: proc(r: ^Replicator, l: ^Local, theirs: []u8, base: i64) -> (held: bool) {
+_local_repair :: proc(r: ^Replicator, l: ^Local, theirs: []u8, base: i64, archived := false) -> (held: bool) {
 	if l.fd < 0 {
 		l.fd, _ = prim.open_file(r.vfs, l.path)
 	}
@@ -1463,6 +1484,11 @@ _local_repair :: proc(r: ^Replicator, l: ^Local, theirs: []u8, base: i64) -> (he
 				kind := journal.classify(raw[pos:][:ln], off)
 				valid = kind == .Plain || kind == .Redacted
 				same = ln == n && _ct_eq(raw[pos:][:n], theirs[pos:][:n])
+				if archived && valid && !same && ln == n {
+					if body, berr := journal.record_body(theirs[pos:][:n]); berr == .None && journal.is_sig(body) {
+						same = true
+					}
+				}
 				if valid && !same && kind != .Redacted && journal.classify(theirs[pos:][:n], off) != .Redacted {
 					_local_fatal(r, l, .Conflict, off)
 					return true
@@ -2761,9 +2787,9 @@ _on_event :: proc(user: rawptr, ev: ^Event) -> Error {
 	case .Direct, .Undelivered:
 		_on_direct_event(r, ev)
 	case .Noted:
-		if !_arc_trim_reply(r, Stream_Id(ev.id), false) {
+		if !_arc_trim_reply(r, Stream_Id(ev.id), false, ev.base) {
 			_on_noted(r, ev)
-			_arc_trim_resume(r, Stream_Id(ev.id))
+			_arc_trim_resume(r, Stream_Id(ev.id), ev.base)
 		}
 	case .Hollow:
 		_on_hollow(r, ev)
@@ -3022,6 +3048,7 @@ _repl_reset_state :: proc(r: ^Replicator) {
 		if l.arc_child {
 			l.trim_sent = 0
 			l.trim_wait = false
+			l.trim_above = false
 		}
 	}
 	clear(&r.trims)

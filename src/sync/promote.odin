@@ -198,6 +198,27 @@ _promote_on_refused :: proc(r: ^Replicator, id: Stream_Id, code: Code) -> bool {
 }
 
 @(private)
+_own_sealed :: proc(r: ^Replicator, p: ^Promotion) -> i64 {
+	if !p.own {
+		return 0
+	}
+	if l, has := r.locals[p.id]; has {
+		return l.arc_sealed
+	}
+	pbuf: prim.Path_Buf = ---
+	fd, err := prim.open_file(r.vfs, _floor_path(r, &pbuf, p.id))
+	if err != .None {
+		return 0
+	}
+	defer prim.close_file(r.vfs, fd)
+	newest, _, count, serr := slots_read(r.vfs, fd)
+	if serr != .None || count == 0 {
+		return 0
+	}
+	return newest.start
+}
+
+@(private)
 _promotion_done :: proc(r: ^Replicator, p: ^Promotion, ok: bool) {
 	p.state = .Done
 	_emit(r, Repl_Event{kind = .Promoted, err = .None if ok else .Refused, device = p.device, name = p.name, epoch = p.epoch, stream = p.id, from = p.base, to = p.length, length = p.uploaded})
@@ -240,7 +261,8 @@ _promote_step :: proc(r: ^Replicator, p: ^Promotion) {
 		_promotion_done(r, p, true)
 		return
 	}
-	if l, has := r.locals[p.id]; has && p.own && l.arc_sealed > 0 && p.base <= l.arc_sealed {
+	sealed := _own_sealed(r, p)
+	if sealed > 0 && p.base <= sealed {
 		_promotion_done(r, p, true)
 		return
 	}
@@ -253,12 +275,12 @@ _promote_step :: proc(r: ^Replicator, p: ^Promotion) {
 		return
 	}
 	defer prim.close_file(r.vfs, fd)
-	start, ok := _back_span(r, fd, p, p.base, max(p.target, p.base - FILL_CHUNK))
+	start, ok := _back_span(r, fd, p, p.base, max(p.target, p.base - FILL_CHUNK, sealed))
 	if !ok || start >= p.base {
 		_promotion_done(r, p, false)
 		return
 	}
-	if l, has := r.locals[p.id]; has && start < l.arc_sealed {
+	if start < sealed {
 		_promotion_done(r, p, true)
 		return
 	}
