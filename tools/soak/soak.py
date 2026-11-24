@@ -376,8 +376,13 @@ class Soak:
             return False
         return True
 
-    def fail(self, kind, msg):
-        self.findings.append(dict(kind=kind, step=self.steps, t=round(time.time() - self.t0, 1), msg=msg))
+    def fail(self, kind, msg, cls=None):
+        for f in self.findings:
+            if cls and f.get("cls") == cls:
+                f["count"] += 1
+                self.note(finding=kind, cls=cls, msg=msg)
+                return
+        self.findings.append(dict(kind=kind, step=self.steps, t=round(time.time() - self.t0, 1), msg=msg, cls=cls, count=1))
         self.note(finding=kind, msg=msg)
         print("FINDING step %d %s: %s" % (self.steps, kind, msg), flush=True)
 
@@ -418,6 +423,21 @@ class Soak:
             self.nodes[parent].children.append(rid)
         return n
 
+    def wait_position(self, what, want):
+        t = now()
+        st = {}
+        while now() - t < 30:
+            st = self.c.call("convo.status", object=self.obj)
+            if st.get("position") == want:
+                self.lat.setdefault(what + " position lag", []).append(now() - t)
+                return True
+            time.sleep(0.01)
+        got = st.get("position")
+        self.fail("position", "%s: the position is %s 30 s later, the model expected %s" % (what, got, want))
+        if got in self.nodes or got is None:
+            self.position = got
+        return False
+
     def path(self):
         out, r = [], self.position
         while r:
@@ -427,12 +447,14 @@ class Soak:
 
     def turn(self, parent=None, root=False, op="turn"):
         writes = self.plan(op)
-        base = self.nodes[parent].state if parent else {}
         args = dict(object=self.obj, text="soak %s %d" % (op, self.steps))
         if parent:
             args["parent"] = parent
         elif root:
             args["root"] = True
+        else:
+            parent = self.position
+        base = self.nodes[parent].state if parent else {}
         t = now()
         r = self.timed(op + " send", self.c.call, "send", **args)
         user = r["item"]
@@ -441,6 +463,7 @@ class Soak:
         self.lat.setdefault(op + " to seal", []).append(now() - t)
         self.add(reply, "assistant", user, self.apply(base, writes))
         self.position = reply
+        self.wait_position(op, reply)
         self.check(op)
 
     def regenerate(self):
@@ -456,6 +479,7 @@ class Soak:
         self.lat.setdefault("regenerate", []).append(now() - t)
         self.add(reply, "assistant", u, self.apply(self.nodes[u].state, writes))
         self.position = reply
+        self.wait_position("regenerate", reply)
         self.check("regenerate of %s" % u)
 
     def edit(self):
@@ -509,24 +533,32 @@ class Soak:
         u = self.rng.choice(users[-3:])
         before = self.position
         res = self.timed("undo", self.c.call, "undo", object=self.obj, msg=u)
-        self.undos.append((res.get("undo"), before))
+        self.undos.append((res.get("undo"), before, u))
         self.position = self.nodes[u].parent
-        st = self.c.call("convo.status", object=self.obj)
-        if st.get("position") != self.position:
-            self.fail("position", "undo of %s left the position at %s, the model expected %s" % (u, st.get("position"), self.position))
+        self.wait_position("undo", self.position)
         self.check("undo of %s" % u)
 
     def redo(self):
         if not self.undos:
             return self.undo()
-        uid, back = self.undos.pop()
+        uid, back, u = self.undos.pop()
         self.timed("redo", self.c.call, "redo", object=self.obj, undo=uid)
-        self.position = back
-        st = self.c.call("convo.status", object=self.obj)
+        st, t = {}, now()
+        while now() - t < 5 and st.get("position") != back:
+            st = self.c.call("convo.status", object=self.obj)
+            time.sleep(0.01)
         if st.get("position") != back:
-            self.fail("position", "redo of %s left the position at %s, the model expected %s" % (uid, st.get("position"), back))
-            if st.get("position") in self.nodes:
-                self.position = st.get("position")
+            tip = st.get("position")
+            self.settle()
+            self.position = back
+            held = self.disk() == self.expected()
+            self.fail("position", "redo of %s left the position at %s after 5 s, the model expected %s; the disk %s the redone files" % (uid, tip, back, "holds" if held else "does not hold"), "redo-position")
+            self.position = self.newest_leaf(u)
+            self.c.call("switch", object=self.obj, sibling=u)
+            self.wait_position("resync", self.position)
+            self.check("resync after redo")
+            return
+        self.position = back
         self.check("redo")
 
     def person_edit(self):
@@ -689,7 +721,7 @@ def main():
     json.dump(dict(summary=summary, minutes=s.minute), open(os.path.join(s.dir, "soak.json"), "w"), indent=1)
     print("soak %s seed %d: %d steps over %.0f min, %d messages, %d findings" % (sys.platform, args.seed, s.steps, args.minutes, len(s.nodes), len(s.findings)))
     for f in s.findings:
-        print("  %s at step %d (%.0f s): %s" % (f["kind"], f["step"], f["t"], f["msg"]))
+        print("  %s at step %d (%.0f s)%s: %s" % (f["kind"], f["step"], f["t"], " x%d" % f["count"] if f["count"] > 1 else "", f["msg"]))
     print("result: %s (log %s)" % ("PASS" if not s.findings else "FAIL", os.path.join(s.dir, "steps.jsonl")))
     if not args.keep and not s.findings:
         shutil.rmtree(s.dir, ignore_errors=True)
