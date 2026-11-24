@@ -43,6 +43,7 @@ Named_Edit_Result :: struct {
 	typed: bool,
 	events: u64,
 	conflict: bool,
+	torn_save: bool,
 }
 
 named_edit_run :: proc(seed: u64, arm: Named_Edit_Arm, crash_at: u64 = 0) -> (failures: [dynamic]string, res: Named_Edit_Result) {
@@ -283,6 +284,10 @@ _named_edit :: proc(w: ^World, arm: Named_Edit_Arm, crash_at: u64) -> (res: Name
 	shown, _ := prim.read_file(vfs, NV_ROOT + "/a.txt", context.temp_allocator)
 	n.disk.probe -= 1
 
+	if crash_at > 0 && !arm.atomic && len(shown) == 0 {
+		res.torn_save = true
+		return
+	}
 	edited := crash_at == 0 || strings.contains(string(shown), NV_EDIT)
 	if !edited && strings.contains(string(data), NV_EDIT) {
 		world_fail(w, "named edit: %v: the line has an edit the disk does not (%q, disk %q), at disk op %d", arm, string(data), string(shown), crash_at)
@@ -349,7 +354,7 @@ named_version_edit :: proc(t: ^testing.T) {
 		process := bits & 2 != 0
 		sweep: {
 			arm := Named_Edit_Arm{elsewhere = true, edit = true, named = true, more = more, process = process, atomic = bits & 4 != 0}
-			points, typed, bad := 0, 0, 0
+			points, typed, bad, torn := 0, 0, 0, 0
 			events: u64
 			for k in u64(1) ..= 3000 {
 				failures, res := named_edit_run(1, arm, k)
@@ -359,6 +364,7 @@ named_version_edit :: proc(t: ^testing.T) {
 				}
 				bad += 1 if len(failures) > 0 else 0
 				typed += 1 if res.typed else 0
+				torn += 1 if res.torn_save else 0
 				events = max(events, res.events)
 				delete(failures)
 				if !res.crashed {
@@ -366,7 +372,7 @@ named_version_edit :: proc(t: ^testing.T) {
 				}
 				points += 1
 			}
-			fmt.eprintf("named_version_edit: crash more=%v process=%v atomic=%v: points=%d typed_after=%d failed=%d most event actors=%d\n", more, process, arm.atomic, points, typed, bad, events)
+			fmt.eprintf("named_version_edit: crash more=%v process=%v atomic=%v: points=%d typed_after=%d failed=%d torn_nonatomic_save=%d most event actors=%d\n", more, process, arm.atomic, points, typed, bad, torn, events)
 			testing.expect(t, bad == 0, fmt.tprintf("named_version_edit crash more=%v process=%v failed", more, process))
 			testing.expect(t, !more || arm.atomic || typed > 0, "named_version_edit: nobody typed after a crash")
 		}
