@@ -47,3 +47,9 @@ many seconds after its writes; a control, never a pass on its own),
 `RB_PYTHON` (the interpreter the turns run `rbop.py` with). Each failing run
 leaves `repro.json` and the daemon, host and relay logs in its directory;
 `results.json` holds every step.
+
+On Windows set `RB_COSTBENCH` to `tools/revertbench/winbench` and
+`RB_COSTBENCH_REAL` to `tools/costbench`: the shim drops the bash wrapper,
+puts the run in a job object (4 GB per process, children die with it),
+connects to the daemon's unix socket through winsock and kills processes
+instead of signalling them.

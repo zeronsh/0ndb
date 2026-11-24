@@ -405,7 +405,7 @@ def restart(dev):
     sock = os.path.join(nd.dir, nd.home, "run", "daemon.sock")
     for _ in range(200):
         time.sleep(0.05)
-        if os.path.exists(sock):
+        if os.path.lexists(sock):
             break
     time.sleep(0.2)
     nd.host = H.spawn([H.BIN, "host", "--home", nd.home, "--plugs", "sealed_store,unlock", "--store", nd.home + ".store", "--passkey", nd.home + ".pk"], nd.dir, nd.home + ".host.log", nd.env, mode="a")
@@ -417,7 +417,7 @@ def kill9(dev):
     for p in (dev.daemon, dev.host):
         try:
             if WIN:
-                subprocess.run(["taskkill", "/F", "/T", "/PID", str(p.pid)], capture_output=True)
+                p.kill()
             else:
                 os.killpg(p.pid, signal.SIGKILL)
             p.wait(timeout=10)
