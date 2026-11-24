@@ -451,7 +451,7 @@ Mount :: struct {
 	mat_fast:    bool,
 	dirty:       map[string]^Scope,
 	dirty_at:    map[string]i64,
-	closed:      map[string]bool,
+	closed:      map[string]i64,
 	young_sig:   map[string][2]i64,
 	rescan:      bool,
 	git_moved:   bool,
@@ -665,7 +665,7 @@ mount_open :: proc(m: ^Mount, reg: ^Registry, h: ^History, db: ^odb.Odb, id: pri
 	m.synced = make([dynamic]crdt.Op_Id, allocator)
 	m.dirty = make(map[string]^Scope, allocator)
 	m.dirty_at = make(map[string]i64, allocator)
-	m.closed = make(map[string]bool, allocator)
+	m.closed = make(map[string]i64, allocator)
 	m.young_sig = make(map[string][2]i64, allocator)
 	m.open_scopes = make(map[string]^Scope, allocator)
 	m.fences = make([dynamic]Fence, allocator)
@@ -1229,6 +1229,14 @@ Observe_Since :: struct {
 	wall: i64,
 }
 
+mount_since :: proc(m: ^Mount, age: i64) -> Observe_Since {
+	mono := mount_mono_ns(m)
+	if mono == 0 {
+		return {}
+	}
+	return {mono = mono - age, wall = history_wall_ns(m.history) - age}
+}
+
 @(private)
 mount_mono_ns :: proc(m: ^Mount) -> i64 {
 	if m.history != nil && m.history.opts.clock.mono_ns != nil {
@@ -1257,8 +1265,9 @@ dirty_at_drop :: proc(m: ^Mount, rel: string) {
 @(private)
 _pass_before :: proc(m: ^Mount, since: Observe_Since) -> Error {
 	Kept :: struct {
-		key: string,
-		at:  i64,
+		key:    string,
+		at:     i64,
+		closed: i64,
 	}
 	kept := make([dynamic]Kept, context.temp_allocator)
 	if since.mono != 0 {
@@ -1268,7 +1277,7 @@ _pass_before :: proc(m: ^Mount, since: Observe_Since) -> Error {
 			}
 			v := m.dirty[k]
 			if at, ok := m.dirty_at[k]; ok && v == nil && at >= since.mono {
-				append(&kept, Kept{k, at})
+				append(&kept, Kept{k, at, m.closed[k] or_else 0})
 			}
 		}
 	}
@@ -1287,6 +1296,10 @@ _pass_before :: proc(m: ^Mount, since: Observe_Since) -> Error {
 			m.dirty[x.key] = nil
 		}
 		dirty_at_note(m, x.key, x.at)
+		if x.closed != 0 && x.key not_in m.closed {
+			k, _ := clone_string(x.key, m.allocator)
+			m.closed[k] = x.closed
+		}
 	}
 	if len(kept) > 0 {
 		mount_schedule(m, m.opts.settle_ms)
@@ -1312,6 +1325,14 @@ mount_mark_observed :: proc(m: ^Mount, rel: string, scope: ^Scope) {
 	} else {
 		k, _ := clone_string(rel, m.allocator)
 		m.open_scopes[k] = scope
+	}
+	mount_mark_written(m, rel, scope)
+}
+
+mount_mark_written :: proc(m: ^Mount, rel: string, scope: ^Scope) {
+	if path_internal(rel) {
+		mount_mark(m, rel)
+		return
 	}
 	if v, ok := &m.dirty[rel]; ok {
 		v^ = scope
@@ -1343,9 +1364,11 @@ _observe_begin :: proc(m: ^Mount, rel: string, scope: ^Scope, since: Observe_Sin
 	pending, dirty := m.dirty[rel]
 	other := dirty && pending != scope
 	owned := attributed && !a.used && a.actor == scope.actor
+	claimed := false
 	if other && pending == nil && since.mono != 0 {
 		if at, marked := m.dirty_at[rel]; marked && at >= since.mono {
 			other = false
+			claimed = true
 			m.dirty[rel] = scope
 			dirty_at_drop(m, rel)
 		}
@@ -1354,12 +1377,12 @@ _observe_begin :: proc(m: ^Mount, rel: string, scope: ^Scope, since: Observe_Sin
 		other = !_written_since(m, rel, since)
 		pending = nil
 	}
-	if stale || other {
+	if other || (stale && !claimed) {
 		if o := m.open_scopes[rel]; o != nil && o != scope {
 			m.open_scopes[rel] = nil
 		}
 		mount_mark_observed(m, rel, pending if other else nil)
-		if perr := mount_pass(m, false); perr != .None {
+		if perr := _pass_before(m, since); perr != .None {
 			return false, perr
 		}
 	}
@@ -1369,7 +1392,12 @@ _observe_begin :: proc(m: ^Mount, rel: string, scope: ^Scope, since: Observe_Sin
 			delete(key, m.allocator)
 		}
 	}
-	if v, ok := &m.open_scopes[rel]; ok {
+	if at, closed := m.closed[rel]; closed && since.mono != 0 && at >= since.mono && m.dirty[rel] == scope {
+		if rel in m.open_scopes {
+			k, _ := delete_key(&m.open_scopes, rel)
+			delete(k, m.allocator)
+		}
+	} else if v, ok := &m.open_scopes[rel]; ok {
 		v^ = scope
 	} else {
 		k, _ := clone_string(rel, m.allocator)
@@ -1634,10 +1662,12 @@ mount_closed :: proc(m: ^Mount, rel: string) {
 		k, _ := delete_key(&m.open_scopes, rel)
 		delete(k, m.allocator)
 	}
-	if rel in m.dirty && rel not_in m.closed && active_scope(m) == nil {
+	if rel in m.dirty && rel not_in m.closed {
 		k, _ := clone_string(rel, m.allocator)
-		m.closed[k] = true
-		mount_schedule(m, 0)
+		m.closed[k] = mount_mono_ns(m)
+		if active_scope(m) == nil {
+			mount_schedule(m, 0)
+		}
 	}
 	a, ok := m.attrib[rel]
 	if !ok || a.used || m.db == nil {

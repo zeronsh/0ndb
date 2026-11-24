@@ -72,6 +72,8 @@
   same shell (`ulimit -v 4000000; <cmd>`, raise only with a reason) and a
   `timeout`. The machine has 16 GB shared with the agent host; an uncapped
   runaway gets the whole session killed.
+  A daemon that runs Codex takes its cap as RLIMIT_DATA
+  (`ulimit -d 12000000`): V8's code-mode host dies under `ulimit -v`.
 - A sim feature lives in its own file under `tests/sim` and plugs in
   through `hooks.odin` from an `@(init) proc "contextless"` there:
   `register_final_check`, `register_restarted`, `register_stat_line` and
