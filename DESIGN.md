@@ -2176,7 +2176,11 @@ live runner by default:
   `offline` or `wakeable` (a member pool whose host can start or resume a
   runner), providers installed and signed in, and whether it is the
   conversation's current or last runner. Pushed on advert, presence and
-  placement changes; nothing polls.
+  placement changes; nothing polls. Whether a provider's CLI is installed is found by
+  resolving its executable on the device's PATH; the answer is kept per
+  provider for 30 s on the engine clock and reused by placement, the runner
+  check and the advert, so a send does not search PATH for every provider
+  (PATH and PATHEXT made that tens of milliseconds per send on Windows).
 - **Not signed in.** A runner checks a harness provider's sign-in (its auth
   env or auth files) when a run begins: a provider that is not signed in on
   this device fails the run at once with an error block named
