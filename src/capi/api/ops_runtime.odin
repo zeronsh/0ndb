@@ -44,6 +44,8 @@ RUNTIME_OPS := []Op {
 	{175, "redo", {OBJ, {"undo", .Id, nil}}, "undo:id done:bool", op_redo},
 	{176, "undo.resume", {OBJ}, "resumed:uvarint", op_undo_resume},
 	{177, "regenerate", {OBJ, MSG}, "undo:id done:bool", op_regenerate},
+	{179, "convo.turn_diff", {OBJ, MSG, {"patch", .Bool, nil}, {"blame", .Bool, nil}, {"max_chars", .U64, nil}}, "Turn", op_convo_turn_diff},
+	{180, "convo.history", {OBJ, {"from", .Rid, nil}, {"from_seal", .Rid, nil}, {"from_known", .Bool, nil}, {"limit", .U64, nil}, {"max_files", .U64, nil}}, "turns:[Turn] next:rid next_seal:rid next_known:bool more:bool", op_convo_history},
 	{143, "subscribe.fork_diff", {OBJ, {"caller", .Object, nil}, {"diff", .Bool, nil}, {"max_chars", .U64, nil}}, "changes:[Change] diff:str", nil},
 }
 
@@ -811,4 +813,78 @@ op_undo_resume :: proc(c: ^Call, o: ^Out) -> Status {
 	}
 	o_int(o, "resumed", rt.runtime_undo_resume(r, a_object(c, "object")))
 	return .Ok
+}
+
+op_convo_turn_diff :: proc(c: ^Call, o: ^Out) -> Status {
+	r := _rt(c)
+	if r == nil {
+		return .Unsupported
+	}
+	opts := rt.Turn_Opts{patch = a_bool(c, "patch"), blame = a_bool(c, "blame"), max_chars = a_int(c, "max_chars", 200_000)}
+	t, err := rt.turn_diff(r, a_object(c, "object"), a_rid(c, "msg"), opts, context.temp_allocator, ready(c))
+	if err != .None {
+		return pend(c, err)
+	}
+	emit_turn(o, t)
+	return .Ok
+}
+
+op_convo_history :: proc(c: ^Call, o: ^Out) -> Status {
+	r := _rt(c)
+	if r == nil {
+		return .Unsupported
+	}
+	from := convo.Position{msg = a_rid(c, "from"), seal = a_rid(c, "from_seal"), seal_known = a_bool(c, "from_known")}
+	turns, next, more, err := rt.turn_history(r, a_object(c, "object"), from, min(a_int(c, "limit", 50), 1000), min(a_int(c, "max_files", 40), 1000), context.temp_allocator, ready(c))
+	if err != .None {
+		return pend(c, err)
+	}
+	o_arr(o, "turns", len(turns))
+	for t in turns {
+		o_obj(o, "")
+		emit_turn(o, t)
+		o_end(o)
+	}
+	o_end(o)
+	o_rid(o, "next", next.msg)
+	o_rid(o, "next_seal", next.seal)
+	o_bool(o, "next_known", next.seal_known)
+	o_bool(o, "more", more)
+	return .Ok
+}
+
+emit_turn :: proc(o: ^Out, t: rt.Turn) {
+	o_rid(o, "msg", t.msg)
+	o_id(o, "actor", t.actor)
+	o_u64(o, "stamp", u64(t.stamp))
+	o_bool(o, "ended", t.ended)
+	o_u64(o, "added", u64(t.added))
+	o_u64(o, "removed", u64(t.removed))
+	o_u64(o, "more_files", u64(t.more_files))
+	o_arr(o, "files", len(t.files))
+	for f in t.files {
+		o_obj(o, "")
+		o_str(o, "mount", f.mount)
+		o_str(o, "path", f.path)
+		o_str(o, "from", f.from)
+		o_str(o, "status", f.status)
+		o_bool(o, "binary", f.binary)
+		o_u64(o, "added", u64(f.added))
+		o_u64(o, "removed", u64(f.removed))
+		o_str(o, "patch", f.patch)
+		o_bool(o, "clipped", f.clipped)
+		o_arr(o, "blame", len(f.blame))
+		for b in f.blame {
+			o_obj(o, "")
+			o_u64(o, "line_lo", u64(b.line_lo))
+			o_u64(o, "line_hi", u64(b.line_hi))
+			o_id(o, "actor", b.actor)
+			o_id(o, "owner", b.owner)
+			o_id(o, "device", b.device)
+			o_end(o)
+		}
+		o_end(o)
+		o_end(o)
+	}
+	o_end(o)
 }

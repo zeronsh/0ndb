@@ -1059,6 +1059,21 @@ equal in both directions.
   (create, move, remove, flags, target) or a side lost ops. A frame goes out
   only when the listed result changed, so an idle fork costs nothing.
   `task.changes` reads the same view once.
+- **Turn diff and history.** A turn's `Scope{kind = Turn}` record holds each
+  mounted tree's version at the turn's start (`before`) and end (`after`),
+  and the reply's `Seal.scope` names that record, so a turn is found from its
+  message in O(1). `convo.turn_diff(msg)` diffs the two versions per mount:
+  the ops between them name the touched inodes (O(changes)), snapshots of
+  the tree's structure at both versions give each file's paths, and it lists
+  every file whose presence, path or bytes differ as added, removed, moved
+  (with `from`) or modified, with line counts, a unified patch under a shared
+  character budget, and blame for the end version: runs of lines, each
+  credited to the actor that wrote most of its bytes, the conversation that
+  owns that actor (zero for a person) and its device. A reply whose run is
+  still open diffs its start against the run line's current head
+  (`ended = false`). `convo.history` pages a conversation's replies newest
+  first, like `convo.page`, and gives each turn its per-file counts without
+  patches.
 - **Blame** is a span lookup. **Revert** of a scope creates ops that undo
   exactly that scope's ops, transformed through everything since. Actors are
   bounded (one per conversation, mount and line, plus the ingestion actors),
@@ -1747,9 +1762,10 @@ concurrent typing is never lost or reverted.
   a view and converts back within that view use `obj.vref_pos`.
 - Every stored reference is safe by one of these rules:
   - *Same segment, backward* (links `event/segs/prev`; convo `Msg.parent,
-    jump, intent, parent_seal, files_prev, claim`, `Block.msg/prev`, `Seal`,
-    `Leaf`, `Fork`, `Remember`, `Spine`, `Files.next`, intent and run
-    targets, `Compact`, `Scope.msg`, `Interrupted`, `Revived`, `Recorded`;
+    jump, intent, parent_seal, files_prev, claim`, `Block.msg/prev`, `Seal`
+    (with `Seal.scope`), `Leaf`, `Fork`, `Remember`, `Spine`, `Files.next`,
+    intent and run targets, `Compact`, `Scope.msg`, `Interrupted`, `Revived`,
+    `Recorded`;
     `Redact.from/target` in the writer's own segment; map `Del` dots naming
     own `Add`s): refs only point to earlier offsets and journals are
     prefix-durable, so if the referencing record survives so does its target.
