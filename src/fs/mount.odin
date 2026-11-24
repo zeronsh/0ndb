@@ -2688,7 +2688,10 @@ mount_recover :: proc(m: ^Mount) -> Error {
 				continue
 			}
 			p, pok, perr := fstree.path(&snap, ino, context.temp_allocator)
-			if perr != nil || !pok {
+			if perr != nil {
+				return tree_error(perr)
+			}
+			if !pok {
 				continue
 			}
 			if had && old != p {
@@ -2728,7 +2731,7 @@ recover_orphan :: proc(m: ^Mount, p: string, e: Entry, ino: fstree.Inode_Id, int
 		return false, .None
 	}
 	data, oid, binary, ok := read_content(m, p, d.stat, ino, true) or_return
-	if !ok || binary || .Opaque in tree_flags(h, ino) {
+	if !ok || binary || .Opaque in (tree_flags(h, ino) or_return) {
 		return false, .None
 	}
 	#reverse for it in intents {
@@ -2760,7 +2763,7 @@ recover_at :: proc(m: ^Mount, e: ^Entry, p: string, ino: fstree.Inode_Id, target
 		return .None
 	}
 	data, oid, binary, ok := read_content(m, p, d.stat, ino, true) or_return
-	if !ok || binary || .Opaque in tree_flags(h, ino) {
+	if !ok || binary || .Opaque in (tree_flags(h, ino) or_return) {
 		return .None
 	}
 	want := history_text_at(h, ino, crdt.graph_version_ids(&h.g, target, context.temp_allocator), context.temp_allocator) or_return

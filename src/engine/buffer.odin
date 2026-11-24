@@ -303,7 +303,10 @@ buffer_open :: proc(e: ^Engine, o: Object, opts: Buffer_Options, allocator := co
 			return {}, .Not_Found
 		}
 		fi, iok, ierr := fstree.info(&snap, id, context.temp_allocator)
-		if ierr != nil || !iok {
+		if ierr != nil {
+			return {}, _ferr(fs.tree_error(ierr))
+		}
+		if !iok {
 			return {}, .Corrupt
 		}
 		if fi.kind != .File {

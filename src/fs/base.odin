@@ -669,7 +669,7 @@ rebase_commit :: proc(p: ^Pass, c: ^Change, v: []crdt.Op_Id, inode: fstree.Inode
 	m := p.m
 	h := m.history
 	data, oid, binary, ok := read_content(m, c.path, c.stat, inode, true) or_return
-	if !ok || binary || .Opaque in tree_flags(h, inode) {
+	if !ok || binary || .Opaque in (tree_flags(h, inode) or_return) {
 		return false, .None
 	}
 	old := history_text_at(h, inode, v, context.temp_allocator) or_return

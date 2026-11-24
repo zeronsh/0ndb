@@ -214,7 +214,7 @@ dir_tree :: proc(m: ^Mount, dir: string, pack: ^odb.Pack_Builder = nil) -> (oid:
 			mode = odb.MODE_TREE
 		case .File:
 			ensure_blob(m, child, &e) or_continue
-			mode = odb.MODE_EXEC if .Exec in tree_flags(m.history, e.inode) else odb.MODE_FILE
+			mode = odb.MODE_EXEC if .Exec in (tree_flags(m.history, e.inode) or_return) else odb.MODE_FILE
 		case .Symlink:
 			ensure_link_blob(m, child, &e) or_continue
 			mode = odb.MODE_LINK
@@ -293,7 +293,7 @@ ensure_blob :: proc(m: ^Mount, rel: string, e: ^Entry) -> Error {
 	}
 	defer virtual.arena_destroy(&scratch)
 	context.temp_allocator = virtual.arena_allocator(&scratch)
-	if .Opaque in tree_flags(h, e.inode) {
+	if .Opaque in (tree_flags(h, e.inode) or_return) {
 		reg, has := history_blob(h, e.inode) or_return
 		if has && odb.exists(m.db, odb.Oid(reg.oid)) {
 			e.oid = odb.Oid(reg.oid)
@@ -323,7 +323,10 @@ ensure_link_blob :: proc(m: ^Mount, rel: string, e: ^Entry) -> Error {
 	}
 	snap := fstree.current(&m.history.tree)
 	info, ok, ierr := fstree.info(&snap, e.inode, context.temp_allocator)
-	if ierr != nil || !ok {
+	if ierr != nil {
+		return tree_error(ierr)
+	}
+	if !ok {
 		return .Not_Found
 	}
 	oid := from_odb_v(odb.write(m.db, .Blob, transmute([]u8)info.target)) or_return

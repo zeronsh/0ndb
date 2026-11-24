@@ -235,7 +235,7 @@ mount_sync_from :: proc(fork: ^Mount, source_line: string, conflicts: ^[dynamic]
 	}
 	marked := make([dynamic]Marked, context.temp_allocator)
 	for ino in both {
-		if .Opaque in tree_flags(h, ino) {
+		if .Opaque in (tree_flags(h, ino) or_return) {
 			continue
 		}
 		b := history_text_at(h, ino, base, context.temp_allocator) or_continue

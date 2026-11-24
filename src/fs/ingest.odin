@@ -477,7 +477,7 @@ mount_import :: proc(m: ^Mount) -> Error {
 				continue
 			}
 		}
-		if (st.adopt || st.resync) && import_adopt(&st, it, parent, tracked, &entry) {
+		if adopted := (st.adopt || st.resync) && (import_adopt(&st, it, parent, tracked, &entry) or_return); adopted {
 			continue
 		}
 		switch it.kind {
@@ -543,15 +543,21 @@ adopt_finish :: proc(m: ^Mount) -> Error {
 }
 
 @(private)
-import_adopt :: proc(st: ^Import_State, it: ^Scan_Item, parent: Dir_Frame, tracked: bool, entry: ^Index_Entry) -> bool {
+import_adopt :: proc(st: ^Import_State, it: ^Scan_Item, parent: Dir_Frame, tracked: bool, entry: ^Index_Entry) -> (adopted: bool, err: Error) {
 	m := st.m
 	ino, found, lerr := fstree.lookup(&st.snap, it.path)
-	if lerr != nil || !found {
-		return false
+	if lerr != nil {
+		return false, tree_error(lerr)
+	}
+	if !found {
+		return false, .None
 	}
 	info, ok, ierr := fstree.info(&st.snap, ino, context.temp_allocator)
-	if ierr != nil || !ok || !info.present {
-		return false
+	if ierr != nil {
+		return false, tree_error(ierr)
+	}
+	if !ok || !info.present {
+		return false, .None
 	}
 	want: fstree.Kind
 	#partial switch it.kind {
@@ -562,11 +568,11 @@ import_adopt :: proc(st: ^Import_State, it: ^Scan_Item, parent: Dir_Frame, track
 	case .Symlink:
 		want = .Symlink
 	case:
-		return false
+		return false, .None
 	}
 	if info.kind != want {
 		if !(info.kind == .Symlink && want == .File && !mount_symlinks(m)) {
-			return false
+			return false, .None
 		}
 		want = .Symlink
 	}
@@ -576,7 +582,7 @@ import_adopt :: proc(st: ^Import_State, it: ^Scan_Item, parent: Dir_Frame, track
 		wd, _ := watch_dir(m.reg, m, it.path, parent.wd)
 		p, _ := clone_string(it.path, st.long)
 		append(&st.stack, Dir_Frame{path = p, inode = ino, depth = it.depth, wd = wd, partial = true})
-		return true
+		return true, .None
 	}
 	e := Entry{inode = ino, kind = want}
 	if want == .File {
@@ -586,7 +592,7 @@ import_adopt :: proc(st: ^Import_State, it: ^Scan_Item, parent: Dir_Frame, track
 		}
 	}
 	import_shadow(st, it.path, e)
-	return true
+	return true, .None
 }
 
 @(private)
@@ -771,8 +777,16 @@ import_gitlink :: proc(st: ^Import_State, it: ^Scan_Item, parent: Dir_Frame) -> 
 		}
 	}
 	if st.adopt || st.resync {
-		if ino, found, lerr := fstree.lookup(&st.snap, it.path); lerr == nil && found {
-			if info, ok, ierr := fstree.info(&st.snap, ino, context.temp_allocator); ierr == nil && ok && info.present && info.kind == .Dir {
+		ino, found, lerr := fstree.lookup(&st.snap, it.path)
+		if lerr != nil {
+			return tree_error(lerr)
+		}
+		if found {
+			info, ok, ierr := fstree.info(&st.snap, ino, context.temp_allocator)
+			if ierr != nil {
+				return tree_error(ierr)
+			}
+			if ok && info.present && info.kind == .Dir {
 				st.stack[len(st.stack) - 1].partial = true
 				return import_shadow(st, it.path, Entry{inode = ino, kind = .Dir, stat = it.stat})
 			}
@@ -3319,7 +3333,7 @@ emit_modify :: proc(p: ^Pass, b: ^Builder, c: ^Change, e: Entry) -> Error {
 	ne := e
 	ne.stat = c.stat
 	ne.oid = oid
-	old_flags := tree_flags(h, e.inode)
+	old_flags := tree_flags(h, e.inode) or_return
 	exec := exec_bit(m, c.stat, .Exec in old_flags)
 	if exec != (.Exec in old_flags) {
 		builder_tree(b, fstree.Op_Set_Flags{inode = e.inode, mask = {.Exec}, value = {.Exec} if exec else {}})
@@ -3661,12 +3675,15 @@ emit_insert :: proc(m: ^Mount, b: ^Builder, inode: fstree.Inode_Id, pos: int, in
 }
 
 @(private)
-tree_flags :: proc(h: ^History, inode: fstree.Inode_Id) -> fstree.Flags {
-	n, err := fstree.get(&h.tree, inode)
-	if err != nil || n == nil {
-		return {}
+tree_flags :: proc(h: ^History, inode: fstree.Inode_Id) -> (flags: fstree.Flags, err: Error) {
+	n, gerr := fstree.get(&h.tree, inode)
+	if gerr != nil {
+		return {}, tree_error(gerr)
 	}
-	return n.flags
+	if n == nil {
+		return {}, .None
+	}
+	return n.flags, .None
 }
 
 @(private)

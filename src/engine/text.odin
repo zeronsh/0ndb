@@ -136,7 +136,11 @@ _tree_read :: proc(e: ^Engine, o: Object, path: string, allocator := context.all
 		}
 		return nil, .Not_Found
 	}
-	if info, iok, ierr := fstree.info(&at.snap, id, context.temp_allocator); ierr == nil && iok && info.kind == .Dir {
+	info, iok, ierr := fstree.info(&at.snap, id, context.temp_allocator)
+	if ierr != nil {
+		return nil, _ferr(fs.tree_error(ierr))
+	}
+	if iok && info.kind == .Dir {
 		return nil, .Invalid
 	}
 	text, ferr := _tree_text(e, h, &at, id)
@@ -199,7 +203,11 @@ _tree_entries :: proc(e: ^Engine, o: Object, path: string, allocator: runtime.Al
 			}
 			return nil, .Not_Found
 		}
-		if info, iok, ierr := fstree.info(&at.snap, id, context.temp_allocator); ierr == nil && iok && info.kind != .Dir {
+		info, iok, ierr := fstree.info(&at.snap, id, context.temp_allocator)
+		if ierr != nil {
+			return nil, _ferr(fs.tree_error(ierr))
+		}
+		if iok && info.kind != .Dir {
 			return nil, .Invalid
 		}
 		dir = id
@@ -303,7 +311,11 @@ tree_write :: proc(e: ^Engine, o: Object, path: string, data: []u8, base: fs.Ver
 	if lerr != nil {
 		return _ferr(fs.tree_error(lerr))
 	}
-	if info, iok, ierr := fstree.info(&bat.snap, id, context.temp_allocator); ok && ierr == nil && iok && info.kind != .File {
+	info, iok, ierr := fstree.info(&bat.snap, id, context.temp_allocator)
+	if ierr != nil {
+		return _ferr(fs.tree_error(ierr))
+	}
+	if ok && iok && info.kind != .File {
 		return .Invalid
 	}
 	if !ok {

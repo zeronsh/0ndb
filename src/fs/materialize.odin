@@ -158,26 +158,30 @@ materialize_to :: proc(m: ^Mount, target: Version, merge: bool) -> Error {
 	displaced_touch(m, &snap, &touched) or_return
 	indirect := len(m.collided) > 0 || len(m.reshow) > 0
 	for c in m.collided {
-		if ino, ok, lerr := fstree.lookup(&snap, c); lerr == nil && ok {
-			touched[ino] = true
+		touch_path(&snap, c, &touched) or_return
+	}
+	for a in m.absent {
+		hit := touch_path(&snap, a, &touched) or_return
+		if hit {
+			continue
 		}
+		if e, found := shadow_get(&m.shadow, a) or_return; found {
+			touched[e.inode] = true
+		}
+	}
+	for r in m.reshow {
+		touch_path(&snap, r, &touched) or_return
+	}
+	for c in m.collided {
 		delete(c, m.allocator)
 	}
 	clear(&m.collided)
 	for a in m.absent {
-		if ino, ok, lerr := fstree.lookup(&snap, a); lerr == nil && ok {
-			touched[ino] = true
-		} else if e, found := shadow_get(&m.shadow, a) or_return; found {
-			touched[e.inode] = true
-		}
 		delete(a, m.allocator)
 	}
 	clear(&m.absent_set)
 	clear(&m.absent)
 	for r in m.reshow {
-		if ino, ok, lerr := fstree.lookup(&snap, r); lerr == nil && ok {
-			touched[ino] = true
-		}
 		delete(r, m.allocator)
 	}
 	clear(&m.reshow)
@@ -888,7 +892,11 @@ displaced_touch :: proc(m: ^Mount, snap: ^fstree.Snapshot, touched: ^map[fstree.
 	for len(work) > 0 {
 		ino := pop(&work)
 		if old, _, had := shadow_by_inode(&m.shadow, ino, context.temp_allocator) or_return; had {
-			if z, zok, zerr := fstree.lookup(snap, conflict_base(old)); zerr == nil && zok && z != ino && !touched[z] {
+			z, zok, zerr := fstree.lookup(snap, conflict_base(old))
+			if zerr != nil {
+				return tree_error(zerr)
+			}
+			if zok && z != ino && !touched[z] {
 				touched[z] = true
 				append(&work, z)
 			}
@@ -914,6 +922,18 @@ displaced_touch :: proc(m: ^Mount, snap: ^fstree.Snapshot, touched: ^map[fstree.
 		}
 	}
 	return .None
+}
+
+@(private = "file")
+touch_path :: proc(snap: ^fstree.Snapshot, path: string, touched: ^map[fstree.Inode_Id]bool) -> (hit: bool, err: Error) {
+	ino, ok, lerr := fstree.lookup(snap, path)
+	if lerr != nil {
+		return false, tree_error(lerr)
+	}
+	if ok {
+		touched[ino] = true
+	}
+	return ok, .None
 }
 
 @(private)

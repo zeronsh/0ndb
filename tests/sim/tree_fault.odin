@@ -23,7 +23,12 @@ Tf_Op :: enum u8 {
 	Disk_Edit,
 	Disk_Create,
 	List,
+	Cold_Create,
+	Cold_Disk,
 }
+
+@(private = "file", thread_local)
+_tf_removed: bool
 
 @(private = "file")
 _tf_name :: proc(i: int) -> string {
@@ -79,6 +84,9 @@ _tf_missing :: proc(w: ^World, n: ^Node, tree: eng.Object, disk: bool) -> (missi
 	context = instance_context(&n.inst)
 	defer node_after(n)
 	for i in 0 ..< TF_FILES {
+		if i == 297 && _tf_removed {
+			continue
+		}
 		name := _tf_name(i)
 		text := ""
 		ok := false
@@ -103,6 +111,7 @@ _tf_missing :: proc(w: ^World, n: ^Node, tree: eng.Object, disk: bool) -> (missi
 
 @(private = "file")
 _tf_run :: proc(w: ^World, op: Tf_Op, nth: int) -> (fired: bool, path: string, errs: string) {
+	_tf_removed = op == .Cold_Disk
 	if !relay_start(&w.relay) {
 		world_fail(w, "relay start")
 		return
@@ -178,8 +187,38 @@ _tf_run :: proc(w: ^World, op: Tf_Op, nth: int) -> (fired: bool, path: string, e
 		_tf_write(vfs, TF_ROOT + "/" + TF_DIR + "/new.txt", "local\n")
 		a.disk.probe -= 1
 	}
+	if op == .Cold_Create || op == .Cold_Disk {
+		context = instance_context(&a.inst)
+		if mt := _tf_mount(a); mt != nil {
+			fs.mount_hibernate(mt)
+			fs.history_sleep(mt.history)
+		}
+		node_after(a)
+	}
 	read_fault_arm(&a.disk, "/data", nth)
 	switch op {
+	case .Cold_Create, .Cold_Disk:
+		{
+			context = instance_context(&a.inst)
+			names, lerr := eng.tree_list(&a.e, tree, TF_DIR, context.temp_allocator)
+			if lerr == .None && len(names) != TF_FILES / TF_DIRS {
+				world_fail(w, "list during the fault: %d names with no error, want %d", len(names), TF_FILES / TF_DIRS)
+			}
+			if lerr != .None {
+				fmt.sbprintf(&eb, "list %v ", lerr)
+			}
+			node_after(a)
+		}
+		if op == .Cold_Create {
+			if err := _tf_edit(a, tree, TF_DIR + "/new.txt", "new\n", true); err != .None {
+				fmt.sbprintf(&eb, "write %v ", err)
+			}
+		} else {
+			_tf_write(vfs, TF_ROOT + "/" + TF_DIR + "/person.txt", "a person's file\n")
+			prim.remove(vfs, fmt.tprintf("%s/%s", TF_ROOT, _tf_name(297)))
+			context = instance_context(&a.inst)
+			node_after(a)
+		}
 	case .Engine_Create, .Engine_Over:
 		if err := _tf_edit(a, tree, TF_DIR + "/new.txt", "new\n", true); err != .None {
 			fmt.sbprintf(&eb, "write %v ", err)

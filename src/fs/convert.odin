@@ -1612,7 +1612,11 @@ conv_on :: proc(m: ^Mount, inode: fstree.Inode_Id, has_inode: bool) -> bool {
 	if m.has_git {
 		return true
 	}
-	return has_inode && m.history != nil && .Git_Clean in tree_flags(m.history, inode)
+	if !has_inode || m.history == nil {
+		return false
+	}
+	flags, err := tree_flags(m.history, inode)
+	return err == .None && .Git_Clean in flags
 }
 
 eol_clean :: proc(m: ^Mount, rel: string, data: []u8, inode := fstree.Inode_Id{}, has_old := false, allocator := context.temp_allocator) -> ([]u8, bool) {

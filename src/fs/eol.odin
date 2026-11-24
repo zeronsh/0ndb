@@ -414,7 +414,11 @@ attr_history_text :: proc(m: ^Mount, c: ^Attr_Ctx, rel: string) -> ([]u8, bool) 
 	if ierr != nil || !ok || !info.present || info.kind != .File {
 		return nil, false
 	}
-	if .Opaque in tree_flags(m.history, ino) && m.db != nil {
+	flags, ferr := tree_flags(m.history, ino)
+	if ferr != .None {
+		return nil, false
+	}
+	if .Opaque in flags && m.db != nil {
 		if reg, has, berr := history_blob_at(m.history, ino, c.version); berr == .None && has {
 			if _, size, herr := odb.read_header(m.db, odb.Oid(reg.oid)); herr != .None || size > ATTR_FILE_MAX {
 				return nil, false
