@@ -483,6 +483,8 @@ Mount :: struct {
 	attrib:      map[string]Attrib,
 	log_fd:      prim.Fd,
 	attrib_chain: map[string][dynamic]Attrib_Step,
+	landed: map[prim.Id]bool,
+	landed_gone: bool,
 	log_sync:    ^Log_Sync,
 	log_next:    [dynamic]Obs_Wait,
 	log_len:     i64,
@@ -668,6 +670,7 @@ mount_open :: proc(m: ^Mount, reg: ^Registry, h: ^History, db: ^odb.Odb, id: pri
 	m.open_scopes = make(map[string]^Scope, allocator)
 	m.fences = make([dynamic]Fence, allocator)
 	m.intents = make([dynamic]Intent, allocator)
+	m.landed = make(map[prim.Id]bool, allocator)
 	m.unwatched = make([dynamic]string, allocator)
 	m.collided = make([dynamic]string, allocator)
 	m.absent = make([dynamic]string, allocator)
@@ -882,6 +885,7 @@ mount_close :: proc(m: ^Mount) {
 		delete(k, m.allocator)
 	}
 	delete(m.attrib_chain)
+	delete(m.landed)
 	if m.shadow.dir != "" {
 		shadow_close(&m.shadow)
 	}
@@ -2842,7 +2846,10 @@ intents_dedupe :: proc(list: ^[dynamic]Intent) {
 mount_recover :: proc(m: ^Mount) -> Error {
 	h := m.history
 	if h != nil {
-		history_marked(h, m.jpos, commit_mark(m), &m.intents) or_return
+		clear(&m.landed)
+		m.landed_gone = false
+		history_marked(h, m.jpos, commit_mark(m), &m.intents, &m.landed, &m.landed_gone) or_return
+		landed_settle(m)
 	}
 	intents_dedupe(&m.intents)
 	if len(m.intents) == 0 {
