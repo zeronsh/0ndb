@@ -1,5 +1,7 @@
 package fs
 
+import "core:fmt"
+
 import "base:runtime"
 import "core:bytes"
 import "core:crypto/blake2b"
@@ -1365,6 +1367,7 @@ attribute_changes :: proc(p: ^Pass) -> Error {
 		if has && !m.lost && !actor_on_line(m, a.actor) && a.scope == {} {
 			has = false
 		}
+		fmt.eprintfln("SIGS change %s kind=%v has=%v chained=%v nchain=%d lost=%v line=%s", c.path, c.kind, has, chained, len(chain), m.lost, m.line)
 		steps := make([dynamic]Attrib_Step, context.temp_allocator)
 		if chained {
 			append(&steps, ..chain[:])
@@ -1404,6 +1407,11 @@ attribute_changes :: proc(p: ^Pass) -> Error {
 		}
 		matched, broken, gone := false, false, false
 		cur := c.old.oid if c.kind == .Modify else odb.Oid{}
+		defer fmt.eprintfln("SIGS %s steps=%d disk=%x cur=%x matched=%v broken=%v gone=%v line=%s", c.path, len(steps), disk_oid[:3], cur[:3], matched, broken, gone, m.line)
+		for st in steps {
+			sa, so := st.actor, st.oid
+			fmt.eprintfln("SIGS  step actor=%x oid=%x exists=%v scope=%v", sa[12:], so[:3], odb.exists(m.db, st.oid), st.scope != {})
+		}
 		for st in steps {
 			if disk_oid == st.oid {
 				c.actor = st.actor

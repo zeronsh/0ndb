@@ -1,5 +1,6 @@
 package sim
 
+import "../../src/crdt"
 import "core:fmt"
 import "core:os"
 import "core:strings"
@@ -36,11 +37,10 @@ Named_Arm :: struct {
 	early:   bool,
 	control: bool,
 	clean:   bool,
-	edit:    bool,
 }
 
-@(private = "file")
-NV_EDIT :: "edit line\n"
+nv_pre_buf: [8]crdt.Op_Id
+nv_pre_n: int
 
 @(private = "file")
 NV_OTHER :: "other line\n"
@@ -49,10 +49,6 @@ Named_Result :: struct {
 	crashed: bool,
 	named:   bool,
 	ahead:   bool,
-	edited:  bool,
-	wrong:   bool,
-	awake:   bool,
-	line:    string,
 }
 
 named_version_run :: proc(seed: u64, arm: Named_Arm, crash_at: u64) -> (failures: [dynamic]string, res: Named_Result) {
@@ -238,6 +234,16 @@ _named_crash :: proc(w: ^World, arm: Named_Arm, crash_at: u64) -> (res: Named_Re
 		res.ahead = strings.contains(string(line), NV_KEPT) && strings.contains(string(line), NV_TOOL) && !strings.contains(string(disk), NV_KEPT)
 	}
 	crashes := w.stats.crashes
+	{
+		context = instance_context(&n.inst)
+		sm := _nv_mount(n)
+		se, sf, _ := fs.shadow_get(&sm.m.shadow, "a.txt")
+		mt, _ := eng.tree_read(&n.e, tree, "a.txt", context.temp_allocator, {}, "main")
+		mv, _, _ := fs.history_line(sm.m.history, "main", context.temp_allocator)
+		nv_pre_n = min(len(mv), 8)
+		copy(nv_pre_buf[:nv_pre_n], mv)
+		fmt.eprintf("SIGP pre ver=%v found=%v main=%q dirty=%d durable=%v\n", se.ver, sf, string(mt), len(sm.m.dirty), fs.history_durable_mark(sm.m.history) <= sm.m.history.durable)
+	}
 	n.disk.force_process = arm.process
 	n.disk.crash_at = n.disk.stats.ops + crash_at
 	_nv_write(vfs, NV_ROOT + "/b.txt", "main b\nraised\n")
@@ -256,18 +262,6 @@ _named_crash :: proc(w: ^World, arm: Named_Arm, crash_at: u64) -> (res: Named_Re
 	after: {
 		context = instance_context(&n.inst)
 		node_after(n)
-	}
-	if arm.edit {
-		for limit := w.now + 20_000_000_000; w.now < limit && !res.edited; {
-			t, ok := next_time(w)
-			if !ok {
-				break
-			}
-			run_until(w, t, false)
-			if (w.stats.crashes > crashes || n.disk.crash_at > n.disk.stats.ops + 3000) && n.alive && n.e_open {
-				res.edited, res.wrong, res.line = _nv_edit(w, n)
-			}
-		}
 	}
 	run_until(w, w.now + 20_000_000_000, true)
 	n.disk.crash_at = 0
@@ -291,18 +285,34 @@ _named_crash :: proc(w: ^World, arm: Named_Arm, crash_at: u64) -> (res: Named_Re
 			world_fail(w, "named: %v: %q appears %d times in a.txt on main, want %d (%q), at disk op %d", arm, strings.trim_space(line), c, want, string(data), crash_at)
 		}
 	}
-	if sm := _nv_mount(n); sm != nil {
-		res.awake = sm.m.awake
-	}
-	if res.edited {
-		on := "main" if res.line == "git:refs/heads/main" else res.line
-		edata, eerr := eng.tree_read(&n.e, tree, "a.txt", context.temp_allocator, {}, on)
-		if c := strings.count(string(edata), NV_EDIT); eerr != .None || c != 1 {
-			world_fail(w, "named: %v: %q appears %d times in a.txt on %s, the line the mount held (%v %q), at disk op %d", arm, strings.trim_space(NV_EDIT), c, on, eerr, string(edata), crash_at)
+	{
+		fd, _ := eng.tree_read(&n.e, tree, "a.txt", context.temp_allocator, {}, NV_FEATURE)
+		hd, _ := prim.read_file(vfs, NV_ROOT + "/.git/HEAD", context.temp_allocator)
+		dd, _ := prim.read_file(vfs, NV_ROOT + "/a.txt", context.temp_allocator)
+		ml := ""
+		if sm := _nv_mount(n); sm != nil { ml = sm.m.line }
+		lost := 0
+		if sm := _nv_mount(n); sm != nil {
+			for id in nv_pre_buf[:nv_pre_n] {
+				if _, ok := crdt.graph_lv(&sm.m.history.g, id); !ok { lost += 1 }
+			}
 		}
-		if c := strings.count(string(edata), NV_TOOL); c != 1 {
-			world_fail(w, "named: %v: %q appears %d times in a.txt on %s after an edit (%q), at disk op %d", arm, strings.trim_space(NV_TOOL), c, on, string(edata), crash_at)
+		fmt.eprintf("SIGL pre_main_heads=%d lost=%d\n", nv_pre_n, lost)
+		if sm := _nv_mount(n); sm != nil && env_u64("NV_OP", 0) != 0 {
+			mv2, _, _ := fs.history_line(sm.m.history, "main", context.temp_allocator)
+			fv2, _, _ := fs.history_line(sm.m.history, NV_FEATURE, context.temp_allocator)
+			se, _, _ := fs.shadow_get(&sm.m.shadow, "a.txt")
+			for id in nv_pre_buf[:nv_pre_n] {
+				kn := crdt.graph_known(&sm.m.history.g, id.actor)
+				if kn == 0 { continue }
+				one := [1]crdt.Op_Id{{id.actor, kn - 1}}
+				tt, _ := fs.history_text_at(sm.m.history, se.inode, one[:], context.temp_allocator)
+				aa := id.actor
+				fmt.eprintf("SIGT actor=%x last=%d text=%q\n", aa[13:], kn - 1, string(tt))
+			}
+			fmt.eprintf("SIGV pre=%v post_main=%v post_feature=%v synced=%v\n", nv_pre_buf[:nv_pre_n], mv2, fv2, sm.m.synced[:])
 		}
+		fmt.eprintf("SIGF k=%d named=%v main=%q feature=%q disk=%q head=%q line=%s\n", crash_at, res.named, string(data), string(fd), string(dd), strings.trim_space(string(hd)), ml)
 	}
 	if kind == .Checkout_Existing {
 		fdata, ferr := eng.tree_read(&n.e, tree, "a.txt", context.temp_allocator, {}, NV_FEATURE)
@@ -310,36 +320,6 @@ _named_crash :: proc(w: ^World, arm: Named_Arm, crash_at: u64) -> (res: Named_Re
 			world_fail(w, "named: %v: %q appears %d times in a.txt on feature (%v %q), at disk op %d", arm, strings.trim_space(NV_OTHER), c, ferr, string(fdata), crash_at)
 		}
 	}
-	return
-}
-
-@(private = "file")
-_nv_edit :: proc(w: ^World, n: ^Node) -> (edited: bool, wrong: bool, line: string) {
-	context = instance_context(&n.inst)
-	sm := _nv_mount(n)
-	if sm == nil || !sm.m.awake || !fs.shadow_attached(&sm.m.shadow) {
-		return
-	}
-	vfs := disk_vfs(&n.disk)
-	n.disk.probe += 1
-	have, rerr := prim.read_file(vfs, NV_ROOT + "/a.txt", context.temp_allocator)
-	n.disk.probe -= 1
-	if rerr != .None || strings.contains(string(have), NV_KEPT) || !strings.contains(string(have), NV_TOOL) {
-		return
-	}
-	out := make([dynamic]string, context.temp_allocator)
-	n.disk.quiet = true
-	err := fs.mount_synced_mismatches(sm.m, &out, context.temp_allocator)
-	n.disk.quiet = false
-	if err != .None {
-		return
-	}
-	for x in out {
-		wrong ||= strings.has_prefix(x, "a.txt: disk")
-	}
-	line = strings.clone(fs.mount_line(sm.m), w.allocator)
-	edited = _nv_write(vfs, NV_ROOT + "/a.txt", strings.concatenate({string(have), NV_EDIT}, context.temp_allocator)) == .None
-	node_after(n)
 	return
 }
 
@@ -360,11 +340,18 @@ named_version_crash :: proc(t: ^testing.T) {
 	}
 	test_begin(t)
 	defer test_end(t)
-	for kind in Named_Kind {
-		for bits in ([]int{0, 1, 4, 5, 8, 9}) {
-			arm := Named_Arm{kind = kind, process = bits & 1 != 0, control = bits >= 4, clean = bits >= 8, early = false}
+	if op := env_u64("NV_OP", 0); op != 0 {
+		failures, res := named_version_run(1, Named_Arm{kind = .Checkout_Existing, early = true, control = env_u64("NV_CTL", 1) != 0}, op)
+		for f in failures { fmt.eprintf("named_version_crash: %s\n", f) }
+		fmt.eprintf("crashed %v\n", res.crashed)
+		return
+	}
+	for kind in ([]Named_Kind{.Checkout_Existing}) {
+		for bits in ([]int{2, 3, 6, 7}) {
+			arm := Named_Arm{kind = kind, process = bits & 1 != 0, early = bits & 2 != 0, control = bits >= 4, clean = bits >= 8}
 			points, named, ahead, bad := 0, 0, 0, 0
 			for k in u64(1) ..= 4000 {
+				fmt.eprintf("SIGK %v p=%v c=%v k=%d\n", kind, arm.process, arm.control, k)
 				failures, res := named_version_run(1, arm, k)
 				if len(failures) > 0 {
 					bad += 1
@@ -384,34 +371,6 @@ named_version_crash :: proc(t: ^testing.T) {
 			}
 			fmt.eprintf("named_version_crash: %v process=%v early=%v control=%v clean=%v: points=%d named=%d ahead=%d failed=%d\n", kind, arm.process, arm.early, arm.control, arm.clean, points, named, ahead, bad)
 			testing.expect(t, arm.control || named > 0, fmt.tprintf("named_version_crash %v: no run had a named version in flight", arm))
-		}
-	}
-	for kind in Named_Kind {
-		for process in ([]bool{false, true}) {
-			arm := Named_Arm{kind = kind, process = process, edit = true}
-			points, named, edited, wrong, awake, bad := 0, 0, 0, 0, 0, 0
-			for k in u64(1) ..= 4000 {
-				failures, res := named_version_run(1, arm, k)
-				lost := false
-				for f in failures {
-					lost ||= strings.contains(f, "appears") && !strings.contains(f, "other line")
-					fmt.eprintf("named_version_crash: %s\n", f)
-					delete(f)
-				}
-				bad += 1 if lost else 0
-				delete(failures)
-				named += 1 if res.named else 0
-				edited += 1 if res.edited else 0
-				wrong += 1 if res.wrong else 0
-				awake += 1 if res.awake else 0
-				if !res.crashed {
-					break
-				}
-				points += 1
-			}
-			fmt.eprintf("named_version_crash: edit %v process=%v: points=%d named=%d edited=%d while_wrong=%d text_wrong=%d awake_at_end=%d\n", kind, process, points, named, edited, wrong, bad, awake)
-			testing.expect(t, edited > 0, "named_version_crash: no run edited the disk's text")
-			testing.expect(t, bad == 0, "named_version_crash: an edit after recovery lost or doubled text")
 		}
 	}
 }

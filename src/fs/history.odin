@@ -1,5 +1,7 @@
 package fs
 
+import "core:fmt"
+
 import "base:runtime"
 import "core:mem/virtual"
 import "core:slice"
@@ -885,6 +887,7 @@ remote_line :: proc(h: ^History, stream: prim.Id, name: string, lvs: ^[dynamic]c
 
 history_set_line :: proc(h: ^History, name: string, v: Version) -> Error {
 	history_wake(h) or_return
+	if name == "main" { fmt.eprintfln("SIGLINE set main v=%v", v) }
 	key := line_key(name, context.temp_allocator)
 	sorted := slice.clone(v, context.temp_allocator)
 	slice.sort_by(sorted, crdt.op_id_less)
@@ -937,6 +940,7 @@ apply_line_record :: proc(h: ^History, stream: prim.Id, body: []u8) -> Error {
 		return .Corrupt
 	}
 	v := decode_version(vb, context.temp_allocator) or_return
+	if name == "main" { fmt.eprintfln("SIGLINE replay main self=%v v=%v", stream == h.self, v) }
 	if stream == h.self {
 		return kv_put(&h.kv, line_key(name, context.temp_allocator), vb)
 	}
@@ -1136,6 +1140,7 @@ history_commit_local :: proc(h: ^History, b: ^crdt.Batch, line: Maybe(string) = 
 	}
 	lkey, lver: []u8
 	lname, has_line := line.?
+	fmt.eprintfln("SIGB commit actor=%v seq=%d n=%d line=%v parents=%v", b.actor, b.seq, n, line, b.parents)
 	if has_line {
 		lkey, lver = line_after(h, lname, parents[:], crdt.Op_Id{b.actor, b.seq + u64(n) - 1}) or_return
 	}
@@ -1144,6 +1149,7 @@ history_commit_local :: proc(h: ^History, b: ^crdt.Batch, line: Maybe(string) = 
 	o, jerr := journal_batch(h, b, REC_BATCH, lver == nil)
 	if jerr == .None && lver != nil {
 		jerr = journal_line(h, lname, lver)
+		if lname == "main" { lvv, _ := decode_version(lver, context.temp_allocator); fmt.eprintfln("SIGLINE commit main actor=%v seq=%d v=%v", b.actor, b.seq, lvv) }
 	}
 	if jerr != .None {
 		if journal_unwind(h, jm, dn) {
@@ -2736,6 +2742,7 @@ replay_batch :: proc(h: ^History, kind: u8, payload: []u8, off: i64) -> (wait: b
 	if gerr != .None {
 		return false, .Corrupt
 	}
+	fmt.eprintfln("SIGB replay actor=%v seq=%d n=%d skip=%d off=%d", b.actor, b.seq, crdt.batch_len(&b), skip, off)
 	if skip >= crdt.batch_len(&b) {
 		return false, .None
 	}

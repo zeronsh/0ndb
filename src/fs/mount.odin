@@ -1,5 +1,7 @@
 package fs
 
+import "core:fmt"
+
 import "base:runtime"
 import "core:hash/xxhash"
 import "core:crypto/blake2b"
@@ -1511,6 +1513,7 @@ attrib_log_open :: proc(m: ^Mount) -> Error {
 		if !prim.reader_ok(&rd) {
 			break
 		}
+		fmt.eprintfln("SIGA load path=%s actor=%v has_oid=%v scope=%v pos=%d log_at=%d live=%v mline=%s", path, actor, o != {}, sc != {}, pos, m.log_at, i64(pos) >= m.log_at, m.line)
 		if i64(pos) >= m.log_at {
 			if actor == {} {
 				if path in m.attrib {
@@ -2620,6 +2623,7 @@ mount_recover :: proc(m: ^Mount) -> Error {
 	ends := make([dynamic]crdt.Lv, context.temp_allocator)
 	touched := make(map[fstree.Inode_Id]bool, context.temp_allocator)
 	by_intent := make([dynamic]Recovered_Intent, context.temp_allocator)
+	apart := make([dynamic]Recovered_Intent, context.temp_allocator)
 	lost := make([dynamic]Lost_Range, context.temp_allocator)
 	have := make([dynamic]crdt.Lv, context.temp_allocator)
 	if crdt.graph_version_lvs(&h.g, m.synced[:], &have) != .None {
@@ -2635,6 +2639,27 @@ mount_recover :: proc(m: ^Mount) -> Error {
 			continue
 		}
 		spans := []crdt.Lv_Span{{lv = lv, len = int(it.n)}}
+		proven := true
+		{
+			_, _, ist, ioff, iok := history_batch_at(h, lv)
+			if !iok {
+				return .Corrupt
+			}
+			ib := history_read_batch(h, ist, ioff, context.temp_allocator) or_return
+			base := make([dynamic]crdt.Lv, context.temp_allocator)
+			crdt.version_union(&h.g, have[:], ends[:], &base)
+			for pid in ib.parents {
+				pl, pok := crdt.graph_lv(&h.g, pid)
+				proven &&= pok && crdt.graph_contains(&h.g, base[:], pl)
+			}
+		}
+		if !proven {
+			own := make(map[fstree.Inode_Id]bool, context.temp_allocator)
+			spans_touched(h, spans, &own) or_return
+			end := crdt.Op_Id{it.actor, it.seq + it.n - 1}
+			append(&apart, Recovered_Intent{end = end, touched = own})
+			continue
+		}
 		spans_touched(h, spans, &touched) or_return
 		recovered = true
 		if end, known := crdt.graph_lv(&h.g, crdt.Op_Id{it.actor, it.seq + it.n - 1}); known {
@@ -2646,6 +2671,35 @@ mount_recover :: proc(m: ^Mount) -> Error {
 	}
 	if len(lost) > 0 {
 		drop_lost(m, "", lost[:]) or_return
+	}
+	sig_out, sig_obs, sig_edit, sig_in := 0, 0, 0, 0
+	for it in m.intents {
+		lv, okl := crdt.graph_lv(&h.g, crdt.Op_Id{it.actor, it.seq})
+		if !okl { continue }
+		if crdt.graph_contains(&h.g, have[:], lv) { continue }
+		_, _, st, off, bok := history_batch_at(h, lv)
+		if !bok { continue }
+		b, be := history_read_batch(h, st, off, context.temp_allocator)
+		if be != .None { continue }
+		outside := false
+		for pid in b.parents {
+			if pl, pok := crdt.graph_lv(&h.g, pid); !pok || !crdt.graph_contains(&h.g, have[:], pl) { outside = true }
+		}
+		if !outside { sig_in += 1; continue }
+		sig_out += 1
+		edit := false
+		for op in b.ops { if op.kind != .Opaque { edit = true } }
+		if edit { sig_edit += 1 } else { sig_obs += 1 }
+	}
+	fmt.eprintfln("SIGR intents=%d in=%d outside=%d observe_only=%d edits=%d", len(m.intents), sig_in, sig_out, sig_obs, sig_edit)
+	defer {
+		se, _, _ := shadow_get(&m.shadow, "a.txt")
+		dd, _ := prim.read_file(m.vfs, "/work/named-n0-git/a.txt", context.temp_allocator)
+		tt, _ := history_text_at(h, se.inode, m.synced[:], context.temp_allocator)
+		owed := false
+		for q in m.absent { owed ||= q == "a.txt" }
+		for q in m.reshow { owed ||= q == "a.txt" }
+		fmt.eprintfln("SIGE ver=%d owed=%v synced_w=%v disk_w=%v same=%v", se.ver != 0 ? 1 : 0, owed, strings.contains(string(tt), "other line"), strings.contains(string(dd), "other line"), string(tt) == string(dd))
 	}
 	if recovered {
 		target := have[:]
@@ -2689,6 +2743,27 @@ mount_recover :: proc(m: ^Mount) -> Error {
 			v := crdt.graph_version_ids(&h.g, target, context.temp_allocator)
 			clear(&m.synced)
 			append(&m.synced, ..v)
+		}
+	}
+	for it in apart {
+		for ino in sorted_inodes(it.touched) {
+			rel, e, had := shadow_by_inode(&m.shadow, ino, context.temp_allocator) or_return
+			if !had || e.kind != .File {
+				continue
+			}
+			at := [1]crdt.Op_Id{it.end}
+			t, terr := history_text_at(h, ino, at[:], context.temp_allocator)
+			if terr != .None {
+				continue
+			}
+			one := [1]fstree.Op_Id{op_inode(h, it.end)}
+			e.ver = shadow_version_add(&m.shadow, one[:]) or_return
+			e.stat = {}
+			if m.db != nil {
+				e.oid, _ = odb.hash(m.db.format, .Blob, t)
+			}
+			shadow_put(&m.shadow, rel, e) or_return
+			mount_reshow_add(m, rel)
 		}
 	}
 	m.jpend = mount_jlen(m)
