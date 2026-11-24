@@ -178,9 +178,7 @@ _dlog_apply :: proc(e: ^Engine, x: dl.Entry) -> Dlog_Step {
 	b.units = .Bytes
 	b.hist = hist
 	b.base = x.actor
-	if aerr := _buffer_actor(e, b, hist); aerr != .None {
-		return _dlog_busy(aerr)
-	}
+	_buffer_actor(e, b, hist)
 	line, lerr := _clone(x.line, e.allocator)
 	if lerr != .None {
 		return .Retry

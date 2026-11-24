@@ -5,6 +5,7 @@ import "core:os"
 import "core:strings"
 import "core:testing"
 import eng "../../src/engine"
+import api "../../src/capi/api"
 import "../../src/crdt"
 import "../../src/prim"
 
@@ -14,7 +15,6 @@ Ril_Result :: struct {
 	shown:   bool,
 	lost:    int,
 	changed: int,
-	stale:   bool,
 }
 
 @(private = "file")
@@ -26,6 +26,9 @@ Ril_Peer :: enum {
 	Delete_Inside,
 	Delete_Inside_Now,
 	Delete_Stale,
+	Delete_Inside_Capi,
+	Delete_Stale_Capi,
+	First,
 }
 
 @(private = "file")
@@ -72,6 +75,25 @@ _ril_edit :: proc(n: ^Node, b: ^Ril_Buffer, rev: u64, pos, del: int, ins: string
 	}
 	_, _, err := eng.buffer_edit(&n.e, b.info.id, rev, []eng.Buffer_Edit{{pos, del, transmute([]u8)ins}}, 0, ready)
 	return err
+}
+
+@(private = "file")
+_ril_capi :: proc(w: ^World, n: ^Node, b: ^Ril_Buffer, rev: u64, pos, del: int) -> eng.Error {
+	context = instance_context(&n.inst)
+	req := fmt.tprintf(`{{"op":"buffer.edit","buffer":%d,"rev":%d,"pos":[%d],"del":[%d],"ins":[""]}}`, b.info.id, rev, pos, del)
+	_, st, _ := api.call(&n.api, transmute([]u8)req, true, proc(data: rawptr, id: u64, status: api.Status, payload: []u8) {}, nil, 0, context.temp_allocator)
+	#partial switch st {
+	case .Ok:
+		return .None
+	case .Pending:
+		return .Pending
+	case .Busy:
+		return .Busy
+	case .Conflict:
+		return .Conflict
+	}
+	world_fail(w, "reissue live: capi buffer.edit: %v", st)
+	return .Invalid
 }
 
 @(private = "file")
@@ -180,20 +202,31 @@ _ril_run :: proc(w: ^World, k: u64, peer: Ril_Peer) -> (res: Ril_Result) {
 		return
 	}
 	run_until(w, w.now + 5_000_000_000, true)
-	if err := _ril_edit(b, &bb, bb.rev, 0, 0, "warm ", false); err != .None {
+	head := "warm "
+	if peer == .First {
+		context = instance_context(&b.inst)
+		if err := eng.text_insert(&b.e, text, 0, head); err != .None {
+			world_fail(w, "reissue live: n1 first insert: %v", err)
+			return
+		}
+	} else if err := _ril_edit(b, &bb, bb.rev, 0, 0, head, false); err != .None {
 		world_fail(w, "reissue live: n1 first edit: %v", err)
 		return
 	}
 	node_after(b)
 	run_until(w, w.now + 20_000_000_000, true)
-	if err := _ril_edit(a, &ba, ba.rev, len("warm base\n"), 0, "peer\n", false); err != .None {
+	if err := _ril_edit(a, &ba, ba.rev, len(head) + len("base\n"), 0, "peer\n", false); err != .None {
 		world_fail(w, "reissue live: n0 first edit: %v", err)
 		return
 	}
 	node_after(a)
 	run_until(w, w.now + 20_000_000_000, true)
-	if x, y := _ril_shown(w, a, &ba), _ril_shown(w, b, &bb); x != "warm base\npeer\n" || y != x {
+	if x, y := _ril_shown(w, a, &ba), _ril_shown(w, b, &bb); x != fmt.tprintf("%sbase\npeer\n", head) || y != x {
 		world_fail(w, "reissue live: the buffers did not converge before the crash: %q and %q", x, y)
+		return
+	}
+	if b.e.live_armed != (peer != .First) {
+		world_fail(w, "reissue live: n1's epoch is armed %v before the crash", b.e.live_armed)
 		return
 	}
 	seen := make([dynamic]Reissue_Batch, w.allocator)
@@ -239,7 +272,9 @@ _ril_run :: proc(w: ^World, k: u64, peer: Ril_Peer) -> (res: Ril_Result) {
 			err = _ril_edit(a, &ba, ba.rev, 4, 0, peer_text, peer == .Type_Inside)
 		case .Delete_Inside, .Delete_Inside_Now:
 			err = _ril_edit(a, &ba, ba.rev, 2, 4, "", peer == .Delete_Inside)
-		case .Delete_Stale:
+		case .Delete_Inside_Capi:
+			err = _ril_capi(w, a, &ba, ba.rev, 2, 4)
+		case .Delete_Stale, .Delete_Stale_Capi, .First:
 		}
 		if err != .None {
 			if err != .Pending && err != .Busy {
@@ -257,11 +292,15 @@ _ril_run :: proc(w: ^World, k: u64, peer: Ril_Peer) -> (res: Ril_Result) {
 		world_fail(w, "reissue live: n1 did not restart after the crash at op %d", k)
 		return
 	}
-	if peer == .Delete_Stale && res.shown {
+	if (peer == .Delete_Stale || peer == .Delete_Stale_Capi) && res.shown {
 		run_until(w, w.now + 500_000_000, false)
-		if err := _ril_edit(a, &ba, old, 2, 4, "", true); err == .None {
-			res.stale = !strings.contains(_ril_shown(w, a, &ba), "LOST")
-		} else if err != .Pending && err != .Busy && err != .Conflict {
+		err: eng.Error
+		if peer == .Delete_Stale {
+			err = _ril_edit(a, &ba, old, 2, 4, "", true)
+		} else {
+			err = _ril_capi(w, a, &ba, old, 2, 4)
+		}
+		if err != .None && err != .Pending && err != .Busy && err != .Conflict {
 			world_fail(w, "reissue live: n0 stale edit: %v", err)
 			return
 		}

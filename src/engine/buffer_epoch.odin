@@ -9,9 +9,17 @@ import "../prim"
 LIVE_EPOCH_KEY :: [1]u8{'L'}
 
 @(private)
+LIVE_EPOCH_LEN :: 17
+
+@(private)
 Live_Ids :: struct {
 	object: prim.Id,
 	actor:  prim.Id,
+}
+
+@(private)
+_live_path :: proc(e: ^Engine) -> (string, Error) {
+	return _join(context.temp_allocator, e.dir, "live")
 }
 
 @(private)
@@ -21,28 +29,31 @@ _live_epoch_load :: proc(e: ^Engine) -> Error {
 	if err != .None {
 		return _oerr(err)
 	}
-	if !found {
+	path := _live_path(e) or_return
+	stamp, serr := prim.read_file(e.base, path, context.temp_allocator)
+	if serr != .None && serr != .Not_Found {
+		return _perr(serr)
+	}
+	if !found && serr == .Not_Found {
 		return .None
 	}
-	if len(v) != 9 || v[8] > 1 {
-		return .Corrupt
+	if !found || serr == .Not_Found || len(v) != LIVE_EPOCH_LEN || len(stamp) != 8 || string(v[9:]) != string(stamp) || v[8] != 0 {
+		_live_epoch_next(e)
+		return .None
 	}
-	e.live_epoch = prim.get_u64le(v)
-	if v[8] != 0 {
-		return _live_epoch_next(e)
-	}
+	e.live_epoch = prim.get_u64le(v[:8])
 	return .None
 }
 
 @(private)
-_live_epoch_next :: proc(e: ^Engine) -> Error {
-	if e.live_epoch == max(u64) {
-		return .Corrupt
+_live_epoch_next :: proc(e: ^Engine) {
+	b: [8]u8
+	for prim.get_u64le(b[:]) == 0 {
+		random_fill(e, b[:])
 	}
-	e.live_epoch += 1
+	e.live_epoch = prim.get_u64le(b[:])
 	e.live_armed = false
 	clear(&e.live_ids)
-	return .None
 }
 
 @(private)
@@ -50,11 +61,8 @@ _live_arm :: proc(e: ^Engine) -> bool {
 	if e.live_armed {
 		return true
 	}
-	if !_live_epoch_put(e, true) {
-		return false
-	}
-	e.live_armed = true
-	return true
+	e.live_armed = _live_epoch_put(e, true)
+	return e.live_armed
 }
 
 @(private)
@@ -66,15 +74,20 @@ _live_disarm :: proc(e: ^Engine) {
 
 @(private)
 _live_epoch_put :: proc(e: ^Engine, armed: bool) -> bool {
+	v: [LIVE_EPOCH_LEN]u8
+	prim.put_u64le(v[:8], e.live_epoch)
+	v[8] = u8(armed)
+	random_fill(e, v[9:])
+	path, perr := _live_path(e)
+	if perr != .None || prim.replace_atomic(e.base, path, v[9:]) != .None {
+		return false
+	}
 	t, terr := omap.txn_begin(&e.reg.db)
 	if terr != .None {
 		_reg_fail(e, _oerr(terr))
 		return false
 	}
 	k := LIVE_EPOCH_KEY
-	v: [9]u8
-	prim.put_u64le(v[:8], e.live_epoch)
-	v[8] = u8(armed)
 	if omap.txn_put(t, ROOT_SPACES, k[:], v[:]) != .None {
 		omap.txn_abort(t)
 		_reg_fail(e, .Io)
@@ -96,14 +109,13 @@ _live_actor :: proc(e: ^Engine, base: prim.Id) -> prim.Id {
 }
 
 @(private)
-_buffer_actor :: proc(e: ^Engine, b: ^Buffer, hist: ^fs.History) -> Error {
+_buffer_actor :: proc(e: ^Engine, b: ^Buffer, hist: ^fs.History) {
 	actor := _live_actor(e, b.base)
 	if sent, ok := e.live_ids[Live_Ids{b.object.id, actor}]; ok && fs.history_next_seq(hist, actor) < sent {
-		_live_epoch_next(e) or_return
+		_live_epoch_next(e)
 		actor = _live_actor(e, b.base)
 	}
 	b.actor = actor
-	return .None
 }
 
 @(private)

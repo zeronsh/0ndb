@@ -773,7 +773,7 @@ buffer_ack :: proc(e: ^Engine, id: Buffer_Id, rev: u64) -> Error {
 _buffer_sync :: proc(e: ^Engine, b: ^Buffer, h: ^Handle) -> Error {
 	_buffer_advance(e, b, h) or_return
 	b.dirty = false
-	_buffer_actor(e, b, h.hist) or_return
+	_buffer_actor(e, b, h.hist)
 	next := fs.history_next_seq(h.hist, b.actor)
 	if next == 0 || fs.history_contains(h.hist, b.version[:], crdt.Op_Id{b.actor, next - 1}) {
 		return .None
