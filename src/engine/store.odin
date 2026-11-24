@@ -711,6 +711,11 @@ _batch_complete :: proc(e: ^Engine, b: ^Durable_Batch, err: Error, direct := fal
 				if derr := fs.history_durable(h.hist, m.mark); derr != .None {
 					_log(e, .Warn, "mount state persist failed")
 				}
+				if fs.history_groups_blocked(h.hist) && !pack.pressure(&e.pk) {
+					if derr := fs.history_groups_retry(h.hist); derr != .None {
+						_log(e, .Warn, "history state commit failed")
+					}
+				}
 				if fs.history_durable_mark(h.hist) > h.hist.durable {
 					_touch(e)
 				}
