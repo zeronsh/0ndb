@@ -365,6 +365,9 @@ Engine :: struct {
 	buffer_wakes: [dynamic]Ready,
 	tick:         u64,
 	tick_timer:   prim.Timer,
+	park_timer:   prim.Timer,
+	park_at:      i64,
+	waking:       []^Waiter,
 	tick_hook:    Tick_Hook,
 	deliver_hook: Tick_Hook,
 	tick_wanted:  bool,
@@ -1091,6 +1094,10 @@ _teardown :: proc(e: ^Engine) {
 		if e.settle_timer != 0 {
 			prim.timer_cancel(e.loop, e.settle_timer)
 			e.settle_timer = 0
+		}
+		if e.park_timer != 0 {
+			prim.timer_cancel(e.loop, e.park_timer)
+			e.park_timer = 0
 		}
 		if e.loop.wake_cb == _on_wake && e.loop.wake_data == rawptr(e) {
 			prim.loop_on_wake(e.loop, e.prev_wake, e.prev_wake_data)

@@ -152,6 +152,7 @@ link_down :: proc(e: ^Engine, link: Link) {
 		failed := !sp.connected
 		osync.replicator_link_down(&sp.repl)
 		sp.connected = false
+		_parked_drop(e, sp.id)
 		if failed {
 			sp.attempt = true
 		}
@@ -194,6 +195,7 @@ _link_attempt_failed :: proc(e: ^Engine, sp: ^Space) {
 	sp.attempt = false
 	sp.offline = true
 	_fresh_waiters_fail(e, sp)
+	_parked_drop(e, sp.id)
 }
 
 @(private)
@@ -296,6 +298,7 @@ _link_close :: proc(data: rawptr) {
 	}
 	sp.conn = nil
 	sp.connected = false
+	_parked_drop(e, sp.id)
 	_link_attempt_failed(e, sp)
 	_link_schedule(e, sp)
 }
@@ -519,6 +522,7 @@ _repl_event_apply :: proc(e: ^Engine, sp: ^Space, ev: ^Repl_Ev) {
 		_held_scan(e, sp)
 	case .Disconnected:
 		sp.connected = false
+		_parked_drop(e, sp.id)
 		if ev.err == .Auth && _leave_refused(e, sp) {
 			sp.mem.revoked = true
 			_space_refuse(e, sp)

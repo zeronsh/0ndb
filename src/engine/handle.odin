@@ -1009,7 +1009,13 @@ _waiters_run :: proc(e: ^Engine) {
 		}
 		i += 1
 	}
-	for w in ready {
+	for w, k in ready {
+		e.waking = ready[k + 1:]
+		if w.cmd != nil && w.cmd.dropped {
+			_cmd_free(e, w.cmd)
+			free(w, e.allocator)
+			continue
+		}
 		if w.cmd != nil && _object_blocked(e, w.object) {
 			append(&e.waiters, w)
 			continue
@@ -1031,6 +1037,10 @@ _waiters_run :: proc(e: ^Engine) {
 			}
 		}
 		free(w, e.allocator)
+	}
+	e.waking = nil
+	if e.park_at != 0 {
+		_parked_arm(e)
 	}
 }
 
