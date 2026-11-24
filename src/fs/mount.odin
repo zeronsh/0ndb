@@ -1546,18 +1546,15 @@ attrib_log_open :: proc(m: ^Mount) -> Error {
 			sc = prim.read_id(&rd)
 		}
 		base: Step_Base
+		step: prim.Id
 		if prim.reader_remaining(&rd) > 0 {
-			base.kind = prim.read_u8(&rd)
-			prim.read_fixed(&rd, base.oid[:])
-			bn := prim.read_uvarint(&rd)
-			if bn > STEP_BASE_HEADS {
+			bok: bool
+			if base, bok = step_base_read(&rd); !bok {
 				break
 			}
-			base.n = u8(bn)
-			for i in 0 ..< int(bn) {
-				base.ver[i].actor = prim.read_id(&rd)
-				base.ver[i].seq = prim.read_uvarint(&rd)
-			}
+		}
+		if prim.reader_remaining(&rd) >= len(step) {
+			step = prim.read_id(&rd)
 		}
 		if !prim.reader_ok(&rd) {
 			break
@@ -1569,9 +1566,9 @@ attrib_log_open :: proc(m: ^Mount) -> Error {
 					delete(key, m.allocator)
 				}
 			} else {
-				attrib_set(m, path, actor, false, o, sc, base)
+				attrib_set(m, path, actor, false, o, sc, base, step)
 				if o != {} {
-					attrib_chain_add(m, path, Attrib_Step{actor, o, sc, base})
+					attrib_chain_add(m, path, Attrib_Step{actor, o, sc, base, step})
 				}
 			}
 		}
@@ -1582,7 +1579,7 @@ attrib_log_open :: proc(m: ^Mount) -> Error {
 }
 
 @(private)
-attrib_log_append :: proc(m: ^Mount, rel: string, actor: prim.Id, oid := odb.Oid{}, scope := prim.Id{}, base := Step_Base{}) -> Error {
+attrib_log_append :: proc(m: ^Mount, rel: string, actor: prim.Id, oid := odb.Oid{}, scope := prim.Id{}, base := Step_Base{}, step := prim.Id{}) -> Error {
 	if m.log_fd < 0 {
 		return save_mount_state(m)
 	}
@@ -1590,23 +1587,18 @@ attrib_log_append :: proc(m: ^Mount, rel: string, actor: prim.Id, oid := odb.Oid
 	w := prim.writer(&body)
 	prim.write_str(&w, rel)
 	prim.write_id(&w, actor)
-	if oid != {} || scope != {} || base.kind != STEP_BASE_NONE {
+	if oid != {} || scope != {} || base.kind != STEP_BASE_NONE || step != {} {
 		o := oid
 		prim.write_raw(&w, o[:])
 	}
-	if scope != {} || base.kind != STEP_BASE_NONE {
+	if scope != {} || base.kind != STEP_BASE_NONE || step != {} {
 		prim.write_id(&w, scope)
 	}
-	if base.kind != STEP_BASE_NONE {
-		prim.write_u8(&w, base.kind)
-		bo := base.oid
-		prim.write_raw(&w, bo[:])
-		prim.write_uvarint(&w, u64(base.n))
-		bv := base.ver
-		for id in bv[:base.n] {
-			prim.write_id(&w, id.actor)
-			prim.write_uvarint(&w, id.seq)
-		}
+	if base.kind != STEP_BASE_NONE || step != {} {
+		step_base_write(&w, base)
+	}
+	if step != {} {
+		prim.write_id(&w, step)
 	}
 	rec := make([]u8, 8 + len(body), context.temp_allocator)
 	prim.put_u32le(rec[0:4], u32(len(body)))
@@ -1622,6 +1614,7 @@ Attrib_Step :: struct {
 	oid:   odb.Oid,
 	scope: prim.Id,
 	base:  Step_Base,
+	step:  prim.Id,
 }
 
 @(private)
@@ -1713,8 +1706,9 @@ mount_closed :: proc(m: ^Mount, rel: string) {
 	if has_prev && prev.kind == .File && prev.oid != {} && prev.oid != oid && a.oid != prev.oid && attrib_base_stored(m, prev) {
 		attrib_log_append(m, rel, m.actor, prev.oid)
 	}
-	attrib_set(m, rel, a.actor, false, oid, a.scope, a.base)
-	if attrib_log_append(m, rel, a.actor, oid, a.scope, a.base) == .None {
+	step := step_new(m)
+	attrib_set(m, rel, a.actor, false, oid, a.scope, a.base, step)
+	if attrib_log_append(m, rel, a.actor, oid, a.scope, a.base, step) == .None {
 		attrib_log_durable(m, nil, nil)
 	}
 }
@@ -2269,6 +2263,24 @@ load_mount_state :: proc(m: ^Mount) -> (fresh: bool, err: Error) {
 			shown_put(&m.shown, k, row, m.allocator)
 		}
 	}
+	if prim.reader_remaining(&rd) > 0 {
+		ns := prim.read_uvarint(&rd)
+		if ns > u64(prim.reader_remaining(&rd)) {
+			return false, .Corrupt
+		}
+		for _ in 0 ..< ns {
+			k := prim.read_str(&rd)
+			step := prim.read_id(&rd)
+			base, bok := step_base_read(&rd)
+			if !bok || !prim.reader_ok(&rd) {
+				return false, .Corrupt
+			}
+			if a, ok := &m.attrib[k]; ok {
+				a.step = step
+				a.base = base
+			}
+		}
+	}
 	m.jpend = m.jpos
 	if !prim.reader_ok(&rd) {
 		return false, .Corrupt
@@ -2440,6 +2452,7 @@ Attrib :: struct {
 	oid:   odb.Oid,
 	scope: prim.Id,
 	base:  Step_Base,
+	step:  prim.Id,
 }
 
 STEP_BASE_NONE :: u8(0)
@@ -2456,13 +2469,57 @@ Step_Base :: struct {
 }
 
 @(private)
-attrib_set :: proc(m: ^Mount, path: string, actor: prim.Id, used := false, oid := odb.Oid{}, scope := prim.Id{}, base := Step_Base{}) {
+attrib_set :: proc(m: ^Mount, path: string, actor: prim.Id, used := false, oid := odb.Oid{}, scope := prim.Id{}, base := Step_Base{}, step := prim.Id{}) {
 	if p, ok := &m.attrib[path]; ok {
-		p^ = Attrib{actor, used, oid, scope, base}
+		p^ = Attrib{actor, used, oid, scope, base, step}
 		return
 	}
 	k, _ := clone_string(path, m.allocator)
-	m.attrib[k] = Attrib{actor, used, oid, scope, base}
+	m.attrib[k] = Attrib{actor, used, oid, scope, base, step}
+}
+
+@(private)
+step_new :: proc(m: ^Mount) -> (id: prim.Id) {
+	prim.random_fill(m.reg.random if m.reg != nil else prim.Random{}, id[:])
+	return
+}
+
+@(private)
+step_base_write :: proc(w: ^prim.Writer, base: Step_Base) {
+	prim.write_u8(w, base.kind)
+	if base.kind == STEP_BASE_NONE {
+		return
+	}
+	bo := base.oid
+	prim.write_raw(w, bo[:])
+	prim.write_uvarint(w, u64(base.n))
+	bv := base.ver
+	for id in bv[:base.n] {
+		prim.write_id(w, id.actor)
+		prim.write_uvarint(w, id.seq)
+	}
+}
+
+@(private)
+step_base_read :: proc(rd: ^prim.Reader) -> (base: Step_Base, ok: bool) {
+	base.kind = prim.read_u8(rd)
+	if base.kind == STEP_BASE_NONE {
+		return base, prim.reader_ok(rd)
+	}
+	if base.kind > STEP_BASE_CONTENT {
+		return {}, false
+	}
+	prim.read_fixed(rd, base.oid[:])
+	n := prim.read_uvarint(rd)
+	if n > STEP_BASE_HEADS {
+		return {}, false
+	}
+	base.n = u8(n)
+	for i in 0 ..< int(n) {
+		base.ver[i].actor = prim.read_id(rd)
+		base.ver[i].seq = prim.read_uvarint(rd)
+	}
+	return base, prim.reader_ok(rd)
 }
 
 @(private)
@@ -2720,6 +2777,18 @@ save_mount_state :: proc(m: ^Mount) -> Error {
 		encode_version(&rb, img.shown[k])
 		prim.write_str(&w, k)
 		prim.write_bytes(&w, rb[:])
+	}
+	stepped := make([dynamic]string, context.temp_allocator)
+	for k in sorted_strings(attrib) {
+		if attrib[k].step != {} || attrib[k].base.kind != STEP_BASE_NONE {
+			append(&stepped, k)
+		}
+	}
+	prim.write_uvarint(&w, u64(len(stepped)))
+	for k in stepped {
+		prim.write_str(&w, k)
+		prim.write_id(&w, attrib[k].step)
+		step_base_write(&w, attrib[k].base)
 	}
 	sum := xxhash.XXH3_64_with_seed(buf[:], 0) | 1
 	if sum == m.saved {

@@ -215,7 +215,7 @@ history_observations :: proc(h: ^History, from: crdt.Lv, out: ^[dynamic]Observat
 		at := first
 		for op in b.ops {
 			if op.kind == .Opaque && at >= lv && len(op.content) > 0 && op.content[0] == fshist.TOP_OBSERVE {
-				if o, dok := fshist.decode_observe(op.content, allocator); dok && o.kind != .Step {
+				if o, dok := fshist.decode_observe(op.content, allocator); dok {
 					o.path, _ = clone_string(o.path, allocator)
 					append(out, Observation{actor = b.actor, lv = at, op = o})
 				}
@@ -623,6 +623,9 @@ rebase_changes :: proc(p: ^Pass) -> Error {
 			append(&keep, c)
 			continue
 		}
+		if a, has := m.attrib[c.path]; has && !a.used {
+			c.step = a.step
+		}
 		done, rerr := rebase_commit(p, &c, v, inode, actor, event)
 		#partial switch rerr {
 		case .None:
@@ -745,6 +748,7 @@ rebase_commit :: proc(p: ^Pass, c: ^Change, v: []crdt.Op_Id, inode: fstree.Inode
 	} else if c.scope_id != {} {
 		b.scope = scope_marker(who, c.scope_id)
 	}
+	step_mark(&b, c.step)
 	shadow_txn_begin(&m.shadow)
 	err = copy_begin(m, c, data)
 	if err == .None {
