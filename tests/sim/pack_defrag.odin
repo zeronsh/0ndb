@@ -15,7 +15,7 @@ DF_PACK :: "/data/pack"
 DF_FILE :: DF_PACK + "/s/idx"
 
 @(private = "file")
-DF_SIZE :: 192 << 10
+DF_SIZE :: (192 << 10) + 80
 
 @(private = "file")
 DF_WRITE :: 16
@@ -76,6 +76,9 @@ _df_turn :: proc(r: ^Df_Rig) -> bool {
 _df_put :: proc(r: ^Df_Rig, fd: prim.Fd, model: []u8, x: ^u32, tag: int) -> bool {
 	x^ = x^ * 1664525 + 1013904223
 	at := i64((x^ >> 8) % (DF_SIZE / DF_WRITE)) * DF_WRITE
+	if tag % 50 == 0 {
+		at = i64(DF_SIZE / DF_WRITE - 1) * DF_WRITE
+	}
 	b: [DF_WRITE]u8
 	for i in 0 ..< DF_WRITE {
 		b[i] = u8(x^ >> u32(i & 15)) + u8(tag)

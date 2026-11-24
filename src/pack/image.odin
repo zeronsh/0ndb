@@ -98,7 +98,7 @@ _img_dirty_at :: #force_inline proc "contextless" (img: ^Image, b: int) -> bool 
 
 @(private)
 _img_next :: proc(img: ^Image, from: int, size: int) -> (lo: int, hi: int, ok: bool) {
-	b := from / IMG_BLOCK
+	b := (from + IMG_BLOCK - 1) / IMG_BLOCK
 	blocks := (size + IMG_BLOCK - 1) / IMG_BLOCK
 	for b < blocks && !_img_dirty_at(img, b) {
 		b += 1
