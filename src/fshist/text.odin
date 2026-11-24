@@ -95,8 +95,8 @@ _text_build :: proc(src: ^Text_Source, st: ^Text_State, inode: fstree.Inode_Id, 
 		text_replay(src, st, target, rec.base, &buf, nil) or_return
 	}
 	text_replay_all(src, st, inode, target, rec, extra, 0, nil, &buf) or_return
-	if crdt.text_merge(&st.text, src.g, &st.log, v) != .None {
-		return .Corrupt
+	if me := crdt.text_merge(&st.text, src.g, &st.log, v); me != .None {
+		return .Missing if me == .Missing_Content else .Corrupt
 	}
 	return .None
 }

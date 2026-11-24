@@ -2433,6 +2433,8 @@ load_text :: proc(h: ^History, f: ^File_State, v: []crdt.Lv, full := false) -> E
 		return .No_Memory
 	case .Redacted:
 		return .Redacted
+	case .Missing:
+		return .Missing
 	}
 	return .Corrupt
 }

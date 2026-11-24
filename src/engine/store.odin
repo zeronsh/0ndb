@@ -970,7 +970,7 @@ _ferr :: proc "contextless" (e: fs.Error) -> Error {
 		return .Too_Large
 	case .Unsupported:
 		return .Unsupported
-	case .Redacted:
+	case .Redacted, .Missing:
 		return .Missing
 	}
 	return .Io
