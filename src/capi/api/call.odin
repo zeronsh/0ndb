@@ -37,9 +37,10 @@ Status :: enum u8 {
 	Budget       = 24,
 	Spawn        = 25,
 	Timeout      = 26,
+	Newer        = 27,
 }
 
-STATUS_NAMES := [27]string{"ok", "pending", "not_found", "exists", "invalid", "busy", "closed", "offline", "permission", "forged", "quarantined", "missing", "corrupt", "limit", "too_large", "unsupported", "not_assigned", "no_space", "no_memory", "io", "bad_request", "unknown_op", "conflict", "cancelled", "budget", "spawn", "timeout"}
+STATUS_NAMES := [28]string{"ok", "pending", "not_found", "exists", "invalid", "busy", "closed", "offline", "permission", "forged", "quarantined", "missing", "corrupt", "limit", "too_large", "unsupported", "not_assigned", "no_space", "no_memory", "io", "bad_request", "unknown_op", "conflict", "cancelled", "budget", "spawn", "timeout", "newer"}
 
 status_of :: proc "contextless" (err: eng.Error) -> Status {
 	switch err {
@@ -85,6 +86,8 @@ status_of :: proc "contextless" (err: eng.Error) -> Status {
 		return .Io
 	case .Conflict:
 		return .Conflict
+	case .Newer:
+		return .Newer
 	}
 	return .Io
 }

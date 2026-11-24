@@ -230,11 +230,15 @@ exit_of :: proc(st: api.Status) -> int {
 	return int(Exit.Error)
 }
 
+status_hint :: proc(st: api.Status) -> string {
+	return ": its history was written by a newer 0ndb; update 0ndb" if st == .Newer else ""
+}
+
 report_error :: proc(st: api.Status, format: string, args: ..any) -> int {
 	fmt.eprintf("0ndb: ")
 	fmt.eprintf(format, ..args)
 	if st != .Ok {
-		fmt.eprintf(" (%s)", api.STATUS_NAMES[int(st)])
+		fmt.eprintf(" (%s)%s", api.STATUS_NAMES[int(st)], status_hint(st))
 	}
 	fmt.eprintln()
 	return exit_of(st)

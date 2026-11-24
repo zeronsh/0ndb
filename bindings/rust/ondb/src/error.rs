@@ -3,7 +3,7 @@ use std::fmt;
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Status(pub u8);
 
-const NAMES: [&str; 27] = [
+const NAMES: [&str; 28] = [
     "ok",
     "pending",
     "not_found",
@@ -31,6 +31,7 @@ const NAMES: [&str; 27] = [
     "budget",
     "spawn",
     "timeout",
+    "newer",
 ];
 
 impl Status {
@@ -61,6 +62,7 @@ impl Status {
     pub const BUDGET: Status = Status(24);
     pub const SPAWN: Status = Status(25);
     pub const TIMEOUT: Status = Status(26);
+    pub const NEWER: Status = Status(27);
 
     pub fn name(self) -> &'static str {
         NAMES.get(self.0 as usize).copied().unwrap_or("unknown")
