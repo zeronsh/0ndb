@@ -291,6 +291,7 @@ _recover :: proc(p: ^Pack, sb: ^Super) -> Error {
 		for l in sb.lives {
 			if l.id == id {
 				c.live = l.live
+				c.ck_live = l.live
 			}
 		}
 		append(&p.conts, c)
