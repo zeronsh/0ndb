@@ -110,13 +110,58 @@ ok_run() {
 	echo "$1" | grep -E "Finished [0-9]+ tests?" | tail -1 | grep -qE "All tests were successful|The test was successful"
 }
 
+mkdir -p "$OUT/runs"
+rec_run() {
+	local id=$1 limit=$2; shift 2
+	local t0=$SECONDS
+	REC_LOG="$OUT/runs/$id.log"
+	if [ -x /usr/bin/time ]; then
+		/usr/bin/time -q -f "%e %M" -o "$REC_LOG.time" timeout "$limit" env "$@" > "$REC_LOG" 2>&1
+		REC_RC=$?
+		read -r REC_WALL REC_RSS < <(tail -1 "$REC_LOG.time" 2>/dev/null)
+		rm -f "$REC_LOG.time"
+	else
+		timeout "$limit" env "$@" > "$REC_LOG" 2>&1
+		REC_RC=$?
+		REC_WALL=$((SECONDS - t0)) REC_RSS=
+	fi
+	REC_OUT=$(tr -d '\000' < "$REC_LOG")
+	REC_SIG=
+	[ "$REC_RC" -gt 128 ] && REC_SIG=" SIG$(kill -l $((REC_RC - 128)) 2>/dev/null)"
+	[ "$REC_RC" -eq 124 ] && REC_SIG=" timeout"
+	REC_WHAT="rc=$REC_RC$REC_SIG wall=${REC_WALL:-?}s rss=${REC_RSS:-?}KB bytes=$(wc -c < "$REC_LOG" | tr -d ' ')"
+}
+
+rec_keep() {
+	{
+		echo "$1 $REC_WHAT load=$(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null) at=$(date -u +%H:%M:%S)"
+		echo "cmd: $2"
+		echo "last 20 lines:"
+		tail -20 "$REC_LOG"
+	} > "$OUT/runs/$1.rec"
+}
+
+rec_msg() {
+	local m
+	m=$(echo "$REC_OUT" | grep -aE 'trace: FAIL|panic|FATAL|Killed' | head -1 | sed 's/^ *//' | cut -c1-160)
+	if ! echo "$REC_OUT" | grep -qaE "Finished [0-9]+ tests?"; then
+		echo "$REC_WHAT no summary; last: $(tail -1 "$REC_LOG" | tr -d '\000' | cut -c1-120)${m:+; $m}"
+	elif [ -z "$m" ]; then
+		echo "$REC_WHAT; $(fail_list "$REC_OUT" | tail -n +2 | cut -c1-160)"
+	else
+		echo "$m"
+	fi
+}
+
 lane() {
 	local name=$1 env=$2 from=$3 to=$4 f=0 msg=""
 	for s in $(seq "$from" "$to"); do
-		local o
-		o=$(env $env SIM_SEED=$s timeout 900 "$OUT/sim.bin" 2>&1)
-		if ! ok_run "$o"; then
-			f=$((f+1)); msg="$msg [$s: $(echo "$o" | grep -E 'trace: FAIL|panic|FATAL|Killed' | head -1 | sed 's/^ *//' | cut -c1-160)]"
+		rec_run "$name-$s" 900 $env SIM_SEED=$s "$OUT/sim.bin"
+		if [ "$REC_RC" -ne 0 ] || ! ok_run "$REC_OUT"; then
+			f=$((f+1)); msg="$msg [$s: $(rec_msg)]"
+			rec_keep "$name-$s" "$env SIM_SEED=$s sim.bin"
+		else
+			rm -f "$REC_LOG"
 		fi
 	done
 	echo "$name $from-$to: $f failed$msg"
@@ -128,13 +173,57 @@ jitter_lane() {
 		local s=${run%% *} env=""
 		[ "$run" != "$s" ] && env=${run#* }
 		n=$((n+1))
-		local o
-		o=$(env $env SIM_ADDR_JITTER=1 SIM_SEED=$s timeout 1800 "$OUT/sim.bin" 2>&1)
-		if echo "$o" | grep -q "NOT deterministic"; then
+		rec_run "jitter-$n" 1800 $env SIM_ADDR_JITTER=1 SIM_SEED=$s "$OUT/sim.bin"
+		if echo "$REC_OUT" | grep -qa "NOT deterministic"; then
 			f=$((f+1)); msg="$msg [$s $env]"
+			rec_keep "jitter-$n" "$env SIM_ADDR_JITTER=1 SIM_SEED=$s sim.bin"
+		elif ! echo "$REC_OUT" | grep -qaE "Finished [0-9]+ tests?"; then
+			f=$((f+1)); msg="$msg [$s $env: $(rec_msg)]"
+			rec_keep "jitter-$n" "$env SIM_ADDR_JITTER=1 SIM_SEED=$s sim.bin"
+		else
+			rm -f "$REC_LOG"
 		fi
 	done
 	echo "addr-jitter $n runs: $f failed$msg"
+}
+
+member_lane() {
+	rec_run membership 2400 SIM_MEMBER_SEED=1 SIM_MEMBER_SEEDS=30 "$OUT/mem.bin"
+	local n
+	n=$(echo "$REC_OUT" | grep -ac 'membership seed [0-9]*: ')
+	if [ "$REC_RC" -ne 0 ] || ! ok_run "$REC_OUT"; then
+		n=$((n+1))
+		rec_keep membership "SIM_MEMBER_SEED=1 SIM_MEMBER_SEEDS=30 mem.bin"
+		echo "membership 1-30 isolated: $n failure lines $(echo "$REC_OUT" | grep -aE 'membership seed [0-9]+: ' | sort -u | head -2 | tr '\n' ' ') [$(rec_msg)]"
+	else
+		rm -f "$REC_LOG"
+		echo "membership 1-30 isolated: $n failure lines "
+	fi
+}
+
+scenario_lane() {
+	rec_run scenarios 2400 "$OUT/sim.bin"
+	local f n list
+	f=$(fail_list "$REC_OUT"); n=$(printf '%s\n' "$f" | head -1); list=$(printf '%s\n' "$f" | tail -n +2)
+	if [ "$REC_RC" -ne 0 ] || ! ok_run "$REC_OUT"; then
+		rec_keep scenarios "sim.bin"
+		[ "$n" = 0 ] && { n=1; list=$(rec_msg); }
+		echo "scenarios: $n failed [$list]"
+	else
+		rm -f "$REC_LOG"
+		echo "scenarios: 0 failed"
+	fi
+}
+
+suite_lane() {
+	rec_run "$1" 900 "$2"
+	if [ "$REC_RC" -ne 0 ] || ! ok_run "$REC_OUT"; then
+		rec_keep "$1" "$2"
+		echo "$1: $(echo "$REC_OUT" | grep -aE "Finished|FAILED|panic|FATAL" | tail -1) [$(rec_msg)]"
+	else
+		rm -f "$REC_LOG"
+		echo "$1: $(echo "$REC_OUT" | grep -aE "Finished" | tail -1)"
+	fi
 }
 {
 	lane default "" 1 10 > "$OUT/l1" &
@@ -151,10 +240,10 @@ jitter_lane() {
 	lane until-run SIM_STORAGE=until-run 41 60 > "$OUT/l17" &
 	lane until-run SIM_STORAGE=until-run 61 80 > "$OUT/l18" &
 	lane until-run SIM_STORAGE=until-run 81 100 > "$OUT/l19" &
-	( r=$(SIM_MEMBER_SEED=1 SIM_MEMBER_SEEDS=30 timeout 2400 "$OUT/mem.bin" 2>&1); n=$(echo "$r" | grep -c 'membership seed [0-9]*: '); ok_run "$r" || n=$((n+1)); echo "membership 1-30 isolated: $n failure lines $(echo "$r" | grep -E 'membership seed [0-9]+: ' | sort -u | head -2 | tr '\n' ' ')" ) > "$OUT/l7" &
-	( r=$(timeout 2400 "$OUT/sim.bin" 2>&1); f=$(fail_list "$r"); n=$(printf '%s\n' "$f" | head -1); list=$(printf '%s\n' "$f" | tail -n +2); if [ "$n" = 0 ] && ! ok_run "$r"; then n=1; list="no test summary (killed or timed out): $(printf '%s\n' "$r" | tail -1 | cut -c1-160)"; fi; if [ "$n" = 0 ]; then echo "scenarios: 0 failed"; else echo "scenarios: $n failed [$list]"; fi ) > "$OUT/l8" &
-	( r=$(timeout 900 "$OUT/cvg.bin" 2>&1 | grep -E "Finished|FAILED|panic|FATAL" | tail -1); echo "convergence: $r" ) > "$OUT/l9" &
-	( r=$(timeout 900 "$OUT/fst.bin" 2>&1 | grep -E "Finished|FAILED|panic|FATAL" | tail -1); echo "fstree: $r" ) > "$OUT/l10" &
+	member_lane > "$OUT/l7" &
+	scenario_lane > "$OUT/l8" &
+	suite_lane convergence "$OUT/cvg.bin" > "$OUT/l9" &
+	suite_lane fstree "$OUT/fst.bin" > "$OUT/l10" &
 	( r=$(cd docs/relay-vectors && timeout 300 "$OUT/relayvec" check . 2>&1 | tail -1); echo "relay vectors: $r" ) > "$OUT/l11" &
 	jitter_lane > "$OUT/l20" &
 	wait
@@ -166,6 +255,7 @@ for i in 1 2 3 4 5 13 17 18 19 6 14 12 15 16 20 7 8 9 10 11; do
 	l=$(cat "$OUT/l$i")
 	note "$l"
 	case "$l" in
+	*" [rc="*) FAIL=1 ;;
 	*": 0 failed"*|*": 0 failure lines"*|"scenarios: 0 failed"*|*"All tests were successful"*|*" 0 failed") ;;
 	*) FAIL=1 ;;
 	esac

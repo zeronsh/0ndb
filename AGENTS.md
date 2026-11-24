@@ -68,6 +68,9 @@
 ## Rules
 
 - No code comments.
+- Never assign `context` inside a `defer`; call a procedure that does. Odin
+  `dev-2026-11` inlines the body at every early return, and the code after that
+  return then runs with the defer's unset context.
 - Run every scratch program, benchmark and test under a memory cap in the
   same shell (`ulimit -v 4000000; <cmd>`, raise only with a reason) and a
   `timeout`. The machine has 16 GB shared with the agent host; an uncapped
