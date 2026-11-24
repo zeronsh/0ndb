@@ -103,6 +103,9 @@ evaluate :: proc(r: ^Runtime, o: Object) {
 			if x != r.self {
 				return
 			}
+			if !_intent_current(r, o) {
+				return
+			}
 			_start_from_intent(r, o, head, &it)
 			return
 		case .Interrupt, .Answer:
@@ -749,6 +752,21 @@ _convo_w :: proc(r: ^Runtime, o: Object) -> ^convo.Writer {
 		return nil
 	}
 	return w
+}
+
+@(private)
+_intent_current :: proc(r: ^Runtime, o: Object) -> bool {
+	wr := _wait_ready(r, o)
+	if wr.call == nil {
+		return false
+	}
+	wr.fresh = true
+	_, err := eng.convo_status(r.e, o, wr)
+	if err == .Pending {
+		return false
+	}
+	_wait_drop(r, wr)
+	return !eng.convo_cold(r.e, o)
 }
 
 @(private)

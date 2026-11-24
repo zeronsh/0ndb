@@ -884,7 +884,7 @@ _on_ready :: proc(data: rawptr, e: ^eng.Engine, err: eng.Error) {
 	if o == eng.space_catalog(r.e, o.space) && _attach_resume(r, o.space) {
 		return
 	}
-	if err == .None {
+	if err == .None || err == .Offline {
 		_queue_eval(r, o)
 	}
 }
