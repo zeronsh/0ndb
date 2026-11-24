@@ -252,6 +252,7 @@ _to_run :: proc(w: ^World, model: To_Observer, alloc: runtime.Allocator) {
 	_to_put(c, "n.txt", "<b2>\n")
 	_to_put(c, "r.txt", "<b3>\n")
 	_to_put(c, "s.txt", "<b4>\n")
+	_to_put(c, "q.txt", "<b5>\n")
 	if err := node_mount(w, n, oi, TO_ROOT); err != .None {
 		world_fail(w, "turn owns: mount: %v", err)
 		return
@@ -271,7 +272,16 @@ _to_run :: proc(w: ^World, model: To_Observer, alloc: runtime.Allocator) {
 		n.reg.observer.changed = nil
 		n.reg.observer.start = nil
 	}
-	c.agent = prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng))
+	own: {
+		context = instance_context(&n.inst)
+		defer node_after(n)
+		pseudo: prim.Id
+		c.agent, pseudo = eng.scope_actor(&n.e, c.conv.id, m.id, m.line)
+		if err := fs.history_register_owned_actor(m.history, c.agent, pseudo, c.conv.id); err != .None {
+			world_fail(w, "turn owns: register the turn's actor: %v", err)
+			return
+		}
+	}
 	c.r0 = _to_msg(c, .User, nil, true) or_else {}
 	_to_msg(c, .Assistant, nil, true)
 	c.r0 = c.parent
@@ -297,6 +307,7 @@ _to_run :: proc(w: ^World, model: To_Observer, alloc: runtime.Allocator) {
 		turn = fs.scope_open(n.reg, m, sid, c.agent)
 		fs.scope_read_base(turn, "r.txt", transmute([]u8)string("<b3>\n"))
 		fs.scope_read_base(turn, "n.txt", transmute([]u8)string("<b2>\n"))
+		fs.scope_read_base(turn, "q.txt", transmute([]u8)string("<b5>\n"))
 	}
 	_to_tool(c, "a.txt", "<b1>\n<A1>\n", true)
 	_to_put(c, "x.txt", "<A2>\n")
@@ -312,23 +323,41 @@ _to_run :: proc(w: ^World, model: To_Observer, alloc: runtime.Allocator) {
 		if err := eng.tree_write(&n.e, c.tree, "api.txt", transmute([]u8)string("<C1>\n"), tree_base(&n.e, c.tree)); err != .None {
 			world_fail(w, "turn owns: tree_write: %v", err)
 		}
-		for x in ([][2]string{{"r.txt", "<b3>\n<C3>\n"}, {"s.txt", "<b4>\n<C4>\n"}}) {
+		for x in ([][2]string{{"r.txt", "<b3>\n<C3>\n"}, {"s.txt", "<b4>\n<C4>\n"}, {"q.txt", "<b5>\n<C5>\n"}}) {
 			if err := eng.tree_write(&n.e, c.tree, x[0], transmute([]u8)x[1], tree_base(&n.e, c.tree)); err != .None {
 				world_fail(w, "turn owns: tree_write %s: %v", x[0], err)
 			}
 		}
 	}
 	for _ in 0 ..< 50 {
-		if d := _to_disk(c); d["s.txt"] == "<b4>\n<C4>\n" {
+		if d := _to_disk(c); d["s.txt"] == "<b4>\n<C4>\n" && d["q.txt"] == "<b5>\n<C5>\n" {
 			break
 		}
 		run_until(w, w.now + 100_000_000, false)
 	}
-	if d := _to_disk(c); d["s.txt"] != "<b4>\n<C4>\n" {
-		world_fail(w, "turn owns: the consumer's s.txt never reached disk (%q)", d["s.txt"])
+	if d := _to_disk(c); d["s.txt"] != "<b4>\n<C4>\n" || d["q.txt"] != "<b5>\n<C5>\n" {
+		world_fail(w, "turn owns: the consumer's s.txt and q.txt never reached disk (%q, %q)", d["s.txt"], d["q.txt"])
 		return
 	}
 	_to_put(c, "s.txt", "<S4>\n")
+	run_until(w, w.now + 100_000_000, false)
+	qabs := strings.concatenate({TO_ROOT, "/q.txt"}, c.alloc)
+	q_open: {
+		context = instance_context(&n.inst)
+		defer node_after(n)
+		n.writers[strings.clone(qabs, w.allocator)] = Writer_Info{scope = turn, agent = true}
+		fs.mount_observe_begin(m, "q.txt", turn)
+	}
+	_to_put(c, "q.txt", "<b5>\n<A5>\n")
+	run_until(w, w.now + 100_000_000, false)
+	q_close: {
+		context = instance_context(&n.inst)
+		defer node_after(n)
+		if qabs in n.writers {
+			key, _ := delete_key(&n.writers, qabs)
+			delete(key, w.allocator)
+		}
+	}
 	buffer: {
 		context = instance_context(&n.inst)
 		defer node_after(n)
@@ -359,13 +388,18 @@ _to_run :: proc(w: ^World, model: To_Observer, alloc: runtime.Allocator) {
 	after["api.txt"] = "<C1>\n"
 	after["r.txt"] = "<b3>\n<C3>\n"
 	after["s.txt"] = "<S4>\n"
+	after["q.txt"] = "<b5>\n<A5>\n<C5>\n"
 	after["n.txt"] = "<b2>\n<C2>\n"
+	if _to_disk(c)["q.txt"] == "<b5>\n<C5>\n<A5>\n" {
+		after["q.txt"] = "<b5>\n<C5>\n<A5>\n"
+	}
 	_to_expect(c, "after the turn", after)
 	undone := make(map[string]string, alloc)
 	undone["a.txt"] = "<b1>\n"
 	undone["api.txt"] = "<C1>\n"
 	undone["r.txt"] = "<b3>\n<C3>\n"
 	undone["s.txt"] = "<b4>\n<C4>\n"
+	undone["q.txt"] = "<b5>\n<C5>\n"
 	undone["n.txt"] = "<b2>\n<C2>\n"
 	undo: prim.Id
 	do_undo: {

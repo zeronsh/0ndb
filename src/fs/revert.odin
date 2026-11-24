@@ -360,6 +360,11 @@ actor_bound :: proc(h: ^History, v: []crdt.Lv, actor: prim.Id) -> u64 {
 	return lo
 }
 
+turn_actor :: proc(m: ^Mount, t: ^Scope) -> prim.Id {
+	return m.actor if t.actor == m.actor else scope_line_actor(m, t.actor)
+}
+
+@(private)
 scope_line_actor :: proc(m: ^Mount, actor: prim.Id) -> prim.Id {
 	ctx: blake2b.Context
 	blake2b.init(&ctx, 16)

@@ -1405,7 +1405,7 @@ attrib_default_actor :: proc(m: ^Mount, path: string) -> prim.Id {
 		return unattributed_actor(m.actor) if m.lost else a.actor
 	}
 	if t := active_scope(m); t != nil && !m.lost {
-		return t.actor
+		return turn_actor(m, t)
 	}
 	return m.actor
 }
@@ -1987,12 +1987,20 @@ scope_close :: proc(reg: ^Registry, s: ^Scope) -> Error {
 		}
 		if err != .None || deferred {
 			sm := s.mount
+			owns := active_scope(sm) == s && !sm.lost
 			for k in prim.sorted_keys(sm.dirty) {
 				if k not_in sm.dirty {
 					continue
 				}
 				v := sm.dirty[k]
-				if v == s {
+				if v == nil && owns {
+					if a, has := sm.attrib[k]; has && !a.used && a.actor != s.actor {
+						continue
+					}
+					attrib_set(sm, k, s.actor, false, {}, s.id)
+					attrib_log_append(sm, k, s.actor, {}, s.id)
+					mount_closed(sm, k)
+				} else if v == s {
 					attrib_set(sm, k, s.actor, false, {}, s.id)
 					attrib_log_append(sm, k, s.actor, {}, s.id)
 				}

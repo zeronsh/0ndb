@@ -557,7 +557,7 @@ rebase_changes :: proc(p: ^Pass) -> Error {
 		if c.scope == nil && c.scope_id == {} {
 			if a, ok := m.attrib[c.path]; ok && a.actor == actor {
 				c.scope_id = a.scope
-			} else if t := active_scope(m); t != nil && t.actor == actor {
+			} else if t := active_scope(m); t != nil && actor != m.actor && turn_actor(m, t) == actor {
 				c.scope_id = t.id
 			}
 		}
