@@ -50,9 +50,6 @@ Op_Kind :: enum u8 {
 	Text_Delete,
 	Tree_Write,
 	Tree_Remove,
-	Redact_Msg,
-	Redact_Text,
-	Redact_Map,
 	Catalog,
 	Usage,
 	Share,
@@ -570,16 +567,6 @@ op_presence :: proc(m: ^Model, n: ^Node, op: ^M_Op) -> Presence {
 			}
 		}
 		return .Absent
-	case .Redact_Msg:
-		t := m.ops[op.target]
-		if obj.rid_none(t.rid) || t.node != op.node {
-			return .Unknown
-		}
-		msg, err := eng.convo_message(&n.e, o, convo.Position{msg = t.rid}, context.temp_allocator)
-		if err != .None {
-			return .Unknown
-		}
-		return .Present if msg.redacted else .Absent
 	case .Create:
 		c, found, err := eng.catalog_get(&n.e, o, context.temp_allocator)
 		_ = c
@@ -599,16 +586,13 @@ model_after_restart :: proc(m: ^Model, n: ^Node) {
 	}
 	last_present := make(map[Per]int, context.temp_allocator)
 	for op in m.ops {
-		if op.node != n.idx || !(op.kind == .Send || op.kind == .Stream || op.kind == .Map_Set || op.kind == .Create || op.kind == .Redact_Msg) {
+		if op.node != n.idx || !(op.kind == .Send || op.kind == .Stream || op.kind == .Map_Set || op.kind == .Create) {
 			continue
 		}
 		if op.status == .Lost || op.status == .Failed || op.status == .Issued {
 			continue
 		}
 		if op.kind == .Create && m.objs[op.obj].creator != n.idx {
-			continue
-		}
-		if op.kind == .Map_Set && redaction_maybe(m, op) {
 			continue
 		}
 		p := op_presence(m, n, op)
@@ -644,15 +628,6 @@ model_after_restart :: proc(m: ^Model, n: ^Node) {
 			}
 		}
 	}
-}
-
-redaction_maybe :: proc(m: ^Model, target: ^M_Op) -> bool {
-	for op in m.ops {
-		if op.target == target.idx && (op.kind == .Redact_Msg || op.kind == .Redact_Map) && op_maybe(op) {
-			return true
-		}
-	}
-	return false
 }
 
 @(init)

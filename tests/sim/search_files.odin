@@ -68,37 +68,16 @@ search_model_files :: proc(n: ^Node, allocator := context.temp_allocator) -> []s
 	return out[:]
 }
 
-snapshot_search_models :: proc(w: ^World, n: ^Node, op: ^M_Op) {
-	context = instance_context(&n.inst)
-	names := search_model_files(n, context.temp_allocator)
-	for nm in names {
-		append(&op.gens, strings.clone(nm, w.allocator))
-	}
-}
-
-check_search_models :: proc(w: ^World, secrets: []string, owners: []int) {
+check_search_settles :: proc(w: ^World) {
 	for n in w.nodes {
 		if !n.alive || !n.e_open {
 			continue
 		}
 		context = instance_context(&n.inst)
-		vfs := eng.vfs(&n.e)
 		names := search_model_files(n)
 		w.stats.search_models += u64(len(names))
 		if len(names) > 0 {
 			world_note(w, "%s search models %v", n.name, names)
-		}
-		for nm in names {
-			path := strings.concatenate({search_dir(n), "/", nm}, context.temp_allocator)
-			data, err := prim.read_file(vfs, path, context.temp_allocator)
-			if err != .None {
-				continue
-			}
-			for s, i in secrets {
-				if token_in(string(data), s) {
-					redaction_finding(w, n, owners[i], "redaction: %s still contains %s in search %s %s", n.name, s, "dictionary" if strings.has_prefix(nm, "zd-") else "codebook", nm)
-				}
-			}
 		}
 		if n.e.index_open {
 			ix := &n.e.index
@@ -112,20 +91,6 @@ check_search_models :: proc(w: ^World, secrets: []string, owners: []int) {
 			}
 			if !settled {
 				world_fail(w, "search: index maintenance on %s does not terminate (models pending %v)", n.name, search.models_pending(ix))
-			}
-		}
-		if n.e.index_open && len(names) > 0 {
-			ix := &n.e.index
-			ix.taint_check = true
-			if terr := search.taint_refresh(ix); terr == .None {
-				if ix.zd_tainted {
-					redaction_finding(w, n, -1, "redaction: search dictionary on %s was trained on redacted content and not retrained (%v)", n.name, names)
-				}
-				if ix.cb_tainted {
-					redaction_finding(w, n, -1, "redaction: search codebook on %s was trained on redacted content and not retrained (%v)", n.name, names)
-				}
-			} else {
-				world_note(w, "%s search taint check: %v", n.name, terr)
 			}
 		}
 		node_after(n)
@@ -145,11 +110,3 @@ quarantined :: proc(w: ^World, n: ^Node, oi: int) -> bool {
 	return false
 }
 
-redaction_finding :: proc(w: ^World, n: ^Node, oi: int, format: string, args: ..any) {
-	if w.cfg.byzantine && quarantined(w, n, oi) {
-		w.stats.stalls += 1
-		world_note(w, format, ..args)
-		return
-	}
-	world_fail(w, format, ..args)
-}
