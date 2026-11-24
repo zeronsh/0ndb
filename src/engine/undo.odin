@@ -314,7 +314,11 @@ _moves_settle_step :: proc(e: ^Engine) {
 		return
 	}
 	list := make([dynamic]Object, context.temp_allocator)
-	for id, c in e.changed {
+	for id in prim.sorted_keys(e.changed) {
+		if id not_in e.changed {
+			continue
+		}
+		c := e.changed[id]
 		if .Data not_in c.kinds {
 			continue
 		}
