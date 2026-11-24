@@ -185,6 +185,7 @@ Pack :: struct {
 	want_flush:    bool,
 	closing:       bool,
 	reclaiming:    bool,
+	op_depth:      int,
 	imgs:          [dynamic]^Open_Inode,
 	img_bytes:     int,
 	img_dirty:     int,
