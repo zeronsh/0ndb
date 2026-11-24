@@ -99,8 +99,10 @@ verify_skip :: proc(m: ^Mount, p: string, disk: bool) -> bool {
 		if path_at_or_under(p, a) {
 			return true
 		}
-		if base := conflict_base(a); base != a && conflict_base(p) == base {
-			return true
+		if base := conflict_base(a); disk && base != a && conflict_base(p) == base {
+			if d, derr := probe(m, p); derr == .None && d.kind == .Missing {
+				return true
+			}
 		}
 	}
 	return false

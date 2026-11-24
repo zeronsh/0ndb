@@ -1004,6 +1004,9 @@ check_mounts :: proc(w: ^World) {
 			for l in lines {
 				strings.write_string(&have, l)
 			}
+			if owed := fs.mount_absent(sm.m); len(owed) > 0 {
+				world_fail(w, "mount: %s %s still owes absent files at quiesce: %v", n.name, sm.root, owed)
+			}
 			if strings.to_string(want) != strings.to_string(have) {
 				world_fail(w, "mount: %s disk at %s differs from tree %s:\n--- tree\n%s--- disk\n%s", n.name, sm.root, id_short(ob.o.id), strings.to_string(want), strings.to_string(have))
 			}
