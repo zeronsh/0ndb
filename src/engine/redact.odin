@@ -938,9 +938,6 @@ _relay_redacted_event :: proc(e: ^Engine, sp: ^Space, stream: osync.Stream_Id, f
 	if device == e.self {
 		return
 	}
-	if kind == .Conversation {
-		_index_relay_zeroed(e, sp, id, device, from, to)
-	}
 	sc := _object_scope(sp, id)
 	defer osync.scope_clear(&sc)
 	if osync.replicator_zero_replica(&sp.repl, &sc, device, _seg_name(kind, id), epoch, from, to) == .None {
