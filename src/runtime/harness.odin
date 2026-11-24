@@ -669,10 +669,18 @@ _proc_event :: proc(p: ^Proc, e: agent.Event) {
 	case agent.Turn_Finished:
 		run.checkpoint = clone(ev.checkpoint, run.alloc)
 		status: convo.Seal_Status = .Done if ev.status == .Done && !run.interrupting else .Interrupted
+		if status == .Done {
+			provider_auth_ok(run.r, run.ai.provider)
+		}
 		run_finish(run, status)
 	case agent.Turn_Failed:
 		run.checkpoint = clone(ev.checkpoint, run.alloc)
-		run_error(run, ev.message)
+		if ev.auth {
+			provider_auth_failed(run.r, run.ai.provider)
+			run_error(run, concat(ev.message, ". ", _not_signed_in_notice(run.r, run.ai.provider)), NOT_SIGNED_IN)
+		} else {
+			run_error(run, ev.message)
+		}
 		run_finish(run, .Interrupted if run.interrupting else .Failed)
 	case agent.Rewind_Failed:
 		run_notice(run, concat("could not rewind the agent session: ", ev.message))

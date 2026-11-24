@@ -209,6 +209,9 @@ claude_feed :: proc(d: ^Driver, v: json.Value, o: ^Output) {
 		if u := get_str(v, "uuid"); u != "" && parent == "" {
 			set(d, &d.checkpoint, u)
 		}
+		if parent == "" && get_str(v, "error") == "authentication_failed" {
+			d.auth_failed = true
+		}
 		for c in get_arr(get(v, "message"), "content") {
 			if get_str(c, "type") == "tool_use" {
 				emit(
