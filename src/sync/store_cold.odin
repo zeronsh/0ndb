@@ -58,17 +58,6 @@ _tier_cold_on :: proc "contextless" (t: ^Tier_Store) -> bool {
 }
 
 @(private)
-_tier_manifest :: proc(sp: ^Tier_Space) -> (raw: []u8, ok: bool) {
-	t := sp.t
-	if sp.man_len == 0 {
-		return nil, true
-	}
-	raw = make([]u8, int(sp.man_len), context.temp_allocator)
-	got, err := t.inner.stream_read(t.inner.data, sp.man, 0, raw)
-	return raw, err == .None && got == len(raw)
-}
-
-@(private)
 _tier_cold_scan :: proc(raw: []u8, id: Stream_Id, c: ^Tier_Cold) {
 	want := id
 	for i := 0; i + TIER_RECORD <= len(raw); i += TIER_RECORD {
@@ -95,7 +84,7 @@ _tier_cold_ref :: proc(sp: ^Tier_Space, id: Stream_Id) -> ^Tier_Cold {
 		c.refs += 1
 		return c
 	}
-	raw, ok := _tier_manifest(sp)
+	raw, ok := _tier_stream_records(sp, id)
 	if !ok {
 		return nil
 	}
@@ -159,10 +148,6 @@ _tier_cold_note :: proc(sp: ^Tier_Space, entries: []u8, segs: map[Stream_Id]Tier
 	if len(hi) == 0 {
 		return
 	}
-	raw, ok := _tier_manifest(sp)
-	if !ok {
-		return
-	}
 	ids := make([dynamic]Stream_Id, 0, len(hi), context.temp_allocator)
 	for id in hi {
 		append(&ids, id)
@@ -176,6 +161,10 @@ _tier_cold_note :: proc(sp: ^Tier_Space, entries: []u8, segs: map[Stream_Id]Tier
 		}
 		c: Tier_Cold
 		c.recs = make([dynamic]Tier_Rec, context.temp_allocator)
+		raw, ok := _tier_stream_records(sp, id)
+		if !ok {
+			continue
+		}
 		_tier_cold_scan(raw, id, &c)
 		_tier_cold_scan(entries, id, &c)
 		if target <= c.upto {
