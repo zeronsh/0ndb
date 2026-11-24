@@ -1216,18 +1216,25 @@ equal in both directions.
   walk over the ops from the common ancestor of `base` and the line to the
   line's version yields every item in document order with its insert class
   (base, in the set, outside it) and the classes of the ops that deleted it.
-  An item the set inserted is deleted; an item the set deleted comes back only
-  if neither an op outside the set nor the base also deleted it. Where an
-  outside edit lies inside text the revert removes (a line holding both an
-  outside insert and a set insert, or an outside batch that deleted text the
-  set inserted and inserted its own line, i.e. a rewrite), the line reverts to
-  its text at `base`: its outside inserts are removed, the base text that
-  rewrite deleted is restored, and the line's pre-revert text is kept as a
-  revert conflict alternative. An outside delete inside set-inserted text
-  disappears with the insert and conflicts with nothing. Tree fields follow
-  the last writer by lamport: a create by the set is removed (a file it
-  created that an outside writer edited is removed too, and its whole
-  pre-revert text, or blob, is the alternative on the removed inode), a remove
+  The decision is per line, and never produces a line nobody wrote. Lines of
+  `base` and of the text as the set alone would have it are aligned by the
+  items they share; what is left between two shared lines pairs by shared
+  items, then by position. A line the set changed that an outside writer has
+  touched since (deleted any of its characters, or inserted inside it or
+  joined to it) stays exactly as it is, deleted if they deleted it, and its
+  `base` line is the revert conflict alternative. Every other line the set
+  changed goes back: the set's line is deleted and its `base` line restored
+  in its place, unless an outside op deleted that `base` line too; extra `base` lines
+  come back with the line before them, extra lines of the set go. A hunk whose
+  result would hold a line that is in neither the current text nor `base`
+  (a missing last newline joining two lines) stays as it is. Outside text is
+  never removed. Text is classified character by character, whoever's run it
+  stands in. Tree fields follow
+  the last writer by lamport: a create by the set is removed, except
+  a file an outside writer edited, which stays with only the lines they
+  touched (and goes if none is left, or if they only deleted lines), an
+  opaque file whose last blob is an outside writer's, and a folder something
+  kept is inside; a remove
   by the set is restored when the file existed at `base` or was created
   outside the set, and a move, flags or target change, or an opaque file's
   blob, set by the set reverts unless an outside op set the same field later
