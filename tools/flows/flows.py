@@ -332,7 +332,14 @@ def f_send_first_token():
             n = len(FakeAnthropic.arrivals)
             t0 = now()
             st = c.call_async("send", object=obj, text="flows message %d" % i)
-            t1, _ = c.wait_delta(tag, has_token)
+            sealed = []
+
+            def token_or_seal(v):
+                if has_kind(v, "seal"):
+                    sealed.append(True)
+                return has_token(v)
+
+            t1, _ = c.wait_delta(tag, token_or_seal)
             if t1 is None:
                 _, sst, sres = c.wait_result(st, 5)
                 raise RuntimeError("no streamed token for send %d (send status %d %s, provider requests %d)" % (i, sst, sres, len(FakeAnthropic.arrivals) - n))
@@ -341,7 +348,8 @@ def f_send_first_token():
             ack.append(ta - t0)
             if len(FakeAnthropic.arrivals) > n:
                 request.append(FakeAnthropic.arrivals[n] - t0)
-            c.wait_delta(tag, lambda v: has_kind(v, "seal"), timeout=30)
+            if not sealed:
+                c.wait_delta(tag, lambda v: has_kind(v, "seal"), timeout=30)
             time.sleep(0.05)
         c.close()
         return row("send → first streamed token", first, True, "native provider against an instant local SSE endpoint, so this is 0ndb's own cost", dict(send_acked=ack, provider_request=request))
