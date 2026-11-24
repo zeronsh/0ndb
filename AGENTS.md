@@ -8,13 +8,15 @@
   the same with `-target:darwin_arm64` and `-target:windows_amd64`
 - Platform testing happens on real machines through Zeron `run_command`:
   macOS on `home-laptop`, Windows on `WING-PC`. No CI.
-- Cross-platform determinism: `python3 tools/xplat.py --commit <sha>` on a
-  machine with the `zeron` CLI builds `sim.simulate` at that commit on
-  Linux, `home-laptop` and `WING-PC`, runs `--seeds` (default 1-20) in
-  `--lanes` (default `default,until-run`), and passes only if every seed's
-  events and disk ops match Linux. Off Linux, name the Linux device and its
-  checkout with `--linux <device> --linux-repo <path> --linux-scratch <dir>`.
-  Run it from `home-laptop` through Zeron with `background: true`.
+- Cross-platform determinism, from `home-laptop` (it has the `zeron` CLI)
+  through Zeron `run_command` with `background: true`:
+  `python3 tools/xplat.py --commit <sha> --linux <your Linux device id> --linux-repo <its checkout> --linux-scratch <its scratch dir>`.
+  It builds `sim.simulate` at that commit on the Linux device,
+  `home-laptop` and `WING-PC`, runs `--seeds` (default 1-20) in `--lanes`
+  (default `default,until-run`), and passes only if every seed's events
+  and disk ops match Linux. On a Linux machine with the `zeron` CLI,
+  `python3 tools/xplat.py --commit <sha>` builds the Linux baseline
+  locally.
 - Tests: `odin test tests/convergence -o:speed`, `odin test tests/fstree -o:speed`,
   `odin test tests/sim -o:speed`. When several agents share the checkout,
   always pass `-out:<your scratch dir>/<name>` to `odin test` and
