@@ -33,10 +33,18 @@ Attack_Kind :: enum u8 {
 	Chain,
 }
 
+Attack_Again :: enum u8 {
+	None,
+	Crash,
+	Fault_State,
+	Fault_Work,
+}
+
 Attack_Arm :: struct {
 	kind:     Attack_Kind,
 	process:  bool,
 	checkout: bool,
+	again:    Attack_Again,
 }
 
 Attack_Out :: struct {
@@ -47,6 +55,7 @@ Attack_Out :: struct {
 	turns:   int,
 	disk:    string,
 	moved:   bool,
+	second:  bool,
 }
 
 @(private = "file")
@@ -288,10 +297,48 @@ _attack :: proc(w: ^World, arm: Attack_Arm, crash_at: u64) -> (out: Attack_Out) 
 		context = instance_context(&n.inst)
 		node_after(n)
 	}
+	if arm.again != .None {
+		for _ in 0 ..< 20_000 {
+			run_until(w, w.now + 1_000_000, true)
+			if w.stats.crashes > crashes {
+				break
+			}
+		}
+		if w.stats.crashes > crashes {
+			at := 1 + crash_at * 7 % 151
+			if arm.again == .Crash {
+				n.disk.crash_at = n.disk.stats.ops + at
+				n.disk.force_process = arm.process
+			} else {
+				n.disk.fail_root = "/data" if arm.again == .Fault_State else SA_ROOT
+				n.disk.fail_nth = at
+			}
+		}
+	}
 	run_until(w, w.now + 20_000_000_000, true)
 	n.disk.crash_at = 0
 	n.disk.force_process = false
 	out.crashed = w.stats.crashes > crashes
+	out.second = w.stats.crashes > crashes + 1 || (n.disk.fail_root != "" && n.disk.fail_nth == 0)
+	n.disk.fail_nth = 0
+	n.disk.fail_root = ""
+	if arm.again == .Fault_State && out.second {
+		if n.alive {
+			node_crash_now(n, .Process, crash_at)
+		} else {
+			kept := 0
+			for f in w.failures {
+				if strings.contains(f, "engine open failed") {
+					continue
+				}
+				w.failures[kept] = f
+				kept += 1
+			}
+			resize(&w.failures, kept)
+			schedule(w, Sim_Event{at = w.now + 500_000_000, kind = .Restart, node = n.idx})
+		}
+		run_until(w, w.now + 20_000_000_000, true)
+	}
 	run_until(w, w.now + 20_000_000_000, true)
 	if !n.alive {
 		world_fail(w, "attack: node did not come back")
@@ -354,13 +401,14 @@ step_attack :: proc(t: ^testing.T) {
 	}
 	for kind in Attack_Kind {
 		for checkout in ([]bool{false, true}) {
-			for process in ([]bool{false, true}) {
-				arm := Attack_Arm{kind = kind, process = process, checkout = checkout}
+			for bits in 0 ..< 8 {
+				process := bits & 1 != 0
+				arm := Attack_Arm{kind = kind, process = process, checkout = checkout, again = Attack_Again(bits >> 1)}
 				_, away := attack_run(1, arm, 1_000_000)
 				_, home := attack_run(1, Attack_Arm{kind = kind, process = process}, 1_000_000)
 				want := away
 				fmt.eprintf("step_attack: %v oracle main=%q feature=%q disk=%q undo=%q redo=%q\n", arm, want.lines[0], want.lines[1], want.disk, want.undo[0][0], want.redo[0][0])
-				points, bad := 0, 0
+				points, bad, second := 0, 0, 0
 				for k in u64(1) ..= 3000 {
 					failures, got := attack_run(1, arm, k)
 					wrong := len(failures) > 0
@@ -373,6 +421,7 @@ step_attack :: proc(t: ^testing.T) {
 						break
 					}
 					points += 1
+					second += 1 if got.second else 0
 					want = away if got.moved == away.moved else home
 					for j in 0 ..< 2 {
 						if got.lines[j] != want.lines[j] {
@@ -390,7 +439,7 @@ step_attack :: proc(t: ^testing.T) {
 						bad += 1
 					}
 				}
-				fmt.eprintf("step_attack: %v: points=%d wrong=%d\n", arm, points, bad)
+				fmt.eprintf("step_attack: %v: points=%d wrong=%d second=%d\n", arm, points, bad, second)
 				testing.expect(t, bad == 0, fmt.tprintf("step_attack %v: %d of %d points differ from the run with no crash", arm, bad, points))
 			}
 		}
