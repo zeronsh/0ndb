@@ -42,7 +42,8 @@ nothing, `RB_BROKEN=add|missing|bytes|exec` perturbs the expected tree. Every
 applicable step must fail; the last line counts the ones that did not.
 
 Knobs: `RB_CRASH=0` skips the crash runs, `RB_CRASH_ONLY=1` runs only them,
-`RB_CRASH_DELAYS` (0 to 13 ms), `RB_LINGER` (keeps the turn's shell alive that
+`RB_CRASH_DELAYS` (0 to 13 ms), `RB_CRASH_TRIGGER=1` (the delay counts from the
+first change seen in the tree, so the kill lands inside the undo), `RB_LINGER` (keeps the turn's shell alive that
 many seconds after its writes; a control, never a pass on its own),
 `RB_PYTHON` (the interpreter the turns run `rbop.py` with). Each failing run
 leaves `repro.json` and the daemon, host and relay logs in its directory;

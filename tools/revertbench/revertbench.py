@@ -14,6 +14,7 @@ NOOP = os.environ.get("RB_NOOP", "0") != "0"
 BROKEN = os.environ.get("RB_BROKEN", "")
 PERSON = os.environ.get("RB_PERSON", "api")
 PERSON_SETTLE = float(os.environ.get("RB_PERSON_SETTLE", "1.5"))
+TRIGGER = os.environ.get("RB_CRASH_TRIGGER", "0") != "0"
 HOLD = float(os.environ.get("RB_HOLD", "4"))
 CRASH_DELAYS = [float(x) for x in os.environ.get("RB_CRASH_DELAYS", "0,0.001,0.002,0.003,0.004,0.005,0.006,0.007,0.008,0.01,0.013").split(",") if x]
 
@@ -495,8 +496,18 @@ def run_case(case, out_root, url, crash, run="undo"):
         if not BROKEN and not NOOP and not res["ok"]:
             raise RuntimeError("setup or turn not as modelled; the operations were not run")
         if crash is not None:
+            at_start = snapshot(work)
             p = subprocess.Popen(H.LIMIT + [H.BIN, "undo", msg, "--home", dev.home], cwd=dev.dir, env=dev.env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            time.sleep(crash)
+            if TRIGGER:
+                t0 = time.time()
+                while time.time() - t0 < 0.5:
+                    try:
+                        if snapshot(work) != at_start:
+                            break
+                    except OSError:
+                        break
+            if crash:
+                time.sleep(crash)
             inside = p.poll() is None
             kill9(dev)
             try:
