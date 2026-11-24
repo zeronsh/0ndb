@@ -1440,7 +1440,7 @@ attribute_changes :: proc(p: ^Pass) -> Error {
 		replayed := false
 		last: Attrib_Step
 		cur := c.old.oid if c.kind == .Modify else odb.Oid{}
-		for st in steps_pending(m, steps[:], cur) or_return {
+		for st in steps_pending(m, steps[:], cur) {
 			if st.step == {} && st.oid == cur {
 				continue
 			}
@@ -1517,17 +1517,32 @@ attrib_chain_settle :: proc(p: ^Pass) {
 	for k in drop {
 		attrib_chain_drop(m, k)
 	}
+	landed_settle(m)
 }
 
 @(private)
-steps_pending :: proc(m: ^Mount, steps: []Attrib_Step, shown: odb.Oid) -> (pending: []Attrib_Step, err: Error) {
-	#reverse for st, i in steps {
-		landed := history_step_landed(m.history, st.step) or_return
-		if landed || (st.step == {} && st.scope != {} && shown != {} && st.oid == shown) {
-			return steps[i + 1:], .None
+landed_settle :: proc(m: ^Mount) {
+	if len(m.attrib_chain) > 0 {
+		return
+	}
+	for _, a in prim.unordered(m.attrib) {
+		if !a.used && a.step != {} {
+			return
 		}
 	}
-	return steps, .None
+	clear(&m.landed)
+	m.landed_gone = false
+}
+
+@(private)
+steps_pending :: proc(m: ^Mount, steps: []Attrib_Step, shown: odb.Oid) -> []Attrib_Step {
+	#reverse for st, i in steps {
+		landed := st.step != {} && (st.step in m.landed || m.landed_gone)
+		if landed || (st.step == {} && st.scope != {} && shown != {} && st.oid == shown) {
+			return steps[i + 1:]
+		}
+	}
+	return steps
 }
 
 @(private)
@@ -1575,7 +1590,7 @@ replay_departing :: proc(m: ^Mount, long: runtime.Allocator, out: ^Replayed) -> 
 		}
 		c := Change{kind = .Modify, path = path, disk = .File, old = e}
 		cur := e.oid
-		for st in steps_pending(m, steps, e.oid) or_return {
+		for st in steps_pending(m, steps, e.oid) {
 			if st.step == {} && st.oid == cur {
 				continue
 			}
