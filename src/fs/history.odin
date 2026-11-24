@@ -2021,9 +2021,13 @@ apply_batch :: proc(h: ^History, b: ^crdt.Batch, stream: u32, off: u64) -> Error
 		}
 		files[i] = f
 	}
+	fresh := !author_known(h, b.actor)
 	first, skip, gerr := crdt.graph_add(&h.g, b)
 	if gerr != .None {
 		return .Corrupt
+	}
+	if fresh {
+		author_arrived(h, b.actor) or_return
 	}
 	n := crdt.batch_len(b)
 	for sp, i in spans {
@@ -3158,10 +3162,7 @@ apply_actor_record :: proc(h: ^History, device: prim.Id, body: []u8) -> Error {
 	}
 	d := device
 	kv_put(&h.kv, fshist.actor_key(a), d[:]) or_return
-	if _, wanted := kv_get(&h.kv, author_wanted_key(a), context.temp_allocator) or_return; wanted {
-		kv_del(&h.kv, author_wanted_key(a)) or_return
-		h.resolved += 1
-	}
+	author_arrived(h, a) or_return
 	if owner == {} {
 		return .None
 	}
@@ -3178,8 +3179,20 @@ author_wanted_key :: proc(actor: prim.Id) -> []u8 {
 }
 
 @(private)
+author_arrived :: proc(h: ^History, actor: prim.Id) -> Error {
+	if _, wanted := kv_get(&h.kv, author_wanted_key(actor), context.temp_allocator) or_return; wanted {
+		kv_del(&h.kv, author_wanted_key(actor)) or_return
+		h.resolved += 1
+	}
+	return .None
+}
+
+@(private)
 author_known :: proc(h: ^History, actor: prim.Id) -> bool {
 	if _, ok := history_actor_owner(h, actor); ok || actor == h.self {
+		return true
+	}
+	if _, ok := crdt.graph_actor(&h.g, actor); ok {
 		return true
 	}
 	for id in h.stream_ids {
@@ -3336,7 +3349,7 @@ history_span_owner :: proc(h: ^History, op: crdt.Op_Id, devices: []prim.Id) -> (
 	if !known {
 		return Span_Owner{kind = .Unresolved}, .None
 	}
-	if lv, ok := crdt.graph_lv(&h.g, op); ok && a == op.actor {
+	if lv, ok := crdt.graph_lv(&h.g, op if a == op.actor else crdt.Op_Id{a, 0}); ok {
 		if _, _, stream, _, found := history_batch_at(h, lv); found && int(stream) < len(h.stream_ids) {
 			o.device = h.stream_ids[stream]
 		}
