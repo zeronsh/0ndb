@@ -159,12 +159,12 @@ op_tree_find :: proc(c: ^Call, o: ^Out) -> Status {
 	return .Ok
 }
 
-emit_spans :: proc(o: ^Out, data: []u8, spans: []crdt.Author_Span) {
+emit_spans :: proc(o: ^Out, data: []u8, spans: []crdt.Author_Span, owners: []fs.Span_Owner = nil) {
 	o_text(o, "text", data)
 	o_arr(o, "spans", len(spans))
 	at := 0
 	line: u64 = 1
-	for s in spans {
+	for s, k in spans {
 		lo := min(at, len(data))
 		hi := min(at + s.len, len(data))
 		l0 := line
@@ -183,6 +183,13 @@ emit_spans :: proc(o: ^Out, data: []u8, spans: []crdt.Author_Span) {
 		o_id(o, "op_actor", s.op.actor)
 		o_u64(o, "op_seq", s.op.seq)
 		o_bool(o, "redacted", s.redacted)
+		if owners != nil {
+			w := owners[k]
+			o_enum(o, "owner", u64(w.kind), OWNER_NAMES[:])
+			o_id(o, "conversation", w.conversation)
+			o_id(o, "scope", w.scope)
+			o_id(o, "device", w.device)
+		}
 		o_end(o)
 		at = hi
 	}
@@ -197,11 +204,12 @@ op_tree_blame :: proc(c: ^Call, o: ^Out) -> Status {
 		context = eng.context_for(c.api.e)
 		fs.mount_sync(m.mount)
 	}
-	data, spans, err := eng.tree_blame(c.api.e, ob, path, context.temp_allocator, line)
+	owners: []fs.Span_Owner
+	data, spans, err := eng.tree_blame(c.api.e, ob, path, context.temp_allocator, line, &owners)
 	if err != .None {
 		return status_of(err)
 	}
 	o_str(o, "line", eng.tree_line(c.api.e, ob, line))
-	emit_spans(o, data, spans)
+	emit_spans(o, data, spans, owners)
 	return .Ok
 }

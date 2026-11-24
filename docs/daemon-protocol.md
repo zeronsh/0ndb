@@ -786,7 +786,7 @@ up exist only over the socket.
 | 93 | `tree.mount` | object: object, root: str | {} |
 | 94 | `tree.unmount` | object: object, root: str | {} |
 | 95 | `tree.mounts` | – | mounts:[Mounted] |
-| 96 | `tree.blame` | object: object, path: str, line: str | line:str text:str spans:[Span] |
+| 96 | `tree.blame` | object: object, path: str, line: str | line:str text:str spans:[BlameSpan] |
 | 97 | `tree.sync` | object: object, root: str | {} |
 | 98 | `tree.find` | path: str | object:object root:str rel:str |
 
