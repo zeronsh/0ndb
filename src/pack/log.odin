@@ -1,5 +1,7 @@
 package pack
 
+import "core:fmt"
+
 import "core:hash/xxhash"
 import "core:slice"
 import "../prim"
@@ -746,6 +748,7 @@ _apply_unlinks :: proc(p: ^Pack) -> Error {
 			continue
 		}
 		pb: prim.Path_Buf
+		if u.inum == 0x521 { fmt.eprintln("DBG521 remove", p.root, "durable", p.durable_seq) }
 		if e := prim.remove(p.base, _phys_path(p, &pb, 'x', u.inum)); e != .None && e != .Not_Found {
 			return _poison(p, e)
 		}

@@ -1,5 +1,7 @@
 package pack
 
+import "core:fmt"
+
 import "../prim"
 
 VFD_BASE :: prim.Fd(0x4000_0000)
@@ -1001,6 +1003,7 @@ _v_unlink :: proc(data: rawptr, path: string) -> Error {
 	}
 	kb: [MAX_KEY]u8
 	_put(p, _dkey(kb[:], parent, name), nil, true) or_return
+	if inum == 0x521 { fmt.eprintln("DBG521 unlink", p.root, rel, "seq", p.seq) }
 	_drop_inode(p, inum) or_return
 	return _maybe_flush(p)
 }
@@ -1204,6 +1207,7 @@ _v_rename :: proc(data: rawptr, old: string, new: string) -> Error {
 	_put(p, _dkey(kb[:], dp, dname), _dval(vb[:], sinum, skind), false) or_return
 	_put(p, _dkey(kb[:], sp, sname), nil, true) or_return
 	if dfound && dinum != sinum {
+		if dinum == 0x521 { fmt.eprintln("DBG521 rename over", p.root, orel, "->", nrel, "seq", p.seq) }
 		_drop_inode(p, dinum) or_return
 	}
 	return _maybe_flush(p)

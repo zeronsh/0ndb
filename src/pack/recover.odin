@@ -1,5 +1,7 @@
 package pack
 
+import "core:fmt"
+
 import "core:hash/xxhash"
 import "core:mem/virtual"
 import "core:slice"
@@ -806,6 +808,7 @@ _destroy_inode :: proc(p: ^Pack, inum: u64, orphan: bool) -> Error {
 	kb: [16]u8
 	if found {
 		if ino.kind == .External {
+			if inum == 0x521 { fmt.eprintln("DBG521 destroy", p.root, "orphan", orphan, "seq", p.seq, "durable", p.durable_seq) }
 			append(&p.unlinks, Pending_Unlink{inum = inum, need = p.seq})
 		}
 		_inode_store(p, inum, &ino, nil) or_return
