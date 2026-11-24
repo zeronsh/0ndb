@@ -260,6 +260,7 @@ _proc_spawn :: proc(p: ^Proc) -> Error {
 	}
 	child, serr := spawn_child(r, &req)
 	if serr != .None {
+		_provider_forget(r, p.desc.id)
 		return .Spawn
 	}
 	r.stats.spawns += 1
