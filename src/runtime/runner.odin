@@ -427,7 +427,7 @@ _candidate :: proc(r: ^Runtime, o: Object) -> bool {
 	if _, known := _descriptor(r, prov); !known {
 		return true
 	}
-	return _list_has(_providers_local(r), prov)
+	return _provider_installed(r, prov)
 }
 
 @(private)
