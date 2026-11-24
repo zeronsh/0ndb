@@ -703,7 +703,6 @@ _hist_rebuild :: proc(e: ^Engine, h: ^Handle, hist: ^fs.History, shuffled: bool)
 	db := device_odb(e) or_return
 	opts := _hist_options(h)
 	opts.keep_at_least = 0
-	opts.redacted = {}
 	re := _ferr2(fs.history_create(e.vfs, scratch, h.id, e.self, db, fs.Stream_Source{data = h, read = _hist_read}, e.allocator, opts)) or_return
 	defer fs.history_release(re)
 	limits := make(map[prim.Id]i64, 8, context.temp_allocator)
