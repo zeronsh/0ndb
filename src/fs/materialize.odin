@@ -5,7 +5,6 @@ import "core:crypto/blake2b"
 import "core:slice"
 import "core:io"
 import "core:mem/virtual"
-import "core:strconv"
 import "../crdt"
 import "../fshist"
 import "../fstree"
@@ -1411,12 +1410,33 @@ mat_unstage :: proc(m: ^Mount, ms: ^Mat_Sync, from: int) {
 }
 
 mount_sweep_temp :: proc(m: ^Mount, dir: string, name: string) {
-	if !m.sweep_temps || !name_our_temp(name) {
+	if !m.sweep_temps || !name_our_temp(name, m.id) {
 		return
 	}
 	buf: prim.Path_Buf
 	if p, ok := path_join_buf(buf[:], dir, name); ok {
 		prim.remove(m.vfs, p)
+	}
+}
+
+@(private)
+mount_sweep_dir :: proc(m: ^Mount, rel: string) -> Error {
+	if !m.sweep_temps {
+		return .None
+	}
+	abuf: prim.Path_Buf
+	abs := abs_path(m, rel, abuf[:])
+	d: prim.Dir
+	if err := prim.dir_open(m.vfs, &d, abs, runtime.heap_allocator()); err != .None {
+		return .None if gone(err) else from_prim(err)
+	}
+	defer prim.dir_close(m.vfs, &d)
+	for {
+		de, more, err := prim.dir_next(m.vfs, &d)
+		if err != .None || !more {
+			return from_prim(err)
+		}
+		mount_sweep_temp(m, abs, de.name)
 	}
 }
 
@@ -1590,13 +1610,8 @@ ensure_parent :: proc(m: ^Mount, abs: string) -> Error {
 @(private)
 temp_name :: proc(m: ^Mount, abs: string, allocator: runtime.Allocator) -> string {
 	m.fence_seq += 1
-	digits: [24]u8
-	num := strconv.write_uint(digits[:], m.fence_seq, 10)
-	parent := path_parent_abs(abs)
-	name := make([]u8, len(TEMP_PREFIX) + len(num), allocator)
-	copy(name, TEMP_PREFIX)
-	copy(name[len(TEMP_PREFIX):], num)
-	out, _ := path_join(parent, string(name), allocator)
+	name := own_temp_name(m.id, "", m.fence_seq, allocator)
+	out, _ := path_join(path_parent_abs(abs), name, allocator)
 	return out
 }
 

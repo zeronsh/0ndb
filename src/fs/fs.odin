@@ -34,6 +34,7 @@ Error :: enum u8 {
 
 STATE_NAME :: ".0ndb"
 TEMP_PREFIX :: ".0ndb-tmp-"
+FENCE_INFIX :: "fence-"
 
 from_prim :: proc "contextless" (e: prim.Error) -> Error {
 	switch e {

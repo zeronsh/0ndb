@@ -11,6 +11,15 @@ import "../../src/prim"
 @(private = "file")
 MM_ROOT :: "/work/midway-n0"
 
+@(private = "file", rodata)
+MM_LOOKALIKES := [?]string {
+	".0ndb-tmp-9x",
+	".0ndb-tmp-999",
+	".0ndb-tmp-fence-9",
+	".0ndb-tmp-00000000000000000000000000000000-9",
+	".0ndb-tmp-fence-00000000000000000000000000000000-9",
+}
+
 @(private = "file")
 MM_FILES :: [?]string{"a.txt", "b.txt", "c.txt", "d.txt", "e.txt"}
 
@@ -172,6 +181,7 @@ _mm_run :: proc(w: ^World, c: Mm_Case) -> (failed_pass: bool, crashed: bool) {
 	}
 	injected := a.disk.stats.injected
 	inc := a.incarnation
+	mid := m.id
 	for _ in 0 ..< 400 {
 		if a.disk.stats.injected > injected {
 			break
@@ -259,8 +269,11 @@ _mm_run :: proc(w: ^World, c: Mm_Case) -> (failed_pass: bool, crashed: bool) {
 	if failed_pass && a.alive && (c.mode == .Process || c.mode == .Power || c.mode == .Midcrash || c.mode == .Dirs_Power) {
 		node_crash_now(a, .Power if c.mode == .Power || c.mode == .Dirs_Power else .Process, c.k)
 		if c.mode == .Midcrash {
-			_mm_write(vfs, MM_ROOT + "/.0ndb-tmp-999", "left by a crashed pass\n")
-			_mm_write(vfs, MM_ROOT + "/.0ndb-tmp-9x", "a user's file\n")
+			_mm_write(vfs, fmt.tprintf("%s/%s", MM_ROOT, fs.own_temp_name(mid, "", 999, context.temp_allocator)), "left by a crashed pass\n")
+			_mm_write(vfs, fmt.tprintf("%s/%s", MM_ROOT, fs.own_temp_name(mid, fs.FENCE_INFIX, 999, context.temp_allocator)), "left by a crashed fence\n")
+			for x in MM_LOOKALIKES {
+				_mm_write(vfs, fmt.tprintf("%s/%s", MM_ROOT, x), "a user's file\n")
+			}
 		}
 	}
 	a.disk.fail_stuck = false
@@ -343,25 +356,25 @@ _mm_run :: proc(w: ^World, c: Mm_Case) -> (failed_pass: bool, crashed: bool) {
 	a.disk.quiet = true
 	merr := fs.mount_synced_mismatches(m, &out, context.temp_allocator)
 	d: prim.Dir
-	lookalike := false
+	lookalike := 0
 	if prim.dir_open(vfs, &d, MM_ROOT, context.temp_allocator) == .None {
 		for {
 			de, more, derr := prim.dir_next(vfs, &d)
 			if derr != .None || !more {
 				break
 			}
-			if fs.name_our_temp(de.name) {
+			if fs.name_our_temp(de.name, m.id) {
 				world_fail(w, "midway: %s/%s is left on disk after a materialize failed at op %d (%v)", MM_ROOT, de.name, c.k, c.mode)
 			}
-			if de.name == ".0ndb-tmp-9x" {
-				lookalike = true
+			for x in MM_LOOKALIKES {
+				lookalike += int(de.name == x)
 			}
 		}
 		prim.dir_close(vfs, &d)
 	}
 	a.disk.quiet = false
-	if c.mode == .Midcrash && failed_pass && !lookalike {
-		world_fail(w, "midway: the sweep after a crash at op %d removed %s/.0ndb-tmp-9x, which is not a temp of ours", c.k, MM_ROOT)
+	if c.mode == .Midcrash && failed_pass && lookalike != len(MM_LOOKALIKES) {
+		world_fail(w, "midway: the sweep after a crash at op %d left %d of %d files in %s that only look like a temp of ours", c.k, lookalike, len(MM_LOOKALIKES), MM_ROOT)
 	}
 	if merr == .None {
 		for x in out {

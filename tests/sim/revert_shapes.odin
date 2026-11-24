@@ -881,7 +881,7 @@ _rs_crash_case :: proc(w: ^World, cs: Rs_Case, k: u64, fault: bool, alloc: runti
 		return
 	}
 	got := _rs_read(c, c.alloc)
-	if left := _rs_strip(&got); len(left) > 0 && _rs_all() {
+	if left := _rs_strip(&got); len(left) > 0 {
 		world_fail(w, "shapes %s: LEFT after a crash at disk op %d: %s", cs.name, k, left)
 	}
 	if len(_rs_diff(r.undoneq, got)) > 0 && len(_rs_diff(r.post, got)) > 0 {
@@ -911,7 +911,9 @@ _rs_crash_case :: proc(w: ^World, cs: Rs_Case, k: u64, fault: bool, alloc: runti
 	}
 	run_until(w, w.now + 20_000_000_000, true)
 	fin := _rs_read(c, c.alloc)
-	_rs_strip(&fin)
+	if left := _rs_strip(&fin); len(left) > 0 {
+		world_fail(w, "shapes %s: LEFT after the resume of a crash at disk op %d: %s", cs.name, k, left)
+	}
 	if len(_rs_diff(r.undoneq, fin)) > 0 {
 		world_fail(w, "shapes %s: RESUME after a crash at disk op %d:%s", cs.name, k, _rs_diff(r.undoneq, fin))
 	}
