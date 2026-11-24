@@ -1508,7 +1508,7 @@ landed_settle :: proc(m: ^Mount) {
 		return
 	}
 	for _, a in prim.unordered(m.attrib) {
-		if !a.used && a.step != {} {
+		if a.step != {} && (!a.used || m.lost) {
 			return
 		}
 	}
