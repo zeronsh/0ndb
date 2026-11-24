@@ -22,23 +22,43 @@ MOVE_SETTLE_WINDOW_MS :: 600_000
 
 @(private)
 Move_Wait :: struct {
-	o:     Object,
-	move:  prim.Id,
-	ready: Ready,
+	o:        Object,
+	move:     prim.Id,
+	ready:    Ready,
+	released: bool,
+	reverts:  []convo.Undone_Revert,
 }
 
 convo_move_on_disk :: proc(e: ^Engine, o: Object, move: prim.Id, ready: Ready = {}) -> Error {
 	context = context_for(e)
-	done := _cu_on_disk(e, o, move) or_return
-	if done {
-		return .None
+	for mw in e.move_waits {
+		if mw.move == move && mw.ready.data == ready.data && ready.call != nil {
+			return .Pending
+		}
+	}
+	released, reverts, rerr := _cu_move_reverts(e, o, move, context.temp_allocator)
+	if rerr == .Missing {
+		h := _handle_get(e, o, .Conversation) or_return
+		if ready.call == nil {
+			return .Pending
+		}
+		return _wait(e, h, ready)
+	}
+	rerr or_return
+	if released {
+		done := _cu_reverts_on_disk(e, reverts) or_return
+		if done {
+			return .None
+		}
 	}
 	if ready.call == nil {
 		return .Pending
 	}
-	append(&e.move_waits, Move_Wait{o = o, move = move, ready = ready})
-	if u, uerr := _cu_undone_of(e, o, move); uerr == .None && e.plug.reg_on {
-		for r in u.reverts {
+	mw := Move_Wait{o = o, move = move, ready = ready, released = released}
+	_cu_keep_reverts(e, &mw, reverts)
+	append(&e.move_waits, mw)
+	if e.plug.reg_on {
+		for r in reverts {
 			for mt in e.plug.mounts {
 				if mt.object.id == r.tree {
 					fs.mount_on_materialized(&mt.mount, _move_materialized, e)
@@ -47,6 +67,26 @@ convo_move_on_disk :: proc(e: ^Engine, o: Object, move: prim.Id, ready: Ready = 
 		}
 	}
 	return .Pending
+}
+
+@(private)
+_cu_keep_reverts :: proc(e: ^Engine, mw: ^Move_Wait, reverts: []convo.Undone_Revert) {
+	_cu_free_reverts(e, mw)
+	out := make([]convo.Undone_Revert, len(reverts), e.allocator)
+	for r, i in reverts {
+		out[i] = r
+		out[i].line = strings.clone(r.line, e.allocator)
+	}
+	mw.reverts = out
+}
+
+@(private)
+_cu_free_reverts :: proc(e: ^Engine, mw: ^Move_Wait) {
+	for r in mw.reverts {
+		delete(r.line, e.allocator)
+	}
+	delete(mw.reverts, e.allocator)
+	mw.reverts = nil
 }
 
 @(private)
@@ -61,44 +101,74 @@ _move_waits_run :: proc(e: ^Engine) {
 	if len(e.move_waits) == 0 {
 		return
 	}
-	fire := make([dynamic]Move_Wait, context.temp_allocator)
+	fire := make([dynamic]Ready, context.temp_allocator)
 	for i := 0; i < len(e.move_waits); {
-		mw := e.move_waits[i]
-		done, err := _cu_on_disk(e, mw.o, mw.move)
+		mw := &e.move_waits[i]
+		if !mw.released {
+			released, reverts, rerr := _cu_move_reverts(e, mw.o, mw.move, context.temp_allocator)
+			if rerr == .Missing {
+				if h, herr := _handle_get(e, mw.o, .Conversation); herr == .None {
+					_wait(e, h, Ready{data = e, call = proc(data: rawptr, e: ^Engine, err: Error) {
+						_touch(e)
+					}})
+				}
+				i += 1
+				continue
+			}
+			if rerr != .None {
+				append(&fire, Ready{data = mw.ready.data, call = mw.ready.call})
+				_cu_free_reverts(e, mw)
+				ordered_remove(&e.move_waits, i)
+				continue
+			}
+			if !released {
+				i += 1
+				continue
+			}
+			mw.released = true
+			_cu_keep_reverts(e, mw, reverts)
+		}
+		done, err := _cu_reverts_on_disk(e, mw.reverts)
 		if err != .None || done {
+			append(&fire, Ready{data = mw.ready.data, call = mw.ready.call, fresh = err == .None})
+			_cu_free_reverts(e, mw)
 			ordered_remove(&e.move_waits, i)
-			append(&fire, Move_Wait{o = mw.o, move = mw.move, ready = Ready{data = mw.ready.data, call = mw.ready.call, fresh = err == .None}})
 			continue
 		}
 		i += 1
 	}
-	for mw in fire {
-		if mw.ready.call != nil {
+	for r in fire {
+		if r.call != nil {
 			context = _outer(e)
-			mw.ready.call(mw.ready.data, e, .None if mw.ready.fresh else .Io)
+			r.call(r.data, e, .None if r.fresh else .Io)
 		}
 	}
 }
 
 @(private)
-_cu_on_disk :: proc(e: ^Engine, o: Object, move: prim.Id) -> (done: bool, err: Error) {
+_cu_move_reverts :: proc(e: ^Engine, o: Object, move: prim.Id, allocator: runtime.Allocator) -> (released: bool, reverts: []convo.Undone_Revert, err: Error) {
 	st, found := _cu_undo_state(e, o, move) or_return
 	if !found {
-		return false, .Not_Found
+		return false, nil, .Not_Found
 	}
 	if st.phase != .Released {
-		return false, .None
+		return false, nil, .None
 	}
 	u, uerr := _cu_undone_of(e, o, move)
 	if uerr == .Not_Found {
-		return true, .None
+		return true, nil, .None
 	} else if uerr != .None {
-		return false, uerr
+		return false, nil, uerr
 	}
+	return true, u.reverts, .None
+}
+
+@(private)
+_cu_reverts_on_disk :: proc(e: ^Engine, reverts: []convo.Undone_Revert) -> (done: bool, err: Error) {
 	if !e.plug.reg_on {
 		return true, .None
 	}
-	for r in u.reverts {
+	for r in reverts {
 		for mt in e.plug.mounts {
 			ml := mt.mount.line if len(mt.mount.line) > 0 else "main"
 			if mt.object.id != r.tree || ml != r.line {
@@ -109,9 +179,11 @@ _cu_on_disk :: proc(e: ^Engine, o: Object, move: prim.Id) -> (done: bool, err: E
 				continue
 			}
 			has, herr := fs.history_version_has(m.history, fs.mount_placed(m), r.revert)
-			if herr == .Not_Found {
+			#partial switch herr {
+			case .None:
+			case .Not_Found, .Busy, .Reloading, .Deferred:
 				return false, .None
-			} else if herr != .None {
+			case:
 				return false, _ferr(herr)
 			}
 			if !has {
@@ -481,6 +553,40 @@ convo_undo_drive :: proc(e: ^Engine, o: Object, undo: prim.Id) -> Error {
 @(private)
 _cu_drive :: proc(e: ^Engine, o: Object, undo: prim.Id, fresh: bool) -> Error {
 	context = context_for(e)
+	err := _cu_drive_once(e, o, undo, fresh)
+	if err == .Missing {
+		h := _handle_get(e, o, .Conversation) or_return
+		r := new(Cu_Redrive, e.allocator)
+		r^ = Cu_Redrive{e = e, o = o, move = undo}
+		werr := _wait(e, h, Ready{data = r, call = proc(data: rawptr, e: ^Engine, err: Error) {
+			r := (^Cu_Redrive)(data)
+			ee, oo, mm := r.e, r.o, r.move
+			free(r, ee.allocator)
+			context = context_for(ee)
+			if err == .None {
+				if _cu_drive(ee, oo, mm, false) == .Pending && ee.undo_hooks.pending != nil {
+					ee.undo_hooks.pending(ee.undo_hooks.data, ee, oo, mm)
+				}
+			}
+		}})
+		if werr != .Pending {
+			free(r, e.allocator)
+			return werr
+		}
+		return .Pending
+	}
+	return err
+}
+
+@(private)
+Cu_Redrive :: struct {
+	e:    ^Engine,
+	o:    Object,
+	move: prim.Id,
+}
+
+@(private)
+_cu_drive_once :: proc(e: ^Engine, o: Object, undo: prim.Id, fresh: bool) -> Error {
 	st, found := _cu_undo_state(e, o, undo) or_return
 	if !found {
 		return .Not_Found

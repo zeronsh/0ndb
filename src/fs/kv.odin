@@ -11,6 +11,8 @@ KV_IDX_MAGIC :: u64(0x3178_6469_7662_6430)
 KV_HEADER :: 4096
 KV_LOG_HEADER :: 16
 KV_SLOT :: 16
+
+kv_rebuild_every: u64
 KV_MIN_CAP :: u64(256)
 KV_MAX_RECORD :: 64 << 20
 KV_LOG_MARKED :: u32(1)
@@ -40,6 +42,7 @@ Kv :: struct {
 	out:       [dynamic]u8,
 	mapped:    []u8,
 	map_lock:  ^sync.Mutex,
+	commits:     u64,
 }
 
 @(private = "file")
@@ -190,8 +193,9 @@ kv_commit :: proc(kv: ^Kv) -> Error {
 		return .Invalid
 	}
 	want := kv_cap_for(kv.used + u64(len(kv.order)) + 1)
-	if want > kv.cap {
-		kv_rebuild(kv, want) or_return
+	kv.commits += 1
+	if want > kv.cap || kv_rebuild_every > 0 && kv.commits % kv_rebuild_every == 0 {
+		kv_rebuild(kv, max(want, kv.cap)) or_return
 	}
 	if kv.clean_disk {
 		kv_write_header(kv, false)

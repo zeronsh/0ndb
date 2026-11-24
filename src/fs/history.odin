@@ -132,6 +132,7 @@ History :: struct {
 	mark:       u64,
 	mark_fp:    [3]u64,
 	content_mark: u64,
+	content_dirty: bool,
 	staged:     [dynamic]Staged_Blob,
 	mounts:     [dynamic]^Mount,
 	pins:       [dynamic]odb.Oid,
@@ -140,6 +141,7 @@ History :: struct {
 	rebuilding: bool,
 	own_wait:   bool,
 	persist_due: bool,
+	groups_blocked: bool,
 	keep_actors: [dynamic]prim.Id,
 	replay_repl: map[i64]i64,
 	own_next:   map[prim.Id]u64,
@@ -396,12 +398,26 @@ history_durable_mark :: proc "contextless" (h: ^History) -> u64 {
 	return h.mark
 }
 
+history_groups_blocked :: proc "contextless" (h: ^History) -> bool {
+	return h.groups_blocked
+}
+
+history_groups_retry :: proc(h: ^History) -> Error {
+	if !h.groups_blocked {
+		return .None
+	}
+	return history_durable(h, h.durable)
+}
+
 history_mark_refresh :: proc(h: ^History) {
 	fp := history_fp(h)
 	if fp != h.mark_fp {
 		h.mark += 1
+		if h.content_dirty {
+			h.content_mark = h.mark
+			h.content_dirty = false
+		}
 		h.mark_fp = fp
-		h.content_mark = h.mark
 	}
 }
 
@@ -433,11 +449,18 @@ history_durable :: proc(h: ^History, mark: u64) -> Error {
 		h.kv_at = 0
 	}
 	committed, cerr := history_commit_groups(h)
+	blocked := cerr == .Busy
+	if blocked {
+		committed = false
+		cerr = .None
+	}
 	if cerr != .None {
 		h.durable = prev
 		return cerr
 	}
-	if committed {
+	h.groups_blocked = blocked
+	if blocked {
+	} else if committed {
 		if h.mark <= h.mark_taken {
 			h.mark += 1
 		}
@@ -1010,6 +1033,9 @@ Import_File :: struct {
 }
 
 history_commit_import :: proc(h: ^History, b: ^crdt.Batch, line: Maybe(string) = nil) -> (off: i64, err: Error) {
+	defer if err == .None {
+		h.content_dirty = true
+	}
 	history_wake(h) or_return
 	parents := make([dynamic]crdt.Lv, context.temp_allocator)
 	skip, gerr := crdt.graph_check(&h.g, b, &parents)
@@ -1112,6 +1138,9 @@ import_apply :: proc(h: ^History, b: ^crdt.Batch, stream: u32, off: u64) -> Erro
 }
 
 history_commit_local :: proc(h: ^History, b: ^crdt.Batch, line: Maybe(string) = nil) -> (off: i64, err: Error) {
+	defer if err == .None {
+		h.content_dirty = true
+	}
 	history_wake(h) or_return
 	parents := make([dynamic]crdt.Lv, context.temp_allocator)
 	skip, gerr := crdt.graph_check(&h.g, b, &parents)

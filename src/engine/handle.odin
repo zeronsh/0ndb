@@ -1056,6 +1056,7 @@ cancel_waits :: proc(e: ^Engine, data: rawptr) {
 	context = context_for(e)
 	for j := 0; j < len(e.move_waits); {
 		if e.move_waits[j].ready.data == data {
+			_cu_free_reverts(e, &e.move_waits[j])
 			ordered_remove(&e.move_waits, j)
 			continue
 		}

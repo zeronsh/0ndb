@@ -1263,3 +1263,89 @@ branch_seeds :: proc(t: ^testing.T) {
 	fmt.eprintf("branch_seeds: %d seeds, %d failed\n", count, bad)
 	testing.expect(t, bad == 0, fmt.tprintf("branch_seeds: %d failures", bad))
 }
+
+@(private = "file")
+_bm_run :: proc(w: ^World, arena: ^virtual.Arena, count: int) {
+	if virtual.arena_init_growing(arena, 1 << 20) != nil {
+		return
+	}
+	alloc := virtual.arena_allocator(arena)
+	c, ok := _br_build(w, alloc)
+	if !ok {
+		world_fail(w, "branch many: build failed")
+		return
+	}
+	u_b, bok := _br_edit(c, c.r0)
+	if !bok {
+		world_fail(w, "branch many: the edit failed")
+		return
+	}
+	c.parent = u_b
+	if _, _, tok := _br_turn(c, false, {{"a.txt", "<B1>\n<b2>\n<b3>\n"}, {"y.txt", "<B2>\n"}}); !tok {
+		world_fail(w, "branch many: the turn on B failed")
+		return
+	}
+	want_a := _br_map({"a.txt", "<b1>\n<A1>\n<b3>\n"}, {"x.txt", "<A2>\n"})
+	defer delete(want_a)
+	want_b := _br_map({"a.txt", "<B1>\n<b2>\n<b3>\n"}, {"b.txt", "<b4>\n<b5>\n<t0>\n"}, {"y.txt", "<B2>\n"})
+	defer delete(want_b)
+	for k in 0 ..< count {
+		to := c.u_a if k % 2 == 0 else u_b
+		want := want_a if k % 2 == 0 else want_b
+		if err := _br_switch(c, to); err != .None && err != .Pending {
+			world_fail(w, "branch many: switch %d: %v", k, err)
+			return
+		}
+		run_until(w, w.now + 3_000_000_000, true)
+		got := _br_disk(c)
+		if !_br_same_disk(got, want) {
+			world_fail(w, "branch many: after switch %d the tree holds %v, not %v", k, got, want)
+			return
+		}
+		pos, _ := _br_position(c, c.n)
+		m, mok := _bs_msg_of(c, pos)
+		if !mok || (pos != to && m.parent != to) {
+			world_fail(w, "branch many: after switch %d the position %v is not on %v", k, pos, to)
+			return
+		}
+	}
+}
+
+@(private = "file")
+_bs_msg_of :: proc(c: ^Br_Ctx, at: obj.Rid) -> (m: convo.Message, ok: bool) {
+	n := c.n
+	context = instance_context(&n.inst)
+	defer node_after(n)
+	x, err := eng.convo_message(&n.e, c.conv, {msg = at}, c.alloc)
+	return x, err == .None
+}
+
+@(test)
+branch_many :: proc(t: ^testing.T) {
+	if s, ok := os.lookup_env("SIM_SEED", context.temp_allocator); ok && len(s) > 0 {
+		return
+	}
+	test_begin(t)
+	defer test_end(t)
+	bad := 0
+	seeds := env_u64("BM_SEEDS", 2)
+	count := int(env_u64("BM_SWITCHES", 300))
+	for seed in u64(1) ..= seeds {
+		w := _br_world(seed)
+		a: virtual.Arena
+		_bm_run(w, &a, count)
+		for f in w.failures {
+			if bad < 30 {
+				fmt.eprintf("branch_many seed %d: %s\n", seed, f)
+			}
+		}
+		if len(w.failures) > 0 {
+			bad += 1
+		}
+		world_destroy(w)
+		free(w)
+		virtual.arena_destroy(&a)
+	}
+	fmt.eprintf("branch_many: %d seeds of %d switches, %d failed\n", seeds, count, bad)
+	testing.expect(t, bad == 0, fmt.tprintf("branch_many: %d failures", bad))
+}

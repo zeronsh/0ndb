@@ -109,6 +109,20 @@ builder_copy :: proc(b: ^Builder, inode: fstree.Inode_Id, pos: int, src: crdt.Op
 }
 
 @(private)
+builder_copy_root :: proc(b: ^Builder, inode: fstree.Inode_Id, pos: int, src: crdt.Op_Id, n: int) {
+	if n <= 0 {
+		return
+	}
+	dst := make([]u8, n, context.temp_allocator)
+	authors := make([dynamic]crdt.Author_Span, context.temp_allocator)
+	if got := copy_read_depth(b.h, src, dst, &authors, 0); got < n || len(authors) == 0 {
+		builder_copy(b, inode, pos, src, n)
+		return
+	}
+	builder_copy_spans(b, inode, pos, authors[:], 0, n)
+}
+
+@(private)
 builder_copy_spans :: proc(b: ^Builder, inode: fstree.Inode_Id, pos: int, spans: []crdt.Author_Span, start: int, n: int) {
 	from := start
 	at := 0

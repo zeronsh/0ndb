@@ -502,7 +502,7 @@ revert_text :: proc(h: ^History, b: ^Builder, ino: fstree.Inode_Id, bl, cl: []cr
 		if e.visible {
 			builder_delete(b, ino, e.pos, e.len)
 		} else {
-			builder_copy(b, ino, e.pos, e.src, e.len)
+			builder_copy_root(b, ino, e.pos, e.src, e.len)
 		}
 	}
 	return .None
