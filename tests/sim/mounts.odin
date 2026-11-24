@@ -1298,7 +1298,7 @@ _git_switch_weight :: proc(w: ^World) -> int {
 }
 
 @(private = "file")
-_carry_token :: proc(w: ^World, n: ^Node, oi: int, line: string, path: string, tok: string) {
+_carry_token :: proc(w: ^World, n: ^Node, oi: int, line: string, path: string, tok: string, inserter: prim.Id) {
 	m := &w.model
 	#reverse for o in m.ops {
 		if o.obj != oi {
@@ -1309,7 +1309,7 @@ _carry_token :: proc(w: ^World, n: ^Node, oi: int, line: string, path: string, t
 				continue
 			}
 			c := new_op(m, o.kind, n, oi)
-			c.actor = o.actor
+			c.actor = o.actor if inserter == {} else inserter
 			c.line = strings.clone(line, w.allocator)
 			c.path = strings.clone(path, w.allocator)
 			append(&c.tokens, strings.clone(tok, w.allocator))
@@ -1414,8 +1414,13 @@ op_git_switch :: proc(w: ^World, n: ^Node) {
 	old_disk := make(map[string][]u8, context.temp_allocator)
 	base := make(map[string][]u8, context.temp_allocator)
 	untracked := make(map[string]bool, context.temp_allocator)
+	on_line := make(map[string]bool, context.temp_allocator)
+	inserter: prim.Id
 	{
 		context = instance_context(&n.inst)
+		if known {
+			inserter = n.identity.id
+		}
 		_end_held_agents(w, n, sm.root)
 		fs.mount_sync(sm.m)
 		for p in paths {
@@ -1424,6 +1429,9 @@ op_git_switch :: proc(w: ^World, n: ^Node) {
 			}
 			if d, terr := eng.tree_read(&n.e, m.objs[sm.oi].o, p, context.temp_allocator, {}, line_eng(base_line)); terr == .None {
 				base[p] = d
+				for t in parse_tokens(d) {
+					on_line[t.text] = true
+				}
 			}
 		}
 		if names, lerr := eng.tree_list(&n.e, m.objs[sm.oi].o, "", context.temp_allocator, {}, line_eng(base_line)); lerr == .None {
@@ -1436,6 +1444,7 @@ op_git_switch :: proc(w: ^World, n: ^Node) {
 				if d, terr := eng.tree_read(&n.e, m.objs[sm.oi].o, nm, context.temp_allocator, {}, line_eng(base_line)); terr == .None {
 					for t in parse_tokens(d) {
 						untracked[t.text] = true
+						on_line[t.text] = true
 					}
 				}
 			}
@@ -1490,7 +1499,7 @@ op_git_switch :: proc(w: ^World, n: ^Node) {
 				}
 				for t in parse_tokens(f.data) {
 					untracked[t.text] = true
-					_carry_token(w, n, sm.oi, key, rel, t.text)
+					_carry_token(w, n, sm.oi, key, rel, t.text, {} if on_line[t.text] else inserter)
 				}
 			}
 		}
@@ -1523,7 +1532,7 @@ op_git_switch :: proc(w: ^World, n: ^Node) {
 						continue
 					}
 					if carried[t.text] {
-						_carry_token(w, n, sm.oi, key, p, t.text)
+						_carry_token(w, n, sm.oi, key, p, t.text, {} if on_line[t.text] else inserter)
 						continue
 					}
 					append(&op.tokens, strings.clone(t.text, w.allocator))
