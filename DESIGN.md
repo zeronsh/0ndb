@@ -376,7 +376,14 @@ Identity and the graph:
 Text (Eg-walker with Fugue):
 
 - Ops are `insert(pos, bytes)` and `delete(pos, len)` in the coordinates of
-  their parent version, exactly what a diff of disk produces.
+  their parent version, exactly what a diff of disk produces. Op kinds:
+  `Insert` (bytes), `Insert_Ref` (a range of a content blob), `Insert_Copy`
+  (a source op range, which must lie in the batch's parents; it takes the
+  source's bytes and authors), `Insert_Carry` (bytes plus the source op
+  range they were carried from, which need not be known; the bytes and the
+  authorship are the op's own), `Delete`, `Delete_Back` and `Opaque`. Every
+  `Insert_Copy` and `Insert_Carry` registers a copy record (source range →
+  own range) when its batch is added, so redaction closes over both.
 - A loaded file is a rope of its current text plus authorship spans
   (op id runs per byte range). Applying ops that extend the current version
   linearly touches only the rope and spans.
@@ -929,10 +936,29 @@ equal in both directions.
   materialized like a pending path and never ingested as a removal; one the
   departing commit holds is git's deletion and lands on the line. A path
   deleted between git's checkout and the pass that sees the switch cannot be
-  told from one git did not create, and is rewritten. Text a git rewrite
-  carries (the departing commit, reflog entries, ORIG_HEAD and cherry-pick
-  sources) is copied with its authors only from versions the line's synced
-  version contains; anything else is a plain insert by the line's actor. A
+  told from one git did not create, and is rewritten. **Carried text keeps
+  its authors**, whichever git command moved it: text a git rewrite carries
+  (the departing commit, reflog entries, ORIG_HEAD and cherry-pick sources)
+  and text a raw checkout leaves dirty on disk (the departing synced version,
+  `carry_from`, kept with the mount state from the retarget until a full
+  pass on the line commits with nothing young or held) is matched against
+  the line diff's inserted runs (a line diff of the source text against the
+  disk, the source's blame resolved through copies to author ops). A run
+  whose author op the batch's parents contain is an `Insert_Copy`. Any
+  other run is held out of the pass's batch (later ops on that inode
+  shift) and, once that batch commits, inserted with its own bytes as an
+  `Insert_Carry` naming its source op ids, in one batch per base actor by
+  that base's line actor on the target line
+  (`ingestion_actor(device, blake2b-128("0ndb scope line" || base ||
+  line))`, kind 3, base the author actor blame presents, a base that is
+  itself a line actor unwrapped to its base). The line is held across the
+  main batch and its carry batches, so no reader or peer sees the line
+  between them; a carry batch that fails clears the stat of its paths and
+  marks them, and a crash between them leaves the pre-pass mount state, so
+  the retarget re-derives `carry_from` and the carried runs are carried
+  again, never ingested as the line actor's. Runs the source does not hold
+  and runs whose source is redacted are plain inserts. A switch that forks a
+  new line needs none of this: the fork contains the departing ops. A
   materialization whose pass switched lines restarts at the
   new line rather than writing the old one back. Ingestion on a line other
   than the mount's own uses an actor derived from the mount and the line,
@@ -1739,6 +1765,19 @@ concurrent typing is never lost or reverted.
   the grown coverage in one transaction. A lookup therefore reads at most
   32 KiB of records plus its share of those commits, however far behind
   the tail the range lies (sim `seal_scan`). Leaving a space drops both.
+- A redaction closes over copy records: redacting a source range redacts
+  every `Insert_Copy` and `Insert_Carry` of it, transitively. A device that
+  applies a remote redaction record applies the closure over its own copy
+  records, not just the record's spans, so a copy the redactor never saw is
+  redacted too; adding a batch whose copy record lands on a redacted source
+  reports the spans that newly become redacted (including copies of the new
+  ops already present), and they are redacted in the loaded texts like a
+  record's. Spans of this device's own records reached either way from a
+  remote record or batch are queued, and the engine redacts them after the
+  admit (zero-fill and relay redaction as for any own redaction); replay of
+  the own journal queues nothing, so reopening never redacts twice.
+  `tree_redact(tree, path, from, to, line)` redacts a byte range of a file
+  at a line through the same plan as a text object's redaction.
 - A blob a redaction scrubs can still back text nobody redacted: an
   `Insert_Ref` op of another line or version that points into the same
   blob. Before its own scrub, every device that applies the redaction, the
@@ -2001,8 +2040,10 @@ running on it is a record in it.
     registered with a conversation of the tree as owner (the revert actors of
     earlier undos and redos, so undoing T' < T after undoing T reverts the
     first undo's copies and deletions too, and the rewind actors of turn
-    reverts), and the ingestion actors of its tasks' fork mounts (home and per
-    line). Landed and merged ops keep their scope actors, so a land needs no
+    reverts), the ingestion actors of its tasks' fork mounts (home and per
+    line), and every line actor whose base is in the set (an agent's text a
+    switch or a held scope moved onto another line undoes with its turn).
+    Landed and merged ops keep their scope actors, so a land needs no
     actor of its own. A scope actor belongs to one conversation: every scope a
     run opens (the turn's and each tool call's) writes as
     `ingestion_actor(device, scope_pseudo(conversation, mount, line))`,
