@@ -292,7 +292,7 @@ op_verify :: proc(c: ^api.Call, o: ^api.Out) -> api.Status {
 	root := trim_slash(api.a_str(c, "root"))
 	m: ^api.Mounted
 	for x in c.api.mounts {
-		if x.root == root {
+		if fs.path_same(x.root, root) {
 			m = x
 		}
 	}

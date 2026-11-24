@@ -8,6 +8,7 @@ import "core:strings"
 import "core:time"
 import "../capi/api"
 import eng "../engine"
+import "../fs"
 import "../mcp"
 import "../prim"
 import rt "../runtime"
@@ -1257,7 +1258,7 @@ op_mount_add :: proc(c: ^api.Call, o: ^api.Out) -> api.Status {
 		return st
 	}
 	for x in d.state.mounts {
-		if x.root == m.root {
+		if fs.path_same(x.root, m.root) {
 			return .Ok
 		}
 	}
@@ -1271,18 +1272,17 @@ op_mount_remove :: proc(c: ^api.Call, o: ^api.Out) -> api.Status {
 	root := trim_slash(api.a_str(c, "root"))
 	found := false
 	for m in c.api.mounts {
-		if m.root == root {
+		if fs.path_same(m.root, root) {
 			api.mount_close(c.api, m)
 			found = true
 			break
 		}
 	}
-	for x, i in d.state.mounts {
-		if x.root == root {
+	for i := len(d.state.mounts) - 1; i >= 0; i -= 1 {
+		if x := d.state.mounts[i]; fs.path_same(x.root, root) {
 			delete(x.root)
 			ordered_remove(&d.state.mounts, i)
 			found = true
-			break
 		}
 	}
 	_state_save(d)
