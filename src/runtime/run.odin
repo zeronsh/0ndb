@@ -371,6 +371,7 @@ run_tool_started :: proc(run: ^Run, id, name, input, parent: string) {
 		observe.tool_call_init(&t.call, id, transmute([]u8)input, run.ws.root, canonical, run.alloc)
 		t.has_obs = true
 		t.scope = worktree_tool_open(run.ws, run, id)
+		worktree_claim_named(run.ws, run, &t.call, t.scope)
 	}
 	append(&run.tools, t)
 	run.r.stats.tool_calls += 1
