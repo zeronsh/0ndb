@@ -507,6 +507,8 @@ _rs_agent :: proc(c: ^Rs_Ctx, op: Rs_Op, model: ^Rs_Tree, before: Rs_Tree) -> bo
 @(private = "file")
 Rs_Run :: struct {
 	user:    obj.Rid,
+	r0:      obj.Rid,
+	base:    obj.Rid,
 	pre:     Rs_Tree,
 	post:    Rs_Tree,
 	undoneq: Rs_Tree,
@@ -591,7 +593,18 @@ _rs_turn :: proc(c: ^Rs_Ctx, cs: Rs_Case) -> (r: Rs_Run, ok: bool) {
 		files[0] = convo.File_Delta{mount = "work", tree = c.tree.id, version = _rs_version(c)}
 		node_after(n)
 	}
-	r.user = _rs_msg(c, .User, {}, nil) or_return
+	r.r0 = _rs_msg(c, .User, {}, nil) or_return
+	r0r := _rs_msg(c, .Assistant, r.r0, files) or_return
+	{
+		context = instance_context(&n.inst)
+		if wr, werr := eng.convo_writer(&n.e, c.conv); werr == .None {
+			convo.writer_seal(wr, r0r, .Done)
+			convo.writer_commit(wr)
+		}
+		node_after(n)
+	}
+	r.base = r0r
+	r.user = _rs_msg(c, .User, r0r, nil) or_return
 	reply := _rs_msg(c, .Assistant, r.user, files) or_return
 	for op in cs.ops {
 		before := make(Rs_Tree, context.temp_allocator)
@@ -683,6 +696,39 @@ _rs_case :: proc(w: ^World, cs: Rs_Case, alloc: runtime.Allocator) {
 	}
 	run_until(w, w.now + 5_000_000_000, true)
 	_rs_expect(c, cs, "redo", r.post)
+	edit: {
+		context = instance_context(&n.inst)
+		_, err := eng.convo_move(&n.e, c.conv, .Edit, r.base)
+		node_after(n)
+		if err != .None {
+			world_fail(w, "shapes %s: edit move: %v", cs.name, err)
+			return
+		}
+	}
+	run_until(w, w.now + 5_000_000_000, true)
+	sib, sok := _rs_msg(c, .User, r.base, nil)
+	if !sok {
+		return
+	}
+	run_until(w, w.now + 2_000_000_000, true)
+	_rs_expect(c, cs, "switch away (an edit of the turn's message)", r.undoneq)
+	for step in ([2]obj.Rid{r.user, sib}) {
+		{
+			context = instance_context(&n.inst)
+			_, err := eng.convo_switch(&n.e, c.conv, step)
+			node_after(n)
+			if err != .None {
+				world_fail(w, "shapes %s: convo_switch: %v", cs.name, err)
+				return
+			}
+		}
+		run_until(w, w.now + 5_000_000_000, true)
+		if step == r.user {
+			_rs_expect(c, cs, "switch back to the turn", r.post)
+		} else {
+			_rs_expect(c, cs, "switch forward to the edit", r.undoneq)
+		}
+	}
 }
 
 revert_shapes_run :: proc(seed: u64, only: string = "") -> (failures: [dynamic]string, cases: int) {
