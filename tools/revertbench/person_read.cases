@@ -1,0 +1,12 @@
+# name | setup | turn ops | note | tree after undo/regenerate/switch (overrides; !path = absent)
+rf_same        | a.txt=x | read a.txt; write a.txt agent; person a.txt person-after | agent reads first | a.txt=person-after
+rf_far         | a.txt=1\n2\n3\n4\n5\n | read a.txt; write a.txt 'A\n2\n3\n4\n5\n'; person a.txt 'A\n2\n3\n4\nP\n' | agent reads first | a.txt=1\n2\n3\n4\nP\n
+rf_adj         | a.txt=1\n2\n3\n | read a.txt; write a.txt 'A\n2\n3\n'; person a.txt 'A\nP\n3\n' | agent reads first | a.txt=1\nP\n3\n
+rf_two         | a.txt=1\n2\n3\n | read a.txt; write a.txt 'A\nB\n3\n'; person a.txt 'A\nP\n3\n' | agent reads first | a.txt=1\nP\n3\n
+rf_mix         | a.txt=x | read a.txt; write a.txt agent-one; person a.txt agent-one-plus | agent reads first | a.txt=agent-one-plus
+rf_del         | a.txt=1\n2\n3\n | read a.txt; write a.txt 'A\n2\n3\n'; person a.txt '2\n3\n' | agent reads first | a.txt=2\n3\n
+rf_del_other   | a.txt=1\n2\n3\n | read a.txt; write a.txt 'A\n2\n3\n'; person a.txt 'A\n2\n' | agent reads first | a.txt=1\n2\n
+rf_created     | k.txt=x | write n.txt agent; read n.txt; person n.txt 'agent\nperson\n' | agent reads back | n.txt=person\n
+rf_marked      | a.txt=x | read a.txt; person a.txt person; touch a.txt | event marks the file for the agent, bytes unchanged | a.txt=person
+rf_samebytes   | a.txt=x | read a.txt; person a.txt person; write a.txt person | agent writes the same bytes | a.txt=person
+rf_between     | a.txt=1\n2\n3\n | read a.txt; person a.txt '1\n2\nP\n'; write a.txt 'A\n2\nP\n' | agent edits another line after the person's write | a.txt=1\n2\nP\n

@@ -23,6 +23,10 @@ def run(op):
             os.makedirs(d, exist_ok=True)
         with open(p, "wb") as f:
             f.write(base64.b64decode(op.get("data", "")))
+    elif k == "touch":
+        d = open(p, "rb").read()
+        with open(p, "wb") as f:
+            f.write(d)
     elif k == "write_bin":
         with open(p, "wb") as f:
             f.write(binary(op["n"]))

@@ -18,6 +18,14 @@ HOLD = float(os.environ.get("RB_HOLD", "4"))
 CRASH_DELAYS = [float(x) for x in os.environ.get("RB_CRASH_DELAYS", "0,0.001,0.002,0.003,0.004,0.005,0.006,0.007,0.008,0.01,0.013").split(",") if x]
 
 
+STYLE = {"append": False}
+
+
+def unescape(v):
+    v = v.replace("\\n", "\n")
+    return v + "\n" if STYLE["append"] and v else v
+
+
 def parse_value(v):
     ex = False
     if v.endswith("+x"):
@@ -25,7 +33,7 @@ def parse_value(v):
     if v == '""':
         return b"", ex
     if "\\n" in v:
-        return v.replace("\\n", "\n").encode(), ex
+        return unescape(v).encode(), ex
     if v.isdigit() and len(v) >= 4:
         return rbop.big(int(v)), ex
     return (v + "\n").encode(), ex
@@ -58,13 +66,13 @@ def with_parents(tree):
 def parse_ops(s):
     ops = []
     for part in s.split(";"):
-        w = shlex.split(part.strip(), posix=True) if part.strip() else []
+        w = [x.replace("\x01", "\\n") for x in shlex.split(part.strip().replace("\\n", "\x01"), posix=True)] if part.strip() else []
         if not w:
             continue
         k = w[0]
         if k in ("write", "person"):
             text = w[2] if len(w) > 2 else ""
-            text = text.replace("\\n", "\n") if "\\n" in text else (text + "\n" if text else "")
+            text = unescape(text) if "\\n" in text else (text + "\n" if text else "")
             ops.append({"op": k, "path": w[1], "data": base64.b64encode(text.encode()).decode()})
         elif k in ("write_bin", "write_big"):
             ops.append({"op": k, "path": w[1], "n": int(w[2])})
@@ -152,6 +160,7 @@ class Turns:
     seen = {}
     workdir = ""
     calls = 0
+    tool_errors = []
     lock = threading.Lock()
 
 
@@ -182,6 +191,9 @@ class FakeProvider(BaseHTTPRequestHandler):
                 break
             if m.get("role") == "user":
                 done += 1
+                for x in results:
+                    if x.get("is_error"):
+                        Turns.tool_errors.append(json.dumps(x.get("content"))[:160])
         prompt = prompt.strip()
         with Turns.lock:
             Turns.calls += 1
@@ -219,8 +231,12 @@ class FakeProvider(BaseHTTPRequestHandler):
 
         ev("message_start", {"type": "message_start", "message": {"id": "msg_%d" % calls, "type": "message", "role": "assistant", "model": "claude-opus-5-5", "content": [], "stop_reason": None, "usage": {"input_tokens": 1, "output_tokens": 1}}})
         if call is not None:
-            inp = json.dumps({"command": shell_command(call)})
-            ev("content_block_start", {"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "id": "toolu_%d" % calls, "name": "shell", "input": {}}})
+            tool = "read_file" if call[0]["op"] == "read" else "shell"
+            if tool == "read_file":
+                inp = json.dumps({"path": Turns.workdir.replace("\\", "/") + "/" + call[0]["path"]})
+            else:
+                inp = json.dumps({"command": shell_command(call)})
+            ev("content_block_start", {"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "id": "toolu_%d" % calls, "name": tool, "input": {}}})
             ev("content_block_delta", {"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": inp}})
             ev("content_block_stop", {"type": "content_block_stop", "index": 0})
             ev("message_delta", {"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 1}})
@@ -369,7 +385,7 @@ class Case:
     def __init__(self, line):
         f = [x.strip() for x in line.split("|")]
         self.name, self.setup_s, self.ops_s = f[0], f[1], f[2]
-        self.note = f[3] if len(f) > 3 else ""
+        self.note = " | ".join(f[3:]) if STYLE["append"] else (f[3] if len(f) > 3 else "")
         self.pre = parse_setup(self.setup_s)
         self.ops = parse_ops(self.ops_s)
         post = self.pre
@@ -380,7 +396,11 @@ class Case:
         for op in self.ops:
             if op["op"] == "person":
                 undo = model_apply(undo, op)
-        if len(f) > 4 and f[4]:
+        for t in shlex.split(self.note.replace("\\n", "\x01").replace("'", "")) if STYLE["append"] else []:
+            if t.startswith("undo:"):
+                p, v = t[5:].replace("\x01", "\\n").split("=", 1)
+                undo = {k: e for k, e in undo.items() if k != p} if v == "-" else dict(undo, **parse_setup(p + "=" + v))
+        if len(f) > 4 and f[4] and not STYLE["append"]:
             toks = f[4].split()
             undo = dict(undo, **parse_setup(" ".join(t for t in toks if not t.startswith("!"))))
             for t in toks:
@@ -436,12 +456,15 @@ def run_case(case, out_root, url, crash, run="undo"):
     os.makedirs(d)
     relay, dev = start(d, url)
     work = os.path.join(d, "work")
+    if WIN:
+        work = work.replace("\\", "/")
     os.makedirs(work)
     make_tree(work, case.pre)
     prompt = "case %s %d" % (case.name, int(time.time() * 1000) % 100000)
     Turns.ops[prompt] = case.ops
     Turns.workdir = work
     Turns.dev = dev
+    Turns.tool_errors = []
 
     def record(name, errs, dl, note):
         na = dl == ["n/a"]
@@ -465,7 +488,7 @@ def run_case(case, out_root, url, crash, run="undo"):
             time.sleep(PERSON_SETTLE)
         _trailing(case, work)
         time.sleep(PERSON_SETTLE)
-        record("turn", ["exit %d: %s" % (rc, err[-160:])] if rc else [], match_and_hold(work, case.post), "")
+        record("turn", (["exit %d: %s" % (rc, err[-160:])] if rc else []) + ["tool error: " + x for x in Turns.tool_errors], match_and_hold(work, case.post), "")
         msg = message_ids(dev).get(prompt)
         if not msg:
             raise RuntimeError("no message id for the turn")
@@ -569,6 +592,7 @@ def _wait_idle(dev):
 
 def load_cases(path):
     cases = []
+    STYLE["append"] = "and one is appended" in open(path, encoding="utf-8").read()
     for line in open(path, encoding="utf-8"):
         if line.strip() and not line.startswith("#"):
             cases.append(Case(line.rstrip("\n")))
