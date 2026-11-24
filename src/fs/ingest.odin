@@ -1251,6 +1251,7 @@ Pass :: struct {
 	rebased:    [dynamic]crdt.Op_Id,
 	stash:      map[fstree.Inode_Id][dynamic]Stashed,
 	restored:   bool,
+	departing:  bool,
 	scope_of:   map[string]^Scope,
 	cutoff:     i64,
 	now:        i64,
@@ -1508,6 +1509,50 @@ attrib_chain_settle :: proc(p: ^Pass) {
 }
 
 @(private)
+replay_departing :: proc(m: ^Mount, long: runtime.Allocator) -> Error {
+	if m.history == nil || m.db == nil || len(m.attrib_chain) == 0 {
+		return .None
+	}
+	q: Pass
+	q.m = m
+	q.long = long
+	q.rebased = make([dynamic]crdt.Op_Id, long)
+	q.departing = true
+	keys := make([dynamic]string, context.temp_allocator)
+	for k in prim.sorted_keys(m.attrib_chain) {
+		append(&keys, k)
+	}
+	for k in keys {
+		chain, ok := m.attrib_chain[k]
+		if !ok {
+			continue
+		}
+		steps := slice.clone(chain[:], context.temp_allocator)
+		attrib_chain_drop(m, k)
+		e, found := shadow_get(&m.shadow, k) or_return
+		if !found || e.kind != .File {
+			continue
+		}
+		path, _ := clone_string(k, long)
+		c := Change{kind = .Modify, path = path, disk = .File, old = e}
+		cur := e.oid
+		for st in steps {
+			if st.oid == cur {
+				continue
+			}
+			if !odb.exists(m.db, st.oid) {
+				break
+			}
+			if !(replay_step(&q, &c, st) or_return) {
+				break
+			}
+			cur = st.oid
+		}
+	}
+	return .None
+}
+
+@(private)
 replay_step :: proc(p: ^Pass, c: ^Change, st: Attrib_Step) -> (committed: bool, err: Error) {
 	m := p.m
 	h := m.history
@@ -1550,7 +1595,9 @@ replay_step :: proc(p: ^Pass, c: ^Change, st: Attrib_Step) -> (committed: bool, 
 			if !found {
 				return false, rerr
 			}
-			mount_reshow_add(m, c.path)
+			if !p.departing {
+				mount_reshow_add(m, c.path)
+			}
 			c.kind = .Modify
 			c.old = e
 			c.actor = {}
@@ -1672,7 +1719,9 @@ replay_merge :: proc(p: ^Pass, c: ^Change, st: Attrib_Step, actor: prim.Id, inod
 	e.ver = 0
 	shadow_put(&m.shadow, c.path, e) or_return
 	attrib_set(m, c.path, st.actor, true, st.oid, st.scope)
-	mount_reshow_add(m, c.path)
+	if !p.departing {
+		mount_reshow_add(m, c.path)
+	}
 	c.kind = .Modify
 	c.old = e
 	c.actor = {}
@@ -1791,6 +1840,7 @@ mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> (err: Error) {
 			delete(m.branch, m.allocator)
 			m.branch, _ = clone_string(key, m.allocator)
 			if follow {
+				replay_departing(m, p.long) or_return
 				line_follow(m, key) or_return
 				p.git_wrote = true
 			}
