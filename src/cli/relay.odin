@@ -297,7 +297,7 @@ op_verify :: proc(c: ^api.Call, o: ^api.Out) -> api.Status {
 		}
 	}
 	if m == nil {
-		return .Not_Found
+		return api.mount_missing(c.api, root)
 	}
 	if fs.mount_sync(m.mount) != .None {
 		return .Io

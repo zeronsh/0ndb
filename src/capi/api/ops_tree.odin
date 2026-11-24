@@ -101,6 +101,15 @@ mount_at :: proc(a: ^Api, path: string) -> (m: ^Mounted, rel: string) {
 	return m, rel
 }
 
+mount_missing :: proc(a: ^Api, path: string) -> Status {
+	for r in eng.tree_refused(a.e) {
+		if path == r.root || (strings.has_prefix(path, r.root) && path[len(r.root)] == '/') {
+			return .Newer
+		}
+	}
+	return .Not_Found
+}
+
 op_tree_mount :: proc(c: ^Call, o: ^Out) -> Status {
 	_, st := mount_open(c.api, a_object(c, "object"), a_str(c, "root"))
 	return st
@@ -160,7 +169,7 @@ op_tree_sync :: proc(c: ^Call, o: ^Out) -> Status {
 op_tree_find :: proc(c: ^Call, o: ^Out) -> Status {
 	m, rel := mount_at(c.api, a_str(c, "path"))
 	if m == nil {
-		return .Not_Found
+		return mount_missing(c.api, a_str(c, "path"))
 	}
 	o_object(o, "object", m.object)
 	o_str(o, "root", m.root)
