@@ -1,6 +1,5 @@
 package fs
 
-import "core:mem/virtual"
 import "../crdt"
 import "../fshist"
 import "../fstree"
@@ -10,201 +9,8 @@ import "../prim"
 
 REC_REDACT :: fshist.REC_REDACT
 
-Redact_Result :: struct {
-	spans:     int,
-	zeroed:    i64,
-	files:     int,
-	rewrites:  int,
-	dropped:   int,
-	ranges:    []journal.Range,
-	unreached: []odb.Unreached,
-}
-
-Redact_Plan :: struct {
-	data: rawptr,
-	call: proc(data: rawptr, ranges: []journal.Range) -> Error,
-}
-
 history_redactions :: proc(h: ^History) -> u64 {
 	return h.redactions
-}
-
-history_redact :: proc(h: ^History, spans: []crdt.Op_Span, allocator := context.allocator, plan := Redact_Plan{}) -> (res: Redact_Result, err: Error) {
-	h.redactions += 1
-	defer if r := h.opts.redacted; r.call != nil {
-		r.call(r.data, res.unreached)
-	}
-	arena: virtual.Arena
-	if virtual.arena_init_growing(&arena, 256 << 10) != nil {
-		return {}, .No_Memory
-	}
-	defer virtual.arena_destroy(&arena)
-	context.temp_allocator = virtual.arena_allocator(&arena)
-	history_wake(h) or_return
-	redact_preflight(h, spans) or_return
-	all := make([dynamic]crdt.Op_Span, context.temp_allocator)
-	for sp in spans {
-		if sp.len <= 0 {
-			continue
-		}
-		append(&all, sp)
-		crdt.graph_redact(&h.g, sp.id.actor, sp.id.seq, sp.len, &all)
-	}
-	if len(all) == 0 {
-		return {}, .None
-	}
-	clear(&h.io)
-	w := prim.writer(&h.io)
-	prim.write_u8(&w, REC_REDACT)
-	prim.write_uvarint(&w, u64(len(all)))
-	for sp in all {
-		prim.write_id(&w, sp.id.actor)
-		prim.write_uvarint(&w, sp.id.seq)
-		prim.write_uvarint(&w, u64(sp.len))
-	}
-	if _, jerr := journal.journal_append(&h.journal, h.io[:]); jerr != .None {
-		return {}, .Io
-	}
-	if journal.journal_commit(&h.journal) != .None {
-		return {}, .Io
-	}
-	res.spans = len(all)
-	records := make([dynamic][2]i64, context.temp_allocator)
-	extra := make([dynamic]crdt.Op_Span, context.temp_allocator)
-	own_records(h, all[:], &records, &extra) or_return
-	if plan.call != nil && len(records) > 0 {
-		planned := make([]journal.Range, len(records), context.temp_allocator)
-		for rec, i in records {
-			planned[i] = journal.Range{rec[0], rec[1]}
-		}
-		plan.call(plan.data, planned) or_return
-	}
-	targets := make([dynamic]odb.Oid, context.temp_allocator)
-	protect := make([dynamic]odb.Oid, context.temp_allocator)
-	res.files = apply_redaction(h, all[:], extra[:], &targets, &protect) or_return
-	if h.db != nil && len(targets) > 0 {
-		from_odb(odb.scrub_note(h.db, targets[:], protect[:])) or_return
-	}
-	history_persist(h) or_return
-	for rec in records {
-		replace_record(h, rec[0], all[:]) or_return
-	}
-	history_persist(h) or_return
-	ranges := make([dynamic]journal.Range, 0, len(records), allocator)
-	for rec in records {
-		if e := journal.journal_redact(&h.journal, rec[0], rec[1]); e != .None {
-			res.ranges = ranges[:]
-			return res, .Io
-		}
-		append(&ranges, journal.Range{rec[0], rec[1]})
-		res.zeroed += rec[1] - rec[0]
-	}
-	res.ranges = ranges[:]
-	if f := h.opts.fault; f.zeroed != nil {
-		f.zeroed(f.data)
-	}
-	history_own_applied(h)
-	if history_persist(h) != .None {
-		history_reload(h)
-	}
-	if h.db != nil && len(targets) > 0 {
-		unstage(h, targets[:], protect[:])
-		rewrites, stats, rerr := odb.redact(h.db, targets[:], "refs/0ndb/", protect[:], true, allocator)
-		if rerr != .None {
-			return res, from_odb(rerr)
-		}
-		res.rewrites = len(rewrites)
-		res.dropped = stats.commits_rewritten
-		res.unreached = stats.unreached
-	}
-	if h.awake {
-		history_unload_files(h)
-	}
-	return res, .None
-}
-
-@(private)
-replace_record :: proc(h: ^History, off: i64, spans: []crdt.Op_Span) -> Error {
-	buf := make([dynamic]u8, context.temp_allocator)
-	body := read_stream(h, 0, off, &buf) or_return
-	payload, ok := batch_payload(body)
-	if !ok {
-		return .None
-	}
-	b, derr := crdt.batch_decode(payload, context.temp_allocator, &h.dict)
-	if derr != .None {
-		return .Corrupt
-	}
-	ops := make([]crdt.Op_Run, len(b.ops), context.temp_allocator)
-	inodes := make([dynamic]fstree.Inode_Id, context.temp_allocator)
-	pos: u64
-	for op, i in b.ops {
-		ops[i] = op
-		s0 := b.seq + pos
-		pos += u64(op.len)
-		if op.kind != .Opaque {
-			append(&inodes, op_inode(h, op.target))
-		}
-		if op.kind != .Insert {
-			continue
-		}
-		c := make([]u8, len(op.content), context.temp_allocator)
-		copy(c, op.content)
-		for sp in spans {
-			if sp.id.actor != b.actor {
-				continue
-			}
-			lo := max(s0, sp.id.seq)
-			hi := min(s0 + u64(op.len), sp.id.seq + u64(sp.len))
-			for k := lo; k < hi; k += 1 {
-				c[k - s0] = 0
-			}
-		}
-		ops[i].content = c
-	}
-	b.ops = ops
-	orig := u64(off)
-	kind := body[0]
-	prevs: []u8
-	if body[0] == REC_REPLACE {
-		r, rok := replace_decode(body)
-		if !rok {
-			return .Corrupt
-		}
-		orig = r.orig
-		kind = r.kind
-		prevs = r.prevs
-	}
-	clear(&h.io)
-	w := prim.writer(&h.io)
-	prim.write_u8(&w, REC_REPLACE)
-	prim.write_uvarint(&w, orig)
-	if orig == u64(off) {
-		prim.write_u8(&w, kind)
-	} else {
-		count := 1
-		rest := prevs
-		for len(rest) > 0 {
-			_, n := prim.get_uvarint(rest)
-			rest = rest[n:]
-			count += 1
-		}
-		prim.write_u8(&w, kind | fshist.REPLACE_PREVS)
-		prim.write_uvarint(&w, u64(count))
-		prim.write_raw(&w, prevs)
-		prim.write_uvarint(&w, u64(off))
-	}
-	if crdt.batch_encode(&b, &h.io, &h.dict) != .None {
-		return .Too_Large
-	}
-	new_off, jerr := journal.journal_append(&h.journal, h.io[:])
-	if jerr != .None {
-		return from_journal(jerr)
-	}
-	if cerr := journal.journal_commit(&h.journal); cerr != .None {
-		return from_journal(cerr)
-	}
-	return replace_chain(h, 0, orig, u64(off), u64(new_off), inodes[:])
 }
 
 @(private)
@@ -409,46 +215,9 @@ apply_redaction :: proc(h: ^History, spans: []crdt.Op_Span, also: []crdt.Op_Span
 	return files, .None
 }
 
-mount_redact_range :: proc(m: ^Mount, path: string, version: Version, from, to: int, allocator := context.allocator, plan := Redact_Plan{}) -> (res: Redact_Result, err: Error) {
-	mount_sync(m) or_return
-	h := m.history
-	e, found := shadow_get(&m.shadow, path) or_return
-	if !found || e.kind != .File {
-		return {}, .Not_Found
-	}
-	v := version if len(version) > 0 else m.synced[:]
-	lvs := make([dynamic]crdt.Lv, context.temp_allocator)
-	if crdt.graph_version_lvs(&h.g, v, &lvs) != .None {
-		return {}, .Corrupt
-	}
-	_, spans := history_text_spans_at(h, e.inode, lvs[:], context.temp_allocator) or_return
-	ids := make([dynamic]crdt.Op_Span, context.temp_allocator)
-	at := 0
-	for s in spans {
-		lo := max(at, from)
-		hi := min(at + s.len, to)
-		if hi > lo {
-			append(&ids, crdt.Op_Span{crdt.Op_Id{s.id.actor, s.id.seq + u64(lo - at)}, hi - lo})
-		}
-		at += s.len
-	}
-	res, err = history_redact(h, ids[:], allocator, plan)
-	if err != .None {
-		return res, err
-	}
-	if mount_wake(m) == .None {
-		m.rescan = false
-	}
-	return res, .None
-}
-
 @(private)
 apply_redact_record :: proc(h: ^History, body: []u8, preflight := false) -> Error {
 	h.redactions += 1
-	unreached: []odb.Unreached
-	defer if r := h.opts.redacted; r.call != nil {
-		r.call(r.data, unreached)
-	}
 	rd := prim.reader(body[1:])
 	n := prim.read_uvarint(&rd)
 	if n > u64(len(body)) {
@@ -478,8 +247,6 @@ apply_redact_record :: proc(h: ^History, body: []u8, preflight := false) -> Erro
 	apply_redaction(h, spans[:], nil, &targets, &protect) or_return
 	if h.db != nil && len(targets) > 0 {
 		unstage(h, targets[:], protect[:])
-		_, st, _ := odb.redact(h.db, targets[:], "refs/0ndb/", protect[:], true, context.temp_allocator)
-		unreached = st.unreached
 	}
 	return .None
 }

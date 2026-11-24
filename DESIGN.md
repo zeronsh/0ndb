@@ -170,8 +170,8 @@ The engine is designed so that none of these has an exception:
   index) stops there, keeps how far it got, and resumes on the rekey.
 - **Upgrade: redaction is removed.** Content already hidden on a device stays
   hidden there, nothing new can be redacted, and a redaction a device had not
-  applied before it upgraded is not applied afterwards, so that device's copy
-  stays readable.
+  applied before it upgraded leaves that device's copy of a message or map
+  value readable, while for file text it hides the text when it is read.
 - **Each participant has its own view.** The leaf is per participant (in its
   own segment); the thread's shared head is the newest sent message. Browsing
   an old branch on one device never moves anyone else.
