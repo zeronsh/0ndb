@@ -2,6 +2,8 @@ import sys, os, shutil, tempfile, threading, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import soak
 from http.server import ThreadingHTTPServer
+soak.isolate.__globals__["__file__"] = os.path.abspath(__file__)
+soak.isolate()
 def scenario(name, new_turn, finish):
     d = tempfile.mkdtemp(prefix="redo-"); root = os.path.join(d, "work")
     srv = ThreadingHTTPServer(("127.0.0.1", 0), soak.Provider); threading.Thread(target=srv.serve_forever, daemon=True).start()
