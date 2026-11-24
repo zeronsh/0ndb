@@ -2,6 +2,8 @@ package fs
 
 import "base:runtime"
 import "core:bytes"
+import "core:os"
+import "core:fmt"
 import "core:crypto/blake2b"
 import "core:strings"
 import "core:mem/virtual"
@@ -160,9 +162,17 @@ target_id :: proc(b: ^Builder, inode: fstree.Inode_Id) -> crdt.Op_Id {
 }
 
 @(private)
-builder_commit :: proc(m: ^Mount, b: ^Builder) -> Error {
+builder_commit :: proc(m: ^Mount, b: ^Builder, loc := #caller_location) -> Error {
 	if b.n == 0 {
 		return .None
+	}
+	if strings.contains(m.root, "e0078bc0") {
+		h0 := m.history
+		e0, f0, _ := shadow_get(&m.shadow, "a.txt")
+		t0, _ := history_text_at(h0, e0.inode, m.synced[:], context.temp_allocator)
+		mv, _, _ := history_line(h0, "main", context.temp_allocator)
+		mt, _ := history_text_at(h0, e0.inode, mv, context.temp_allocator)
+		fmt.eprintf("DBGC root %s line %q hold %v n %d a.txt found %v ver %d synced %q main %q at %s:%d\n", m.root, m.line, m.hold_line, b.n, f0, e0.ver, string(t0), string(mt), loc.file_path[len(loc.file_path) - 12:], loc.line)
 	}
 	h := m.history
 	batch := crdt.Batch {
@@ -1728,6 +1738,9 @@ mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> (err: Error) {
 
 @(private)
 line_follow :: proc(m: ^Mount, key: string) -> Error {
+	if strings.contains(m.root, "e0078bc0") {
+		fmt.eprintf("DBGC follow %q from %q\n", key, m.line)
+	}
 	h := m.history
 	v, found := history_line(h, key, context.temp_allocator) or_return
 	if !found || len(v) == 0 {
@@ -1832,7 +1845,9 @@ fork_version :: proc(m: ^Mount) -> (v: Version, err: Error) {
 		}
 		next := make([dynamic]crdt.Lv, context.temp_allocator)
 		crdt.version_union(&h.g, acc[:], x.lvs, &next)
-		acc = next
+		if os.get_env("FORK_OFF", context.temp_allocator) == "" {
+			acc = next
+		}
 		m.fork_named += 1
 	}
 	return crdt.graph_version_ids(&h.g, acc[:], context.temp_allocator), .None
