@@ -102,9 +102,34 @@ _rs_text :: proc(v: string, alloc: runtime.Allocator) -> string {
 }
 
 @(private = "file")
+RS_DEEP :: prim.PATH_MAX - 36
+
+@(private = "file")
+_rs_deep :: proc(alloc: runtime.Allocator) -> string {
+	b := strings.builder_make(alloc)
+	left := RS_DEEP - len(RS_ROOT)
+	for left > 0 {
+		n := min(left, 201)
+		if left - n == 1 {
+			n -= 1
+		}
+		if strings.builder_len(b) > 0 {
+			strings.write_byte(&b, '/')
+		}
+		for _ in 1 ..< n {
+			strings.write_byte(&b, 'p')
+		}
+		left -= n
+	}
+	return strings.to_string(b)
+}
+
+@(private = "file")
 _rs_cases :: proc(alloc: runtime.Allocator) -> []Rs_Case {
 	out := make([dynamic]Rs_Case, alloc)
-	for line in strings.split_lines(RS_CASES, alloc) {
+	long, _ := strings.replace_all(RS_CASES, "@255", strings.repeat("n", 255, alloc), alloc)
+	long, _ = strings.replace_all(long, "@deep", _rs_deep(alloc), alloc)
+	for line in strings.split_lines(long, alloc) {
 		l := strings.trim_space(line)
 		if len(l) == 0 || l[0] == '#' {
 			continue

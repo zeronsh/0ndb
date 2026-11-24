@@ -35,6 +35,7 @@ Error :: enum u8 {
 STATE_NAME :: ".0ndb"
 TEMP_PREFIX :: ".0ndb-tmp-"
 FENCE_INFIX :: "fence-"
+TEMP_PATH_MAX :: 1024 when ODIN_OS == .Darwin else prim.PATH_MAX
 
 from_prim :: proc "contextless" (e: prim.Error) -> Error {
 	switch e {

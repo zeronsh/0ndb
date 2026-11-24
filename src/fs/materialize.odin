@@ -1611,7 +1611,11 @@ ensure_parent :: proc(m: ^Mount, abs: string) -> Error {
 temp_name :: proc(m: ^Mount, abs: string, allocator: runtime.Allocator) -> string {
 	m.fence_seq += 1
 	name := own_temp_name(m.id, "", m.fence_seq, allocator)
-	out, _ := path_join(path_parent_abs(abs), name, allocator)
+	parent := path_parent_abs(abs)
+	if len(parent) + 1 + len(name) >= TEMP_PATH_MAX {
+		parent = m.root
+	}
+	out, _ := path_join(parent, name, allocator)
 	return out
 }
 
