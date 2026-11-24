@@ -37,10 +37,10 @@ _append_tokens :: proc(w: ^World, n: ^Node, op: ^M_Op, from: []u8, count: int) -
 }
 
 @(private = "file")
-_scoped_write :: proc(w: ^World, n: ^Node, sm: Sim_Mount, name: string, abs: string, scope: ^fs.Scope, data: []u8) -> (err: prim.Error, serr: fs.Error) {
+_scoped_write :: proc(w: ^World, n: ^Node, sm: Sim_Mount, name: string, abs: string, scope: ^fs.Scope, op: ^M_Op, data: []u8) -> (err: prim.Error, serr: fs.Error) {
 	_writer_set(w, n, abs, Writer_Info{scope = scope, agent = true})
 	fs.mount_observe_begin(sm.m, name, scope)
-	err = _disk_write(disk_vfs(&n.disk), abs, data, false)
+	err = disk_write_by(w, n, op, abs, data)
 	if n.disk.dead {
 		return
 	}
@@ -120,7 +120,7 @@ op_agent_held :: proc(w: ^World, n: ^Node) {
 	pop.actor = prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng))
 	other := fs.scope_open(n.reg, sm.m, prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng)), pop.actor)
 	moved := _append_tokens(w, n, pop, base, 1)
-	perr, pserr := _scoped_write(w, n, sm, name, abs, other, moved)
+	perr, pserr := _scoped_write(w, n, sm, name, abs, other, pop, moved)
 	if n.disk.dead {
 		node_crashed(n)
 		return
@@ -136,7 +136,7 @@ op_agent_held :: proc(w: ^World, n: ^Node) {
 	rop.path = strings.clone(name, w.allocator)
 	rop.actor = ractor
 	wrote := _append_tokens(w, n, rop, base, 2)
-	err, serr := _scoped_write(w, n, sm, name, abs, reader, wrote)
+	err, serr := _scoped_write(w, n, sm, name, abs, reader, rop, wrote)
 	if n.disk.dead {
 		node_crashed(n)
 		return
@@ -157,7 +157,7 @@ op_agent_held :: proc(w: ^World, n: ^Node) {
 		top.actor = prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng))
 		third := fs.scope_open(n.reg, sm.m, prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng)), top.actor)
 		next := _append_tokens(w, n, top, wrote, 1 + rng_int(&w.rng, 2))
-		terr, tserr := _scoped_write(w, n, sm, name, abs, third, next)
+		terr, tserr := _scoped_write(w, n, sm, name, abs, third, top, next)
 		if n.disk.dead {
 			node_crashed(n)
 			return
