@@ -147,6 +147,7 @@ Event_Kind :: enum u8 {
 	Replica_Redacted,
 	Rename_Offered,
 	Redact_Unreached,
+	Models_Changed,
 }
 
 Event :: struct {
@@ -999,6 +1000,10 @@ _fatal :: proc(e: ^Engine, err: Error) {
 		e.fatal = err
 	}
 	_emit(e, Event{kind = .Failure, err = err})
+}
+
+emit_models_changed :: proc(e: ^Engine) {
+	_emit(e, Event{kind = .Models_Changed})
 }
 
 @(private)
