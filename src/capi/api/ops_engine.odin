@@ -356,6 +356,9 @@ op_convo_unsealed :: proc(c: ^Call, o: ^Out) -> Status {
 }
 
 op_convo_undone :: proc(c: ^Call, o: ^Out) -> Status {
+	if werr := eng.convo_warm(c.api.e, a_object(c, "object"), ready_local(c)); werr != .None {
+		return pend(c, werr)
+	}
 	list, err := eng.convo_left(c.api.e, a_object(c, "object"), context.temp_allocator)
 	if err != .None {
 		return pend(c, err)

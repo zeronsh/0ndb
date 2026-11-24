@@ -220,6 +220,27 @@ convo_line_key :: proc(id: prim.Id, allocator := context.temp_allocator) -> stri
 	return strings.concatenate({"l/", string(h[:])}, allocator)
 }
 
+convo_warm :: proc(e: ^Engine, o: Object, ready: Ready = {}) -> Error {
+	context = context_for(e)
+	h := _handle_get(e, o, .Conversation) or_return
+	_handle_refresh(h)
+	if err := _cu_warm(e, o, h); err != .None {
+		return _pending_result(e, h, err, ready)
+	}
+	if ready.call != nil && _handle_waiting(h, ready.fresh) {
+		return _wait(e, h, ready)
+	}
+	return .None
+}
+
+@(private)
+_cu_warm :: proc(e: ^Engine, o: Object, h: ^Handle) -> Error {
+	_cu_position(e, o) or_return
+	convo_undos(e, o, context.temp_allocator) or_return
+	_, uerr := convo.undones(&h.view, context.temp_allocator)
+	return _oerr(uerr)
+}
+
 convo_undo :: proc(e: ^Engine, o: Object, msg: Rid) -> (undo: prim.Id, err: Error) {
 	context = context_for(e)
 	from := _cu_position(e, o) or_return
