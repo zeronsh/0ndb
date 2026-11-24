@@ -33,6 +33,8 @@ PACK_PROCS := prim.Vfs_Procs {
 	dir_next   = _v_dir_next,
 	dir_close  = _v_dir_close,
 	caps       = _v_caps,
+	op_begin   = _v_op_begin,
+	op_end     = _v_op_end,
 }
 
 @(private)
@@ -317,13 +319,57 @@ _maybe_flush :: proc(p: ^Pack) -> Error {
 }
 
 @(private)
+_v_op_begin :: proc(data: rawptr, bytes: i64) -> Error {
+	return op_begin((^Pack)(data), bytes)
+}
+
+@(private)
+_v_op_end :: proc(data: rawptr) {
+	op_end((^Pack)(data))
+}
+
+op_begin :: proc(p: ^Pack, bytes: i64) -> Error {
+	if p.poisoned {
+		return .Io
+	}
+	if p.op_depth > 0 {
+		p.op_depth += 1
+		return .None
+	}
+	if _async(p) && p.fl.on && (_over_budget(p, 4) || p.log_since_ck + _log_tail(p) - p.group_start + bytes >= p.opts.log_window * 4) {
+		p.pressure = true
+		return .Would_Block
+	}
+	p.op_depth = 1
+	return .None
+}
+
+op_end :: proc(p: ^Pack) {
+	p.op_depth = max(p.op_depth - 1, 0)
+}
+
+@(private)
 _admit :: proc(p: ^Pack) -> Error {
 	if p.poisoned {
 		return .Io
 	}
-	if _async(p) && p.fl.on && _over_budget(p, 4) {
-		p.pressure = true
-		return .Would_Block
+	if !_async(p) || !p.fl.on || !_over_budget(p, 4) {
+		return .None
+	}
+	if p.op_depth > 0 {
+		return _admitted_wait(p)
+	}
+	p.pressure = true
+	return .Would_Block
+}
+
+@(private)
+_admitted_wait :: proc(p: ^Pack) -> Error {
+	for p.fl.on && _over_budget(p, 4) {
+		_drain(p) or_return
+		if !p.fl.on && _over_budget(p, 4) {
+			_flush_start(p) or_return
+		}
 	}
 	return .None
 }

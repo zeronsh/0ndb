@@ -1552,6 +1552,17 @@ concurrent typing is never lost or reverted.
   commit job that runs at a scheduled later time. Compaction rewrites cold
   containers so each stream's extents stay contiguous, keeping page reads to
   one or two preads.
+- A writer that will log a lot in one step can name it: `op_begin(bytes)` on
+  the Vfs, refused (`Would_Block`, pressure raised) only before its first
+  write, and only while a job is in flight with the log already past four
+  windows or the named bytes reaching there. With nothing in flight any size
+  is admitted, so an operation larger than the budget still completes. Nested
+  begins count as admitted. An admitted operation's later writes are never
+  refused: past four windows they wait for the job in flight and start the
+  flush themselves, so the log holds at most four windows plus one write. A
+  caller that does not ask keeps the per-write refusal. A flush may commit a
+  prefix of an operation, so an operation orders its writes so a prefix is
+  harmless (a new file written whole, then renamed into place).
 - Compaction cannot be starved by writers. Once the garbage in checkpointed
   containers reaches two log windows, the completion of each job runs one
   slice of compaction (256 KiB) and submits its commit before any flush the

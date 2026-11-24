@@ -863,6 +863,9 @@ _start_async :: proc(p: ^Pack) -> Error {
 
 poll :: proc(p: ^Pack) -> Error {
 	if !p.fl.on {
+		if len(p.waiters) > 0 {
+			_fire_waiters(p)
+		}
 		return .None
 	}
 	done, err := _worker_try(p)
