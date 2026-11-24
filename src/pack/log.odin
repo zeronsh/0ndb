@@ -433,6 +433,11 @@ _job_complete :: proc(p: ^Pack, err: Error) -> Error {
 		p.ck_cont = snap.ck_cont
 		p.ck_off = snap.ck_off
 		p.ck_seq = snap.ck_seq
+		for c in snap.conts {
+			if ci := _cont_index(p, c.id); ci >= 0 {
+				p.conts[ci].ck_live = c.live
+			}
+		}
 		if built {
 			nr := new(Run, p.allocator)
 			nr^ = fl.run
@@ -1072,6 +1077,9 @@ _flush_start :: proc(p: ^Pack) -> Error {
 	fl.snap.ck_cont = _active_id(p)
 	fl.snap.ck_off = p.buf_base
 	fl.snap.ck_seq = p.seq
+	for &c, i in fl.snap.conts {
+		c.live = p.conts[i].live
+	}
 	fl.has_snap = true
 	fl.super_fd = p.super_fd
 	fl.root = p.root
