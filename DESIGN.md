@@ -2020,8 +2020,9 @@ running on it is a record in it.
     start a new root); a send first follows any remote move. A send waiting for
     records is held in memory for at most 10 s (one timer, only while a send
     is held) and is dropped, never sent later, when that runs out, when its
-    caller's connection or call ends, when the relay link goes down and when
-    the daemon stops: a caller that got `offline`, or left while it was held,
+    caller's connection or call ends, when the relay link stays down for 2 s
+    (a link that comes back sooner keeps it, up to its 10 s) and when the
+    daemon stops: a caller that got `offline`, or left while it was held,
     can send again and gets exactly one message. With the relay
     out of reach they, and `switch`, answer `offline` at once, and on records
     the device holds they act as usual.
