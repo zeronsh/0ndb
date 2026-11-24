@@ -91,6 +91,21 @@ jitter_lane() {
 	done
 	echo "addr-jitter $n runs: $f failed$msg"
 }
+
+fence_lane() {
+	local f=0 msg="" n=0
+	for run in "17" "26" "35" "17 SIM_DURABILITY=async" "15 SIM_STORAGE=until-run" "69 SIM_STORAGE=until-run" "3 SIM_STORAGE=until-run" "23 SIM_STORAGE=until-run"; do
+		local s=${run%% *} env=""
+		[ "$run" != "$s" ] && env=${run#* }
+		n=$((n+1))
+		local o
+		o=$(env $env SIM_FENCE_CRASH=1 SIM_SEED=$s timeout 900 "$OUT/sim.bin" 2>&1)
+		if ! ok_run "$o"; then
+			f=$((f+1)); msg="$msg [$s $env: $(echo "$o" | grep -E 'trace: FAIL|panic|FATAL|Killed' | head -1 | sed 's/^ *//' | cut -c1-120)]"
+		fi
+	done
+	echo "fence-crash $n runs (expected-fail, not counted): $f failed$msg"
+}
 {
 	lane default "" 1 10 > "$OUT/l1" &
 	lane default "" 11 20 > "$OUT/l2" &
@@ -112,6 +127,7 @@ jitter_lane() {
 	( r=$(timeout 900 "$OUT/fst.bin" 2>&1 | grep -E "Finished|FAILED|panic|FATAL" | tail -1); echo "fstree: $r" ) > "$OUT/l10" &
 	( r=$(cd docs/relay-vectors && timeout 300 "$OUT/relayvec" check . 2>&1 | tail -1); echo "relay vectors: $r" ) > "$OUT/l11" &
 	jitter_lane > "$OUT/l20" &
+	fence_lane > "$OUT/l21" &
 	wait
 }
 if command -v cargo > /dev/null; then
@@ -125,6 +141,7 @@ for i in 1 2 3 4 5 13 17 18 19 6 14 12 15 16 20 7 8 9 10 11; do
 	*) FAIL=1 ;;
 	esac
 done
+note "$(cat "$OUT/l21")"
 [ "$DIRTY" -ne 0 ] && note "warning: uncommitted changes in tracked files"
 [ $FAIL -eq 0 ] && note "result: PASS" || note "result: FAIL"
 cat "$OUT/summary"
