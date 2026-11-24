@@ -375,6 +375,15 @@ _phys_path :: proc(p: ^Pack, buf: ^prim.Path_Buf, prefix: u8, id: u64) -> string
 }
 
 @(private)
+_ext_path :: proc(buf: ^prim.Path_Buf, root: string, inum: u64) -> string {
+	n := copy(buf[:], root)
+	buf[n] = '/'
+	n += 1
+	nm := _name(buf[n:], 'x', inum, 16)
+	return string(buf[:n + len(nm)])
+}
+
+@(private)
 _parse_phys_name :: proc(name: string) -> (prefix: u8, id: u64, ok: bool) {
 	if len(name) != 9 && len(name) != 17 {
 		return

@@ -92,6 +92,7 @@ _release :: proc(p: ^Pack) {
 	p.queued = nil
 	p.fl.hooks = nil
 	delete(p.fl.zjobs)
+	delete(p.fl.xdel)
 	delete(p.fl.syncs)
 	delete(p.fl.busy)
 	delete(p.fl.scans)
@@ -384,13 +385,18 @@ _recover :: proc(p: ^Pack, sb: ^Super) -> Error {
 		p.compacting = 0
 	}
 	_reap_orphans(p) or_return
+	erased := false
 	for id in ext_ids {
 		ino: Inode
 		found := _inode_load(p, id, &ino) or_return
 		if !found || ino.kind != .External {
-			pb: prim.Path_Buf
-			prim.remove(p.base, _phys_path(p, &pb, 'x', id))
+			n: u64
+			_erase_external(p.base, p.root, id, &n) or_return
+			erased = true
 		}
+	}
+	if erased {
+		_sync_root(p) or_return
 	}
 	return .None
 }

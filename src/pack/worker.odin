@@ -66,6 +66,7 @@ Inflight :: struct {
 	fds:      [dynamic]Job_Fd,
 	hooks:    [dynamic]Commit_Hook,
 	zjobs:    [dynamic]Zero_Job,
+	xdel:     [dynamic]u64,
 	syncs:    [dynamic]Cont_Fd,
 	newc_fd:  prim.Fd,
 	dirsync:  bool,
@@ -236,6 +237,35 @@ _zero_bytes :: proc(base: prim.Vfs, fd: prim.Fd, off: i64, size: i64) -> Error {
 }
 
 @(private)
+_erase_external :: proc(base: prim.Vfs, root: string, inum: u64, nsync: ^u64) -> Error {
+	pb: prim.Path_Buf
+	path := _ext_path(&pb, root, inum)
+	fd, oerr := prim.open_file(base, path, {.Write})
+	if oerr == .Not_Found {
+		return .None
+	}
+	if oerr != .None {
+		return oerr
+	}
+	size, serr := prim.file_size(base, fd)
+	if serr == .None && size > 0 {
+		serr = _zero_range(base, fd, 0, size)
+		if serr == .None {
+			nsync^ += 1
+			serr = prim.datasync(base, fd)
+		}
+	}
+	prim.close_file(base, fd)
+	if serr != .None {
+		return serr
+	}
+	if e := prim.remove(base, path); e != .None && e != .Not_Found {
+		return e
+	}
+	return .None
+}
+
+@(private)
 _build_run :: proc(base: prim.Vfs, fd: prim.Fd, imm: ^Mem, drop: bool) -> (run: Run, err: Error) {
 	order := _mem_sorted(imm, nil, nil, runtime.heap_allocator())
 	defer delete(order, runtime.heap_allocator())
@@ -292,6 +322,13 @@ _job_exec :: proc(fl: ^Inflight) -> Error {
 	for c in fl.syncs {
 		fl.nsync += 1
 		prim.datasync(base, c.fd) or_return
+	}
+	if len(fl.xdel) > 0 {
+		for inum in fl.xdel {
+			_erase_external(base, fl.root, inum, &fl.nsync) or_return
+		}
+		fl.nsync += 1
+		prim.sync_dir(base, fl.root) or_return
 	}
 	if fl.scan_fd >= 0 && len(fl.scans) > 0 {
 		_scan_erase(base, fl.scan_fd, fl.scans[:]) or_return

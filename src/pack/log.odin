@@ -373,6 +373,7 @@ _job_complete :: proc(p: ^Pack, err: Error) -> Error {
 	clear(&fl.data)
 	clear(&fl.fds)
 	clear(&fl.zjobs)
+	clear(&fl.xdel)
 	clear(&fl.syncs)
 	clear(&fl.busy)
 	clear(&fl.scans)
@@ -464,7 +465,6 @@ _job_complete :: proc(p: ^Pack, err: Error) -> Error {
 	case .Delete:
 		_cont_deleted(p, del_id)
 	}
-	_apply_unlinks(p) or_return
 	return .None
 }
 
@@ -532,6 +532,7 @@ _collect_externals :: proc(p: ^Pack) -> Error {
 @(private)
 _collect_zeros :: proc(p: ^Pack, upto: u64) -> Error {
 	fl := &p.fl
+	_collect_unlinks(p, upto)
 	i := 0
 	for i < len(p.zeros) {
 		z := p.zeros[i]
@@ -627,7 +628,7 @@ _commit :: proc(p: ^Pack) -> Error {
 	wrote := _commit_write(p) or_return
 	_collect_zeros(p, p.seq - 1 if wrote else p.durable_seq) or_return
 	_collect_scans(p) or_return
-	if !wrote && len(p.fl.zjobs) == 0 && p.fl.scan_fd < 0 {
+	if !wrote && len(p.fl.zjobs) == 0 && len(p.fl.xdel) == 0 && p.fl.scan_fd < 0 {
 		return .None
 	}
 	p.fl.kind = .Commit
@@ -742,21 +743,17 @@ _has_urgent :: proc "contextless" (p: ^Pack) -> bool {
 }
 
 @(private)
-_apply_unlinks :: proc(p: ^Pack) -> Error {
+_collect_unlinks :: proc(p: ^Pack, upto: u64) {
 	i := 0
 	for i < len(p.unlinks) {
 		u := p.unlinks[i]
-		if u.need > p.durable_seq {
+		if u.need > upto {
 			i += 1
 			continue
 		}
-		pb: prim.Path_Buf
-		if e := prim.remove(p.base, _phys_path(p, &pb, 'x', u.inum)); e != .None && e != .Not_Found {
-			return _poison(p, e)
-		}
+		append(&p.fl.xdel, u.inum)
 		unordered_remove(&p.unlinks, i)
 	}
-	return .None
 }
 
 
@@ -853,7 +850,7 @@ _start_async :: proc(p: ^Pack) -> Error {
 	wrote := _commit_write(p) or_return
 	_collect_zeros(p, p.seq - 1 if wrote else p.durable_seq) or_return
 	_collect_scans(p) or_return
-	if !wrote && len(p.fl.zjobs) == 0 && p.fl.scan_fd < 0 {
+	if !wrote && len(p.fl.zjobs) == 0 && len(p.fl.xdel) == 0 && p.fl.scan_fd < 0 {
 		return .None
 	}
 	p.fl.kind = .Commit
