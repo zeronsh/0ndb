@@ -361,8 +361,8 @@ named_version_crash :: proc(t: ^testing.T) {
 	test_begin(t)
 	defer test_end(t)
 	for kind in Named_Kind {
-		for bits in ([]int{0, 1, 4, 5, 8, 9}) {
-			arm := Named_Arm{kind = kind, process = bits & 1 != 0, control = bits >= 4, clean = bits >= 8, early = false}
+		for bits in 0 ..< 10 {
+			arm := Named_Arm{kind = kind, process = bits & 1 != 0, early = bits & 2 != 0, control = bits >= 4, clean = bits >= 8}
 			points, named, ahead, bad := 0, 0, 0, 0
 			for k in u64(1) ..= 4000 {
 				failures, res := named_version_run(1, arm, k)
