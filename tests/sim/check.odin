@@ -1066,10 +1066,47 @@ check_idle :: proc(w: ^World) {
 		if loop_ready(&n.inst.loop) {
 			world_fail(w, "idle: %s has pending wakeups after settle", n.name)
 		}
+		check_asleep(w, n)
 	}
 	if w.relay.alive {
 		if a := loop_armed(&w.relay.inst.loop); a > 0 {
 			world_fail(w, "idle: relay has %d armed timers after settle: %s", a, armed_timers(&w.relay.inst.loop))
+		}
+	}
+}
+
+check_asleep :: proc(w: ^World, n: ^Node) {
+	if !n.e_open || n.e.fatal != .None {
+		return
+	}
+	if n.e.plug.reg_on {
+		for m in n.e.plug.reg.mounts {
+			if m != nil && m.awake {
+				if why := fs.mount_awake_reason(m); len(why) == 0 {
+					world_fail(w, "idle: %s mount %s is awake after settle with nothing to wait for", n.name, m.root)
+				}
+			}
+		}
+	}
+	ids := make([dynamic]prim.Id, context.temp_allocator)
+	for id in n.e.handles {
+		append(&ids, id)
+	}
+	slice.sort_by(ids[:], proc(a, b: prim.Id) -> bool {
+		x, y := a, b
+		return string(x[:]) < string(y[:])
+	})
+	for id in ids {
+		h := n.e.handles[id]
+		if h == nil || h.hist == nil || !h.hist.awake {
+			continue
+		}
+		held := len(h.hist.mounts) > 0
+		for m in h.hist.mounts {
+			held &&= m.awake
+		}
+		if !held && h.pins == 0 {
+			world_fail(w, "idle: %s history of %v %s is awake after settle with no awake mount and no pin", n.name, h.kind, id_short(id))
 		}
 	}
 }
