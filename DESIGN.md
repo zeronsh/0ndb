@@ -2166,6 +2166,14 @@ live runner by default:
   `not_signed_in` whose text says how to sign in, and never spawns the CLI.
   The model list reports `signed_in` and the provider's `login` hint, so a
   client can grey a provider out before the user picks it.
+- **Model list.** `models` answers at once from each provider's last known
+  list (persisted per provider under the work root's `.models/`) plus the
+  native models, with `refreshing` set while probes run. A stale list
+  starts a refresh in the background: each harness is probed, a probe that
+  lists replaces that provider's list and persists it, a probe that fails or
+  times out keeps the previous list and reports its error, and the end of
+  the round emits `models_changed`. `wait` (the CLI's `models`) blocks until
+  the round ends instead.
 - **Sleep and wake.** A sleeping pool runner's lease lapses. On wake its
   pool readmits it with an ephemeral lease token on its existing `Add` (see
   Runner pools), without enrolling again and without a membership record;
