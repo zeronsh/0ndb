@@ -1,6 +1,8 @@
 package fs
 
 import "base:runtime"
+import "core:fmt"
+import "core:time"
 import "core:hash/xxhash"
 import "core:crypto/blake2b"
 import "core:mem/virtual"
@@ -1974,7 +1976,12 @@ scope_close :: proc(reg: ^Registry, s: ^Scope) -> Error {
 	err: Error
 	scope_unhold(s)
 	if s.mount != nil {
+		mt0 := time.tick_now()
 		err = mount_sync(s.mount)
+		mt1 := time.tick_now()
+		me := mount_pass(s.mount, true)
+		mt2 := time.tick_now()
+		fmt.eprintf("MCLOSE sync_us=%d full_us=%d err=%v\n", i64(time.tick_diff(mt0, mt1)) / 1000, i64(time.tick_diff(mt1, mt2)) / 1000, me)
 		deferred := err == .Deferred
 		if deferred {
 			err = .None
