@@ -621,8 +621,10 @@ equal in both directions.
   the mount's own committed batches to `synced`, but a based batch or a
   rewind on a held path is on disk only once it is materialized, so for each
   recovered file whose disk is not the text at that version the entry names
-  the newest recovered batch whose own text the disk is, and the path is
-  rematerialized; the reopen never ingests that gap as a disk change.
+  the newest recovered batch whose own text the disk is, or else the version
+  the persisted entry named, or the version recovery started from, when the
+  disk is exactly that text, and the path is rematerialized; the reopen
+  never ingests that gap as a disk change.
   A rewind (`mount_revert(mount, before, after, owner)`, the primitive under
   rollback and undo) commits as its own actor, one per (mount, line, owner):
   `ingestion_actor(h.self, mount_revert_pseudo(mount, line, owner))`,
@@ -873,9 +875,12 @@ equal in both directions.
   writes over a file whose disk differs from the text at its base: it first
   commits the disk's difference from that base as the mount's snapshot actor
   (`ingestion_actor(h.self, mount_snapshot_pseudo(mount, line))`, registered
-  for the device, parents the base and that actor's last op), points the
+  for the device, parents the base and nothing wider; when that actor already
+  wrote past the base, an event actor), points the
   file's entry at the snapshot version, and materializes the target with the
-  snapshot, so the person's bytes are a durable op concurrent with the
+  snapshot. A file an unused attribution names is its writer's batch, not the
+  mount's, and a file whose entry names a version is diffed from that version,
+  each by the same rule when its actor is blocked. So the person's bytes are a durable op concurrent with the
   target and the written text is the CRDT's merge. A materialization writes
   nothing while history holds a batch that is not yet durable (a snapshot,
   an ingest a pass committed mid-materialization for a race retry or a
@@ -961,7 +966,26 @@ equal in both directions.
   blake2b-128("0ndb scope line" || scope actor || line))`, registered with
   kind 3 (actor, pseudo, base scope actor, device). Blame presents a line
   actor as its base actor, and a line actor whose base is owned joins the
-  base's owner, so the write undoes with its turn. `tree.blame` gives each
+  base's owner, so the write undoes with its turn. A write whose base is
+  known but whose plain actor already wrote past that base (an actor's batch
+  must contain its previous op) commits as an event actor, never from a wider
+  base: `ingestion_actor(device, blake2b-128("0ndb event actor" || plain
+  actor || mount || line || sorted base version || digest))`, where the digest
+  covers the file's inode and the new bytes (every such file's, for a
+  snapshot), so a retry after a crash finds
+  its own batch by id and adopts it instead of committing twice. It is
+  registered with kind 3 in the same journal before its batch, so a batch
+  never exists without its registration. Blame, owners and undo sets treat it
+  as its base; the undo set of a mount includes the line and event actors over
+  the mount's own actors. An edit that changes no bytes, or whose plain actor
+  is not blocked, never makes one. The bound is one permanent actor per
+  blocked edit: none in an ordinary pass, and one per edit while a path's disk
+  text stays behind the line and the same actor writes other files in
+  between. An actor is an id in the graph's actor table and one journal
+  record. They could be folded by a checkpoint that rewrites an actor with no
+  concurrent op left into its base; nothing does that yet. The same edit of
+  one file in two mounts of one device is two edits, as it is for plain
+  actors. `tree.blame` gives each
   span an owner, resolved through the actor records: `agent` (the
   conversation that owns an actor on the way, the turn or tool call scope
   the op was committed under, and the device), `person` (the device that
