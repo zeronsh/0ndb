@@ -405,6 +405,7 @@ device_odb :: proc(e: ^Engine) -> (db: ^odb.Odb, err: Error) {
 			return nil, _derr(oerr)
 		}
 		odb.sweep_temps(&e.db)
+		odb.sweep_ref_locks(&e.db)
 		e.db.deferred = true
 		e.db.scrub_hook = odb.Scrub_Hook{data = e, call = _serve_scrubbed}
 		e.db_open = true
