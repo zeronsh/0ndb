@@ -360,6 +360,47 @@ actor_bound :: proc(h: ^History, v: []crdt.Lv, actor: prim.Id) -> u64 {
 	return lo
 }
 
+@(private)
+event_actor :: proc(m: ^Mount, base: prim.Id, parents: []crdt.Op_Id, digest: [32]u8) -> (actor: prim.Id, err: Error) {
+	h := m.history
+	ctx: blake2b.Context
+	blake2b.init(&ctx, 16)
+	tag := "0ndb event actor"
+	blake2b.update(&ctx, transmute([]u8)tag)
+	b := base
+	blake2b.update(&ctx, b[:])
+	n: [8]u8
+	prim.put_u64le(n[:], u64(len(m.line)))
+	blake2b.update(&ctx, n[:])
+	blake2b.update(&ctx, transmute([]u8)m.line)
+	sorted := slice.clone(parents, context.temp_allocator)
+	slice.sort_by(sorted, proc(x, y: crdt.Op_Id) -> bool {
+		if x.actor != y.actor {
+			return crdt.id_less(x.actor, y.actor)
+		}
+		return x.seq < y.seq
+	})
+	prim.put_u64le(n[:], u64(len(sorted)))
+	blake2b.update(&ctx, n[:])
+	for id in sorted {
+		a := id.actor
+		blake2b.update(&ctx, a[:])
+		prim.put_u64le(n[:], id.seq)
+		blake2b.update(&ctx, n[:])
+	}
+	d := digest
+	blake2b.update(&ctx, d[:])
+	pseudo: prim.Id
+	blake2b.final(&ctx, pseudo[:])
+	actor = fshist.ingestion_actor(h.self, pseudo)
+	if _, known := history_actor_owner(h, actor); !known {
+		history_register_line_actor(h, actor, pseudo, base) or_return
+		m.event_actors += 1
+	}
+	return actor, .None
+}
+
+@(private)
 scope_line_actor :: proc(m: ^Mount, actor: prim.Id) -> prim.Id {
 	ctx: blake2b.Context
 	blake2b.init(&ctx, 16)
