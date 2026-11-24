@@ -388,7 +388,11 @@ _inject_path :: proc(d: ^Disk, path: string, space: bool) -> prim.Error {
 			return .Io
 		}
 	}
-	return _inject(d, space)
+	ie := _inject(d, space)
+	if ie != .None {
+		fmt.eprintln("INJECT", d.name, ie, path)
+	}
+	return ie
 }
 
 @(private = "file")

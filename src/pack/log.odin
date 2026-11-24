@@ -1,5 +1,6 @@
 package pack
 
+import "core:fmt"
 import "core:hash/xxhash"
 import "core:slice"
 import "../prim"
@@ -347,6 +348,7 @@ _job_complete :: proc(p: ^Pack, err: Error) -> Error {
 		fl.on = false
 		p.fl_retry = true
 		p.fl_err = err
+		fmt.eprintln("PACKRETRY", fl.kind, err)
 		return .None
 	}
 	p.fl_retry = false
