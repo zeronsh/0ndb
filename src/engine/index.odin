@@ -117,6 +117,10 @@ _index_all :: proc(e: ^Engine) {
 		_index_item_add(x, rec.space, id, rec.kind)
 		return true
 	}
+	for k, v in e.reg.staged {
+		key := k
+		visit(e, key[:], v)
+	}
 	omap.db_scan(&e.reg.db, ROOT_OBJECTS, nil, nil, e, visit)
 	_touch(e)
 }
@@ -355,8 +359,10 @@ _scan_object :: proc(e: ^Engine, h: ^Handle, budget: int) -> (used: int, more: b
 					continue
 				}
 				if je == .Missing && h.sp.repl_on {
-					r := [1]journal.Range{{pos, end}}
-					osync.replicator_want(&h.sp.repl, &h.scope, s.device, h.name, 0, r[:])
+					if gap := s.jr.missing; gap.from < end {
+						r := [1]journal.Range{{max(gap.from, pos), min(max(gap.to, gap.from + 1), end)}}
+						osync.replicator_want(&h.sp.repl, &h.scope, s.device, h.name, 0, r[:])
+					}
 					if osync.replicator_relay_length(&h.sp.repl, &h.scope, s.device, h.name, 0) < 0 {
 						osync.replicator_want_tail(&h.sp.repl, &h.scope, s.device, h.name, 0, 1)
 					}

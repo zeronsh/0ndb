@@ -297,10 +297,16 @@ _space_erase :: proc(e: ^Engine, sp: ^Space) -> Error {
 			delete(v, e.allocator)
 			delete_key(&e.reg.staged, oid)
 		}
+		delete_key(&e.reg.hold, oid)
 		if v, ok := e.reg.kstaged[oid]; ok {
 			crypto.zero_explicit(raw_data(v), len(v))
 			delete(v, e.allocator)
 			delete_key(&e.reg.kstaged, oid)
+		}
+	}
+	for i := len(e.reg.owned) - 1; i >= 0; i -= 1 {
+		if string(e.reg.owned[i].key[:16]) == string(id[:]) {
+			ordered_remove(&e.reg.owned, i)
 		}
 	}
 	if v, ok := e.reg.sstaged[id]; ok {
