@@ -12,8 +12,8 @@ import "../../src/prim"
 Ril_Result :: struct {
 	crashed: bool,
 	shown:   bool,
+	lost:    int,
 	changed: int,
-	wrong:   bool,
 	stale:   bool,
 }
 
@@ -293,17 +293,16 @@ _ril_run :: proc(w: ^World, k: u64, peer: Ril_Peer) -> (res: Ril_Result) {
 	if len(peer_text) > 0 && strings.count(ta, peer_text) != 1 {
 		world_fail(w, "%s: n0's edit appears %d times in %q", what, strings.count(ta, peer_text), ta)
 	}
-	lost: int
-	lost, res.changed = reissue_settle(w, what, a, b, text, seen[:], true)
-	if len(anchors) == 1 && lost > 0 && !strings.contains(ta, "LOST") {
+	res.lost, res.changed = reissue_settle(w, what, a, b, text, seen[:], true)
+	if len(anchors) == 1 && res.lost > 0 && !strings.contains(ta, "LOST") {
 		context = instance_context(&a.inst)
 		at, _, _, err := eng.buffer_resolve(&a.e, ba.info.id, ba.rev, anchors, context.temp_allocator)
 		if err == .None && len(at) == 1 && at[0] >= 0 {
-			res.wrong = true
-			if w.cfg.verbose {
-				fmt.eprintf("%s: an anchor in the lost text %v resolves to %d in %q\n", what, anchors[0], at[0], ta)
-			}
+			world_fail(w, "%s: an anchor in the lost text %v resolves to %d in %q", what, anchors[0], at[0], ta)
 		}
+	}
+	if res.shown && res.changed > 0 {
+		world_fail(w, "%s: %d batches n0 was shown and n1 lost were re-issued with other operations", what, res.changed)
 	}
 	check_uploaded(w)
 	check_derived(a, fmt.tprintf("%s, n0", what))
@@ -319,7 +318,7 @@ reissue_live_crash :: proc(t: ^testing.T) {
 	test_begin(t)
 	defer test_end(t)
 	for peer in Ril_Peer {
-		points, shown, changed, wrong := 0, 0, 0, 0
+		points, shown, lost := 0, 0, 0
 		for k := u64(1); k < 2000; k += 1 {
 			res, failures := _ril_case(1, k, peer)
 			for f in failures {
@@ -334,11 +333,10 @@ reissue_live_crash :: proc(t: ^testing.T) {
 			}
 			points += 1
 			shown += 1 if res.shown else 0
-			changed += 1 if res.shown && res.changed > 0 else 0
-			wrong += 1 if res.wrong else 0
+			lost += 1 if res.shown && res.lost > 0 else 0
 		}
-		testing.expectf(t, changed > 0, "reissue_live_crash %v never re-issued a sequence a peer had been shown", peer)
-		fmt.eprintf("reissue_live_crash %v: %d crash points, %d shown live before durability, %d of those re-issued with other operations, %d anchors in lost text still resolve\n", peer, points, shown, changed, wrong)
+		testing.expectf(t, lost > 0, "reissue_live_crash %v never lost a batch a peer had been shown", peer)
+		fmt.eprintf("reissue_live_crash %v: %d crash points, %d shown live before durability, %d of those lost\n", peer, points, shown, lost)
 	}
 	free_all(context.temp_allocator)
 }
