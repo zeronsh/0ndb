@@ -119,6 +119,8 @@ need_keys :: proc(t: ^testing.T) {
 	if s, ok := os.lookup_env("SIM_SEED", context.temp_allocator); ok && len(s) > 0 {
 		return
 	}
+	test_begin(t)
+	defer test_end(t)
 	if why := _need_keys_case(); why != "" {
 		fmt.eprintf("need_keys: %s\n", why)
 		testing.fail(t)

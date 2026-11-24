@@ -72,6 +72,8 @@ _torn_case :: proc(seed: u64) -> (shaped: bool, msg: string) {
 
 @(test)
 torn_middle :: proc(t: ^testing.T) {
+	test_begin(t)
+	defer test_end(t)
 	shaped := 0
 	for seed in 1 ..= 256 {
 		ok, msg := _torn_case(u64(seed))
