@@ -51,6 +51,7 @@ open :: proc(p: ^Pack, base: prim.Vfs, root: string, opts := DEFAULT_OPTIONS, al
 	p.handles = make([dynamic]Handle, allocator)
 	p.free_handles = make([dynamic]int, allocator)
 	p.open_inodes = make(map[u64]^Open_Inode, allocator)
+	p.imgs = make([dynamic]^Open_Inode, allocator)
 	p.pend = make(map[u64]^Pend, allocator)
 	p.scratch = make([dynamic]u8, allocator)
 	p.vbuf = make([dynamic]u8, allocator)
@@ -115,12 +116,17 @@ _release :: proc(p: ^Pack) {
 	slice.sort(inos[:])
 	for k in inos {
 		o := p.open_inodes[k]
+		if o.img != nil {
+			_img_free(p, o.img)
+			o.img = nil
+		}
 		if o.real_fd >= 0 {
 			prim.close_file(p.base, o.real_fd)
 		}
 		free(o, p.allocator)
 	}
 	delete(p.open_inodes)
+	delete(p.imgs)
 	_pend_release(p)
 	for &c in p.conts {
 		if c.fd >= 0 {

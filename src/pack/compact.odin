@@ -298,7 +298,7 @@ step :: proc(p: ^Pack, budget: i64 = 4 * 1024 * 1024) -> (more: bool, err: Error
 		}
 		return true, .None
 	}
-	if p.nrec > 0 || len(p.dirty) > 0 {
+	if p.nrec > 0 || len(p.dirty) > 0 || p.img_dirty > 0 {
 		if _async(p) {
 			_start_async(p) or_return
 			return _polled(p), .None
@@ -322,7 +322,7 @@ compact_all :: proc(p: ^Pack, budget: i64 = 4 * 1024 * 1024) -> (more: bool, err
 		return false, .Io
 	}
 	if p.horizon == 0 {
-		if p.mem.count > 0 || p.nrec > 0 {
+		if p.mem.count > 0 || p.nrec > 0 || p.img_dirty > 0 {
 			_flush(p) or_return
 		}
 		p.horizon = p.ck_cont

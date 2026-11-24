@@ -279,6 +279,14 @@ _oi_release :: proc(p: ^Pack, oi: ^Open_Inode) -> Error {
 	}
 	inum := oi.inum
 	unlinked := oi.unlinked
+	if oi.img != nil {
+		if unlinked {
+			_img_drop(p, oi)
+		} else if e := _img_settle(p, oi); e != .None {
+			err = e
+			_img_drop(p, oi)
+		}
+	}
 	if oi.dirty && !unlinked {
 		append(&p.ext_dirty, inum)
 	}
@@ -523,6 +531,10 @@ _v_read_at :: proc(data: rawptr, fd: prim.Fd, buf: []u8, off: i64) -> (int, Erro
 	}
 	n := int(min(i64(len(buf)), oi.ino.size - off))
 	out := buf[:n]
+	if oi.img != nil {
+		copy(out, oi.img.data[off:][:n])
+		return n, .None
+	}
 	end := off + i64(n)
 	pos := off
 	for e in oi.ino.ext[:oi.ino.n] {
@@ -582,6 +594,7 @@ _v_write_at :: proc(data: rawptr, fd: prim.Fd, src: []u8, off: i64) -> Error {
 @(private)
 _write :: proc(p: ^Pack, oi: ^Open_Inode, src: []u8, off: i64, sized := false) -> Error {
 	if oi.ino.kind == .File && off + i64(len(src)) > p.opts.promote_size {
+		_img_settle(p, oi) or_return
 		_promote(p, oi, sized) or_return
 	}
 	if oi.ino.kind == .External {
@@ -593,6 +606,14 @@ _write :: proc(p: ^Pack, oi: ^Open_Inode, src: []u8, off: i64, sized := false) -
 	}
 	old := oi.ino
 	_pend_note(p, oi.inum, old.size, max(old.size, off + i64(len(src))))
+	if oi.img == nil && oi.ino.n >= MAX_EXTENTS - 2 {
+		_img_open(p, oi) or_return
+	}
+	if oi.img != nil {
+		_img_write(p, oi, src, off)
+		oi.ino.mtime = _now(p)
+		return _maybe_flush(p)
+	}
 	ph := _log_data(p, oi.inum, off, src) or_return
 	nw := &oi.ino
 	scratch: Phys_List
@@ -704,6 +725,7 @@ _promote :: proc(p: ^Pack, oi: ^Open_Inode, sized := false) -> Error {
 _truncate :: proc(p: ^Pack, h: ^Handle, size: i64) -> Error {
 	oi := h.oi
 	if oi.ino.kind == .File && size > p.opts.promote_size {
+		_img_settle(p, oi) or_return
 		_promote(p, oi) or_return
 	}
 	if oi.ino.kind == .External {
@@ -721,6 +743,7 @@ _truncate :: proc(p: ^Pack, h: ^Handle, size: i64) -> Error {
 	if size == oi.ino.size {
 		return .None
 	}
+	_img_settle(p, oi) or_return
 	old := oi.ino
 	_pend_note(p, oi.inum, old.size, size)
 	scratch: Phys_List
@@ -760,6 +783,7 @@ _v_punch_hole :: proc(data: rawptr, fd: prim.Fd, off: i64, size: i64) -> Error {
 		return .None
 	}
 	oi := h.oi
+	_img_settle(p, oi) or_return
 	if oi.ino.kind == .External {
 		oi.dirty = true
 		fsize, serr := prim.file_size(p.base, oi.real_fd)
@@ -1355,6 +1379,9 @@ extent :: proc(p: ^Pack, fd: prim.Fd, off: i64, n: i64) -> (r: Phys_Range, ok: b
 		return
 	}
 	oi := h.oi
+	if oi.img != nil && _img_settle(p, oi) != .None {
+		return
+	}
 	if oi.ino.kind == .External {
 		st, err := prim.fstat(p.base, oi.real_fd)
 		if err != .None || off >= st.size {

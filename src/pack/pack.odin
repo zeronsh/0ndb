@@ -101,6 +101,7 @@ Open_Inode :: struct {
 	dirty:    bool,
 	pinned:   int,
 	ext_base: i64,
+	img:      ^Image,
 }
 
 @(private)
@@ -184,6 +185,9 @@ Pack :: struct {
 	want_flush:    bool,
 	closing:       bool,
 	reclaiming:    bool,
+	imgs:          [dynamic]^Open_Inode,
+	img_bytes:     int,
+	img_dirty:     int,
 	reclaimed:     bool,
 	cscan:         [dynamic]Scan,
 	bcache:        []Bc_Entry,
@@ -533,6 +537,9 @@ _put :: proc(p: ^Pack, key: []u8, val: []u8, tomb: bool) -> Error {
 @(private)
 _inode_load :: proc(p: ^Pack, inum: u64, ino: ^Inode) -> (found: bool, err: Error) {
 	if oi, ok := p.open_inodes[inum]; ok {
+		if oi.img != nil {
+			_img_settle(p, oi) or_return
+		}
 		ino^ = oi.ino
 		return true, .None
 	}
