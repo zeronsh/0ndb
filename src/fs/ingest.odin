@@ -3242,6 +3242,7 @@ store_blob :: proc(m: ^Mount, data: []u8) -> Error {
 
 @(private)
 emit_modify :: proc(p: ^Pass, b: ^Builder, c: ^Change, e: Entry) -> Error {
+	own := e.ver
 	e := e
 	e.ver = 0
 	m := p.m
@@ -3282,7 +3283,13 @@ emit_modify :: proc(p: ^Pass, b: ^Builder, c: ^Change, e: Entry) -> Error {
 		builder_tree(b, fstree.Op_Set_Flags{inode = e.inode, mask = {.Git_Clean}, value = {.Git_Clean}})
 	}
 	if oid == e.oid && m.db != nil {
-		return shadow_put(&m.shadow, path, ne)
+		if own == 0 {
+			return shadow_put(&m.shadow, path, ne)
+		}
+		if !p.switched {
+			ne.ver = own
+			return shadow_put(&m.shadow, path, ne)
+		}
 	}
 	was_binary := .Opaque in old_flags
 	if binary && was_binary && m.db != nil && blob_current(h, e.inode, m.synced[:], oid) {
