@@ -149,6 +149,12 @@ map_get :: proc(e: ^Engine, o: Object, key: []u8, allocator := context.allocator
 @(private)
 _map_get :: proc(e: ^Engine, o: Object, key: []u8, allocator := context.allocator, ready: Ready = {}) -> (entry: Map_Entry, found: bool, err: Error) {
 	context = context_for(e)
+	if ready.call != nil {
+		sp := _space_open(e, o.space) or_return
+		if _space_settling(e, sp) {
+			return entry, false, _space_wait(e, sp, ready, nil)
+		}
+	}
 	h := _handle_get(e, o, .Map) or_return
 	merr := _map_sync(e, h)
 	if merr != .None && merr != .Missing {
@@ -175,6 +181,12 @@ map_scan :: proc(e: ^Engine, o: Object, prefix: []u8, after: ^Map_Cursor, limit:
 @(private)
 _map_scan :: proc(e: ^Engine, o: Object, prefix: []u8, after: ^Map_Cursor, limit: int, allocator := context.allocator, ready: Ready = {}) -> (rows: []Map_Row, more: bool, err: Error) {
 	context = context_for(e)
+	if ready.call != nil {
+		sp := _space_open(e, o.space) or_return
+		if _space_settling(e, sp) {
+			return nil, false, _space_wait(e, sp, ready, nil)
+		}
+	}
 	h := _handle_get(e, o, .Map) or_return
 	merr := _map_sync(e, h)
 	if merr != .None && merr != .Missing {

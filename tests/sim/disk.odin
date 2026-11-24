@@ -118,6 +118,7 @@ Disk :: struct {
 	grains:    [dynamic]Grain,
 	crash_on_trunc: string,
 	force_process: bool,
+	force_power: bool,
 	blob_crash: u64,
 	blob_crash_n: u64,
 	blob_crashes: u64,

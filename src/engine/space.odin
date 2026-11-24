@@ -121,8 +121,8 @@ space_create :: proc(e: ^Engine, name: string, relay := "", relay_public: osync.
 	sp := _space_register(e, prim.Id(sid), name, relay, relay_public, mode, false) or_return
 	raws := make([][]u8, len(m.raws), context.temp_allocator)
 	copy(raws, m.raws[:])
-	_members_emit(e, sp, &m, raws) or_return
 	_members_secrets_store(e, sp, &m) or_return
+	_members_emit(e, sp, &m, raws) or_return
 	_proof_stage(e, sp, m.raws[0])
 	_account_manifest_add(e, sp)
 	_pool_notify(e, sp)

@@ -472,9 +472,7 @@ _members_remote :: proc(e: ^Engine, sp: ^Space, device: prim.Id, length: i64) {
 	if length > sp.mem.want[device] {
 		sp.mem.want[device] = length
 	}
-	defer if sp.mem.deferred && _members_ready(sp) {
-		_members_recheck(e, sp)
-	}
+	defer _members_redrive(e, sp)
 	seen := sp.mem.seen[device]
 	if length <= seen {
 		return
@@ -528,6 +526,7 @@ _members_ingest :: proc(e: ^Engine, sp: ^Space, raws: [][]u8) {
 		}
 	}
 	if added == 0 {
+		_members_reopen(e, sp, &m)
 		return
 	}
 	sp.mem.records = len(m.records)
@@ -536,11 +535,7 @@ _members_ingest :: proc(e: ^Engine, sp: ^Space, raws: [][]u8) {
 }
 
 @(private)
-_members_settle :: proc(e: ^Engine, sp: ^Space, m: ^osync.Membership) {
-	if osync.membership_resolve(m) != .None {
-		return
-	}
-	before := len(m.keys)
+_members_open :: proc(e: ^Engine, sp: ^Space, m: ^osync.Membership) {
 	op := osync.Opener{keyring = &e.keyring, self = e.identity}
 	osync.membership_open(m, op)
 	osync.membership_open_seals(m, op)
@@ -548,6 +543,45 @@ _members_settle :: proc(e: ^Engine, sp: ^Space, m: ^osync.Membership) {
 		akr := osync.account_keyring(sp.mem.enroll)
 		osync.membership_open(m, osync.Opener{keyring = &akr, self = osync.account_identity(sp.mem.enroll)})
 	}
+}
+
+@(private)
+_members_unopened :: proc(sp: ^Space) -> bool {
+	return !sp.keyless && !sp.mem.removed && (!sp.mem.have_naming || sp.mem.current < 0)
+}
+
+@(private)
+_members_reopen :: proc(e: ^Engine, sp: ^Space, m: ^osync.Membership) {
+	if !_members_unopened(sp) || osync.membership_resolve(m) != .None {
+		return
+	}
+	keys, naming := len(m.keys), m.have_naming
+	_members_open(e, sp, m)
+	if len(m.keys) > keys || m.have_naming != naming {
+		_members_settle(e, sp, m)
+	}
+}
+
+@(private)
+_members_reopen_load :: proc(e: ^Engine, sp: ^Space) {
+	if !_members_unopened(sp) {
+		return
+	}
+	m: osync.Membership
+	if _members_load(e, sp, &m) != .None {
+		return
+	}
+	defer osync.membership_destroy(&m)
+	_members_reopen(e, sp, &m)
+}
+
+@(private)
+_members_settle :: proc(e: ^Engine, sp: ^Space, m: ^osync.Membership) {
+	if osync.membership_resolve(m) != .None {
+		return
+	}
+	before := len(m.keys)
+	_members_open(e, sp, m)
 	_members_adopt(e, sp, m)
 	_members_maybe_commit(e, sp, m)
 	_members_runner_watch(e, sp, m)
@@ -615,7 +649,15 @@ _members_maybe_commit :: proc(e: ^Engine, sp: ^Space, m: ^osync.Membership) {
 		_log(e, .Warn, "membership commit failed")
 		return
 	}
-	_members_emit(e, sp, m, [][]u8{raw})
+	serr := _members_secrets_store(e, sp, m)
+	if serr == .None {
+		serr = _members_emit(e, sp, m, [][]u8{raw})
+	}
+	if serr != .None {
+		_log(e, .Warn, "membership commit not stored")
+		sp.mem.deferred = true
+		return
+	}
 	_members_adopt(e, sp, m)
 }
 
@@ -698,6 +740,25 @@ _members_runner_watch :: proc(e: ^Engine, sp: ^Space, m: ^osync.Membership) {
 }
 
 @(private)
+_members_owes_commit :: proc(e: ^Engine, m: ^osync.Membership) -> bool {
+	now := _now_ms(e)
+	me := osync.roster_find(&m.roster, e.identity.sign)
+	if me < 0 || !osync.member_active(&m.roster.members[me], now) || !osync.member_leaf_kind(m.roster.members[me].kind) || len(m.roster.members[me].scope) > 0 {
+		return false
+	}
+	st, err := osync.membership_status(m, now)
+	if err != .None || st.epoch < 0 || !st.eligible {
+		return true
+	}
+	t: osync.Ratchet_Tree
+	if osync.roster_leaves(&m.roster, st.epoch, &t, context.temp_allocator) != .None {
+		return true
+	}
+	_, in_tree := osync.tree_find_leaf(&t, e.identity.sign)
+	return !in_tree
+}
+
+@(private)
 _members_restore :: proc(e: ^Engine, sp: ^Space) {
 	m: osync.Membership
 	if _members_load(e, sp, &m) != .None {
@@ -707,7 +768,15 @@ _members_restore :: proc(e: ^Engine, sp: ^Space) {
 	if osync.membership_resolve(&m) != .None {
 		return
 	}
+	keys, naming := len(m.keys), m.have_naming
+	_members_open(e, sp, &m)
+	if len(m.keys) > keys || m.have_naming != naming {
+		if _members_secrets_store(e, sp, &m) != .None {
+			_log(e, .Warn, "membership secrets not stored")
+		}
+	}
 	_members_adopt(e, sp, &m)
+	sp.mem.deferred = _members_owes_commit(e, &m)
 	sp.mem.loaded = true
 }
 
@@ -771,6 +840,7 @@ _members_change :: proc(e: ^Engine, sp: ^Space, build: proc(e: ^Engine, sp: ^Spa
 			return _serr(cerr)
 		}
 		append(&raws, craw)
+		_members_secrets_store(e, sp, &m) or_return
 	}
 	_members_emit(e, sp, &m, raws[:]) or_return
 	sp.mem.records = len(m.records)
@@ -1010,9 +1080,15 @@ _members_ready :: proc(sp: ^Space) -> bool {
 @(private)
 _members_caught_up :: proc(e: ^Engine, sp: ^Space) {
 	sp.mem.caught = true
+	_members_redrive(e, sp)
+}
+
+@(private)
+_members_redrive :: proc(e: ^Engine, sp: ^Space) {
 	if sp.mem.deferred && _members_ready(sp) {
 		_members_recheck(e, sp)
 	}
+	_members_reopen_load(e, sp)
 }
 
 @(private)

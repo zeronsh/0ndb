@@ -50,6 +50,7 @@ _space_wait :: proc(e: ^Engine, sp: ^Space, ready: Ready, cmd: ^Pending_Cmd) -> 
 	if _, err := append(&e.space_waits, Space_Wait{space = sp.id, ready = ready, cmd = cmd}); err != nil {
 		return .No_Memory
 	}
+	_members_reopen_load(e, sp)
 	return .Pending
 }
 
