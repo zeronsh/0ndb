@@ -370,10 +370,7 @@ trim :: proc(t: ^Tree, keep: int) -> runtime.Allocator_Error {
 		return nil
 	}
 	aged := make([dynamic]Aged, 0, max(len(t.inodes), len(t.nodes)), context.temp_allocator) or_return
-	for id in prim.sorted_keys(t.inodes) {
-		if id not_in t.inodes {
-			continue
-		}
+	for id in prim.try_sorted_keys(t.inodes) or_return {
 		n := t.inodes[id]
 		if id != ROOT && !(id in t.dirty_inodes) {
 			append(&aged, Aged{inode = id, used = n.used})
@@ -389,10 +386,7 @@ trim :: proc(t: ^Tree, keep: int) -> runtime.Allocator_Error {
 		}
 	}
 	clear(&aged)
-	for key in prim.sorted_keys(t.nodes) {
-		if key not_in t.nodes {
-			continue
-		}
+	for key in prim.try_sorted_keys(t.nodes) or_return {
 		n := t.nodes[key]
 		if !(key in t.dirty_nodes) {
 			append(&aged, Aged{key = key, used = n.used})
