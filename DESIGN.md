@@ -292,7 +292,15 @@ record := len:u32le  tag:[16]u8  body:[len]u8  len:u32le
   device's tree has already punctured restores as redacted (it is never
   taken for tampering), and a redaction that lands while a repair is pending
   wins, because `journal_restore` accepts a record that is now validly
-  redacted on disk.
+  redacted on disk. Below the writer's archive point the relay holds no
+  copy, so the source is the writer's own archive journal instead: the
+  covering group is opened with the segment's keys, verified against its
+  chain heads and rebuilt in local form, which reproduces every record body
+  exactly. Signature records are elided in groups and come back as inert
+  signature records of the same length; a valid local signature record is
+  kept, and only a damaged one is replaced, since below the archive point
+  signatures are never uploaded, served or checked again. If the archive
+  cannot supply the range, the stream is fatal.
 - Epochs: a writer may start a new epoch of a stream (compaction) beginning
   with a snapshot record; the old epoch file is deleted after the new one is
   uploaded.
@@ -3620,7 +3628,14 @@ Relay cost tracks the reachable information, not the activity. Items marked
   there). An archive reader looking backward for the latest seal never
   re-reads bytes its archive replica already holds. A session that ends
   forgets every Trim in flight: no reply can arrive on it, so the next
-  session resends each owed Trim.
+  session resends each owed Trim. Only the writer moves its stream's base
+  (by Trim or by uploading a device-held prefix as hollow), so a Trim the
+  relay answers Noted with a higher base sits below a device-held prefix:
+  the Trim stays owed and is sent again when a later Noted for the stream
+  shows the base at or below it, which is what a promotion's last fill
+  reports. A promotion fills only down to the archive point (read from the
+  writer's floor slot when its local is closed): the bytes below it are
+  archived and about to be trimmed.
   Readers: a `Trimmed` reply marks the remote; wants below its base become
   archive wants: the reader tails the writer's archive stream (an ordinary
   remote, chain-verified with the writer's identity and no keys), reads

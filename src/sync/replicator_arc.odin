@@ -269,6 +269,80 @@ _arc_trim_send :: proc(r: ^Replicator, al: ^Local) {
 
 
 @(private)
+_arc_own_records :: proc(r: ^Replicator, l: ^Local, at, to: i64) -> (out: []u8, ok: bool) {
+	keys: journal.Key_Provider
+	switch {
+	case l.plain:
+	case l.tree != nil:
+		keys = keytree_provider(l.tree)
+	case:
+		return
+	}
+	name, nerr := arc.stream_name(l.name)
+	if nerr != .None {
+		return
+	}
+	scope := l.scope
+	aid := stream_id(&scope, r.cfg.self, name, l.epoch)
+	pbuf: prim.Path_Buf = ---
+	path := _arc_path(r, &pbuf, aid)
+	chain := journal.Chain {
+		seed   = chain_seed(aid),
+		signer = r.cfg.signer,
+	}
+	j: journal.Journal
+	if journal.journal_open(&j, r.vfs, path, journal.Options{chain = &chain}, context.temp_allocator) != .None {
+		return
+	}
+	defer journal.journal_close(&j)
+	seal: arc.Seal
+	seal.entries = make([dynamic]arc.Seal_Entry, context.temp_allocator)
+	index := make([dynamic]arc.Seal_Entry, context.temp_allocator)
+	_, _, have, lerr := _arc_last_seal(&j, &seal, &index)
+	if lerr != .None || !have {
+		return
+	}
+	if !seal.full {
+		arc.seal_merge(&index, seal.entries[:])
+	}
+	e, found := arc.seal_lookup(index[:], at)
+	if !found {
+		return
+	}
+	rd: journal.Reader
+	journal.journal_reader(&j, &rd, context.temp_allocator)
+	defer journal.reader_close(&rd)
+	body, _, rerr := journal.record_at(&rd, e.arc_off)
+	if rerr != .None {
+		return
+	}
+	g, perr := arc.group_parse(body, e.arc_off)
+	if perr != .None || g.first != e.first || g.end != e.end || at < g.first {
+		return
+	}
+	raw, oerr := arc.group_open(&g, keys)
+	if oerr != .None {
+		return
+	}
+	defer crypto.zero_explicit(raw_data(raw), len(raw))
+	buf := make([dynamic]u8, 0, int(g.end - g.first), context.temp_allocator)
+	gchain := journal.Chain{keys = keys}
+	if arc.group_records(&g, raw, &gchain, keys, false, &buf) != .None || i64(len(buf)) != g.end - g.first {
+		return
+	}
+	hi := min(to, g.end)
+	if at >= hi {
+		return
+	}
+	part := buf[at - g.first:hi - g.first]
+	k := journal.record_bounds(part)
+	if k == 0 {
+		return
+	}
+	return part[:k], true
+}
+
+@(private)
 _arc_advanced :: proc(r: ^Replicator, l: ^Local) {
 	if l.arc_child && l.floor >= l.trim_at {
 		_arc_trim_send(r, l)
@@ -1001,13 +1075,22 @@ _key_live :: proc(keys: journal.Key_Provider, off: i64) -> bool {
 }
 
 @(private)
-_arc_trim_reply :: proc(r: ^Replicator, id: Stream_Id, refused: bool) -> bool {
+_arc_trim_reply :: proc(r: ^Replicator, id: Stream_Id, refused: bool, base: i64 = -1) -> bool {
 	if _, ok := r.trims[id]; !ok {
 		return false
 	}
 	delete_key(&r.trims, id)
 	if !refused {
-		_arc_trim_resume(r, id)
+		if base >= 0 {
+			for lid in prim.sorted_keys(r.locals) {
+				if al, ok := r.locals[lid]; ok && al.arc_child && al.trim_for == id && al.trim_sent > 0 && base > al.trim_base {
+					al.trim_sent = 0
+					al.trim_wait = true
+					al.trim_above = true
+				}
+			}
+		}
+		_arc_trim_resume(r, id, base)
 		return true
 	}
 	for _, al in r.locals {
@@ -1020,7 +1103,7 @@ _arc_trim_reply :: proc(r: ^Replicator, id: Stream_Id, refused: bool) -> bool {
 }
 
 @(private)
-_arc_trim_resume :: proc(r: ^Replicator, id: Stream_Id) {
+_arc_trim_resume :: proc(r: ^Replicator, id: Stream_Id, base: i64 = -1) {
 	if _, inflight := r.trims[id]; inflight {
 		return
 	}
@@ -1028,6 +1111,12 @@ _arc_trim_resume :: proc(r: ^Replicator, id: Stream_Id) {
 		al, ok := r.locals[lid]
 		if !ok || !al.arc_child || !al.trim_wait || al.trim_for != id {
 			continue
+		}
+		if al.trim_above {
+			if base < 0 || base > al.trim_base {
+				continue
+			}
+			al.trim_above = false
 		}
 		al.trim_wait = false
 		if al.floor >= al.trim_at {
