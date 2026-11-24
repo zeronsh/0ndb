@@ -109,6 +109,7 @@ check_deferred_undo :: proc(w: ^World) {
 		if sm == nil {
 			continue
 		}
+		run_until(w, w.now + 20_000_000_000, true)
 		context = instance_context(&n.inst)
 		vfs := disk_vfs(&n.disk)
 		tree := w.model.objs[sm.oi].o
@@ -116,7 +117,11 @@ check_deferred_undo :: proc(w: ^World) {
 		paths := TREE_PATHS
 		was := make(map[string]string, context.temp_allocator)
 		for p in paths {
-			t, _ := eng.tree_read(&n.e, tree, p, context.temp_allocator, {}, line)
+			t, terr := eng.tree_read(&n.e, tree, p, context.temp_allocator, {}, line)
+			if terr != .None && terr != .Not_Found {
+				world_fail(w, "deferred close: cannot read %s on %s before the undo: %v", p, line, terr)
+				return
+			}
 			was[p] = strings.clone(string(t), context.temp_allocator)
 		}
 		after := slice.clone(_line_heads(sm.m), context.temp_allocator)
@@ -128,7 +133,11 @@ check_deferred_undo :: proc(w: ^World) {
 		run_until(w, w.now + 20_000_000_000, true)
 		context = instance_context(&n.inst)
 		for p in paths {
-			t, _ := eng.tree_read(&n.e, tree, p, context.temp_allocator, {}, line)
+			t, terr := eng.tree_read(&n.e, tree, p, context.temp_allocator, {}, line)
+			if terr != .None && terr != .Not_Found {
+				world_fail(w, "deferred close: cannot read %s on %s after the undo: %v", p, line, terr)
+				continue
+			}
 			want := was[p]
 			if p == c.path {
 				for tok in c.tokens {
