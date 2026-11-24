@@ -192,6 +192,18 @@ _handle_get :: proc(e: ^Engine, o: Object, kind: Kind) -> (h: ^Handle, err: Erro
 			_handle_add_member(h, m.device, m.keys_epoch)
 		}
 	}
+	if (!found || !rec.own) && (kind == .Conversation || kind == .Map) && !sp.keyless {
+		path := _seg_path(e, o.id) or_return
+		if prim.exists(e.vfs, path) {
+			if !found {
+				rec = Obj_Rec{space = o.space, kind = kind, members = make([dynamic]Member, context.temp_allocator)}
+			}
+			rec.own = true
+			_rec_put(e, o.id, &rec) or_return
+			h.own = true
+			_handle_open_writer(h) or_return
+		}
+	}
 	if o.id != sp.catalog {
 		_catalog_members(e, h)
 	}
