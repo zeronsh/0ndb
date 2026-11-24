@@ -1,6 +1,7 @@
 package engine
 
 import "../journal"
+import omap "../map"
 import "../pack"
 import "../prim"
 import osync "../sync"
@@ -375,5 +376,19 @@ _restores_durable :: proc(e: ^Engine, list: []Restore) {
 		}
 		_restore_redrive(e, x)
 		_object_changed(e, x.space, x.object, .Data)
+	}
+}
+
+@(private)
+_derived_purge :: proc(e: ^Engine, h: ^Handle) {
+	#partial switch h.kind {
+	case .Map:
+		if _map_table(e, h) == .None && omap.table_reset(&h.table) != .None {
+			omap.table_close(&h.table)
+			h.table_open = false
+		}
+		_index_reindex(e, h)
+	case .Conversation:
+		_index_reindex(e, h)
 	}
 }
