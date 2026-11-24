@@ -805,8 +805,12 @@ _hist_catch_up :: proc(e: ^Engine, h: ^Handle) -> (blocked: bool) {
 					fs.history_unload_unviewed(hist)
 				}
 				merge_scratch := virtual.arena_temp_begin(&e.temp)
+				resolved := hist.resolved
 				_, aerr := fs.history_admit(hist, s.device, pos, owned)
 				virtual.arena_temp_end(merge_scratch)
+				if hist.resolved != resolved {
+					_emit(e, Event{kind = .Authors_Resolved, space = h.sp.id, object = h.id})
+				}
 				if aerr == .None && len(owned) > 0 && owned[0] == fs.REC_REDACT {
 					_hist_redact_own(e, h, owned)
 				}
@@ -1062,7 +1066,7 @@ _tree_text :: proc(e: ^Engine, h: ^Handle, at: ^Tree_At, inode: fstree.Inode_Id)
 	return crdt.text_bytes(&view.text, context.temp_allocator), .None
 }
 
-tree_blame :: proc(e: ^Engine, o: Object, path: string, allocator := context.allocator, line := "") -> (data: []u8, spans: []crdt.Author_Span, err: Error) {
+tree_blame :: proc(e: ^Engine, o: Object, path: string, allocator := context.allocator, line := "", owners: ^[]fs.Span_Owner = nil) -> (data: []u8, spans: []crdt.Author_Span, err: Error) {
 	context = context_for(e)
 	h := _handle_get(e, o, .File_Tree) or_return
 	_hist_ready(e, h) or_return
@@ -1085,8 +1089,25 @@ tree_blame :: proc(e: ^Engine, o: Object, path: string, allocator := context.all
 		data = crdt.text_bytes(&view.text, allocator)
 		spans = crdt.text_spans(&view.text, &h.hist.g, allocator)
 	}
+	if owners != nil {
+		oerr: fs.Error
+		spans, owners^, oerr = fs.history_span_owners(h.hist, spans, space_devices(e, o.space, context.temp_allocator), allocator)
+		if oerr != .None {
+			return nil, nil, _ferr(oerr)
+		}
+	}
 	fs.history_present_spans(h.hist, spans)
 	return data, spans, .None
+}
+
+space_devices :: proc(e: ^Engine, space: prim.Id, allocator := context.allocator) -> []prim.Id {
+	devices := make([dynamic]prim.Id, allocator)
+	if ms, err := space_members(e, space, context.temp_allocator); err == .None {
+		for x in ms {
+			append(&devices, x.device)
+		}
+	}
+	return devices[:]
 }
 
 @(private)

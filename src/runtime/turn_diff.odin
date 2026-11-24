@@ -16,9 +16,11 @@ import "../textdiff"
 Turn_Blame :: struct {
 	line_lo: int,
 	line_hi: int,
-	actor:   prim.Id,
-	owner:   prim.Id,
-	device:  prim.Id,
+	actor:        prim.Id,
+	owner:        fs.Owner_Kind,
+	conversation: prim.Id,
+	scope:        prim.Id,
+	device:       prim.Id,
 }
 
 Turn_File :: struct {
@@ -209,6 +211,7 @@ _turn_merge :: proc(s: ^Turn_Span, blob: []u8, start: bool) {
 _turn_compute :: proc(r: ^Runtime, o: Object, s: ^Turn_Span, opts: Turn_Opts, allocator: runtime.Allocator) -> Turn {
 	t := Turn{msg = s.msg, actor = s.actor, stamp = s.stamp, ended = s.ended}
 
+	devices := eng.space_devices(r.e, o.space, context.temp_allocator)
 	files := make([dynamic]Turn_File, allocator)
 	budget := opts.max_chars if opts.max_chars > 0 else 200_000
 	slice.sort_by(s.mounts[:], proc(a, b: Turn_Mount) -> bool {
@@ -223,7 +226,7 @@ _turn_compute :: proc(r: ^Runtime, o: Object, s: ^Turn_Span, opts: Turn_Opts, al
 		if herr != .None {
 			continue
 		}
-		_turn_mount(h, o, s, m, opts, &budget, &t, &files, allocator)
+		_turn_mount(h, o, s, m, opts, &budget, &t, &files, allocator, devices)
 		eng.tree_release(r.e, tree)
 	}
 	if opts.max_files > 0 && len(files) > opts.max_files {
@@ -235,7 +238,7 @@ _turn_compute :: proc(r: ^Runtime, o: Object, s: ^Turn_Span, opts: Turn_Opts, al
 }
 
 @(private)
-_turn_mount :: proc(h: ^fs.History, o: Object, s: ^Turn_Span, m: Turn_Mount, opts: Turn_Opts, budget: ^int, t: ^Turn, files: ^[dynamic]Turn_File, allocator: runtime.Allocator) {
+_turn_mount :: proc(h: ^fs.History, o: Object, s: ^Turn_Span, m: Turn_Mount, opts: Turn_Opts, budget: ^int, t: ^Turn, files: ^[dynamic]Turn_File, allocator: runtime.Allocator, devices: []prim.Id = nil) {
 	arena: virtual.Arena
 	if !_arena_init(&arena) {
 		return
@@ -365,7 +368,7 @@ _turn_mount :: proc(h: ^fs.History, o: Object, s: ^Turn_Span, m: Turn_Mount, opt
 				}
 			}
 			if opts.blame && pb {
-				f.blame = _turn_blame(h, b, spans, allocator)
+				f.blame = _turn_blame(h, b, spans, allocator, devices)
 			}
 		}
 		t.added += f.added
@@ -392,15 +395,16 @@ _turn_content :: proc(h: ^fs.History, ino: fstree.Inode_Id, inf: fstree.Info, v:
 }
 
 @(private)
-_turn_blame :: proc(h: ^fs.History, data: []u8, spans: []crdt.Author_Span, allocator: runtime.Allocator) -> []Turn_Blame {
+_turn_blame :: proc(h: ^fs.History, data: []u8, spans: []crdt.Author_Span, allocator: runtime.Allocator, devices: []prim.Id) -> []Turn_Blame {
 	Tally :: struct {
 		actor: prim.Id,
+		op:    crdt.Op_Id,
 		n:     int,
 	}
 	out := make([dynamic]Turn_Blame, allocator)
 	tally := make([dynamic]Tally, context.temp_allocator)
 	line := 1
-	finish :: proc(h: ^fs.History, out: ^[dynamic]Turn_Blame, tally: ^[dynamic]Tally, line: ^int) {
+	finish :: proc(h: ^fs.History, out: ^[dynamic]Turn_Blame, tally: ^[dynamic]Tally, line: ^int, devices: []prim.Id) {
 		best := 0
 		for x, i in tally {
 			if x.n > tally[best].n {
@@ -411,20 +415,20 @@ _turn_blame :: proc(h: ^fs.History, data: []u8, spans: []crdt.Author_Span, alloc
 		if n := len(out); n > 0 && out[n - 1].actor == who && out[n - 1].line_hi == line^ {
 			out[n - 1].line_hi = line^ + 1
 		} else {
-			owner, _ := fs.history_owner_of(h, who)
-			append(out, Turn_Blame{line_lo = line^, line_hi = line^ + 1, actor = who, owner = owner, device = fs.history_present_actor(h, who)})
+			w, _ := fs.history_span_owner(h, tally[best].op, devices)
+			append(out, Turn_Blame{line_lo = line^, line_hi = line^ + 1, actor = who, owner = w.kind, conversation = w.conversation, scope = w.scope, device = w.device})
 		}
 		line^ += 1
 		clear(tally)
 	}
-	add :: proc(tally: ^[dynamic]Tally, actor: prim.Id, n: int) {
+	add :: proc(tally: ^[dynamic]Tally, op: crdt.Op_Id, n: int) {
 		for &x in tally {
-			if x.actor == actor {
+			if x.actor == op.actor {
 				x.n += n
 				return
 			}
 		}
-		append(tally, Tally{actor, n})
+		append(tally, Tally{op.actor, op, n})
 	}
 	at := 0
 	for s in spans {
@@ -439,15 +443,15 @@ _turn_blame :: proc(h: ^fs.History, data: []u8, spans: []crdt.Author_Span, alloc
 			}
 			nl := q < hi
 			end := q + 1 if nl else q
-			add(&tally, s.id.actor, end - p)
+			add(&tally, crdt.Op_Id{s.id.actor, s.id.seq + u64(p - lo)}, end - p)
 			p = end
 			if nl {
-				finish(h, &out, &tally, &line)
+				finish(h, &out, &tally, &line, devices)
 			}
 		}
 	}
 	if len(tally) > 0 {
-		finish(h, &out, &tally, &line)
+		finish(h, &out, &tally, &line, devices)
 	}
 	return out[:]
 }

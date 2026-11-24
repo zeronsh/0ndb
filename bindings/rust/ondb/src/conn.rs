@@ -429,7 +429,7 @@ impl Client {
     }
 }
 
-pub const EVENT_NAMES: [&str; 34] = [
+pub const EVENT_NAMES: [&str; 35] = [
     "connected",
     "disconnected",
     "durable",
@@ -464,6 +464,7 @@ pub const EVENT_NAMES: [&str; 34] = [
     "rename_offered",
     "redact_unreached",
     "models_changed",
+    "authors_resolved",
 ];
 
 fn events_frame(mask: u64) -> Vec<u8> {

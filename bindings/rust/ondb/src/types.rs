@@ -775,7 +775,18 @@ pub struct Spans {
 pub struct Blame {
     pub line: String,
     pub text: String,
-    pub spans: Vec<Span>,
+    pub spans: Vec<BlameSpan>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct BlameSpan {
+    #[serde(flatten)]
+    pub span: Span,
+    pub owner: String,
+    pub conversation: Option<Id>,
+    pub scope: Option<Id>,
+    pub device: Option<Id>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

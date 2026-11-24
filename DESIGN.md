@@ -943,7 +943,19 @@ equal in both directions.
   blake2b-128("0ndb scope line" || scope actor || line))`, registered with
   kind 3 (actor, pseudo, base scope actor, device). Blame presents a line
   actor as its base actor, and a line actor whose base is owned joins the
-  base's owner, so the write undoes with its turn. An unscoped write that is
+  base's owner, so the write undoes with its turn. `tree.blame` gives each
+  span an owner, resolved through the actor records: `agent` (the
+  conversation that owns an actor on the way, the turn or tool call scope
+  the op was committed under, and the device), `person` (the device that
+  wrote it: this device, a history stream, a roster member, or an actor
+  whose own ops this device holds without an actor record, such as an
+  editor or a client-supplied actor), or `unresolved`: the author is
+  reached only through a record that names it (a line actor's base) and
+  neither its actor record nor any op of its own has arrived. Unresolved
+  never names an owner: a carrier never asserts its author's ownership,
+  since only the author's stream can. When the record or the first op of
+  a wanted author arrives, the engine emits `Authors_Resolved` for the
+  tree, and the next read shows the owner. An unscoped write that is
   off the line still falls back to the mount's actor. The engine reports each
   switch as `Line_Switched` (object = the tree, detail = from and to keys) and
   git's `index.lock` coming and going

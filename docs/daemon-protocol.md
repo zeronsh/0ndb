@@ -280,7 +280,10 @@ the user's git repository at `place` holds it, reached from `ref` at
 history. `shared`: other live content still uses the same bytes. `pinned`:
 a pack git pinned with `.keep` or `.promisor` (`place`) holds it. `left`: its
 removal failed and the scrub stays pending; it resumes at the next redaction
-and the next open. `object` is zero for a scrub resumed at open). The meaning of each
+and the next open. `object` is zero for a scrub resumed at open),
+33 models_changed,
+34 authors_resolved (an author a `tree.blame` span of `object` showed as
+`unresolved` became known: blame it again for its owner). The meaning of each
 field per kind is in the header (`Event`). For a UI: `placement` (where a
 conversation's next run is; see "Placement" below), `presence`
 (device up or down, `tick` 1 or 0), `connected`/`disconnected` (relay link of
@@ -786,7 +789,7 @@ up exist only over the socket.
 | 93 | `tree.mount` | object: object, root: str | {} |
 | 94 | `tree.unmount` | object: object, root: str | {} |
 | 95 | `tree.mounts` | – | mounts:[Mounted] |
-| 96 | `tree.blame` | object: object, path: str, line: str | line:str text:str spans:[Span] |
+| 96 | `tree.blame` | object: object, path: str, line: str | line:str text:str spans:[BlameSpan] |
 | 97 | `tree.sync` | object: object, root: str | {} |
 | 98 | `tree.find` | path: str | object:object root:str rel:str |
 
