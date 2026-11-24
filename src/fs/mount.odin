@@ -2224,6 +2224,20 @@ load_mount_state :: proc(m: ^Mount) -> (fresh: bool, err: Error) {
 		rec_head.commit = prim.read_str(&rd)
 		rec_reflog = prim.read_ivarint(&rd)
 	}
+	if prim.reader_remaining(&rd) > 0 {
+		nr := prim.read_uvarint(&rd)
+		if nr > u64(prim.reader_remaining(&rd)) {
+			return false, .Corrupt
+		}
+		for _ in 0 ..< nr {
+			k := prim.read_str(&rd)
+			row := decode_version(prim.read_bytes(&rd), context.temp_allocator) or_return
+			if !prim.reader_ok(&rd) {
+				return false, .Corrupt
+			}
+			shown_put(&m.shown, k, row, m.allocator)
+		}
+	}
 	m.jpend = m.jpos
 	if !prim.reader_ok(&rd) {
 		return false, .Corrupt
@@ -2292,6 +2306,7 @@ Mount_Image :: struct {
 	chained:    bool,
 	line:       string,
 	absent:     [dynamic]string,
+	shown:      map[string][]crdt.Op_Id,
 }
 
 Mount_Wait :: struct {
@@ -2336,6 +2351,9 @@ image_take :: proc(m: ^Mount, img: ^Mount_Image) {
 		c, _ := clone_string(a, m.allocator)
 		append(&img.absent, c)
 	}
+	for k, v in prim.unordered(m.shown) {
+		shown_put(&img.shown, k, v, m.allocator)
+	}
 }
 
 @(private)
@@ -2352,6 +2370,7 @@ image_free :: proc(m: ^Mount, img: ^Mount_Image) {
 		delete(a, m.allocator)
 	}
 	delete(img.absent)
+	shown_free(&img.shown, m.allocator)
 	img^ = {}
 }
 
@@ -2574,6 +2593,13 @@ save_mount_state :: proc(m: ^Mount) -> Error {
 	prim.write_str(&w, rec.head.branch)
 	prim.write_str(&w, rec.head.commit)
 	prim.write_ivarint(&w, rec.reflog_pos)
+	prim.write_uvarint(&w, u64(len(img.shown)))
+	for k in sorted_strings(img.shown) {
+		rb := make([dynamic]u8, context.temp_allocator)
+		encode_version(&rb, img.shown[k])
+		prim.write_str(&w, k)
+		prim.write_bytes(&w, rb[:])
+	}
 	sum := xxhash.XXH3_64_with_seed(buf[:], 0) | 1
 	if sum == m.saved {
 		return .None
