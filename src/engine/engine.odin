@@ -37,6 +37,7 @@ Error :: enum u8 {
 	No_Memory,
 	Io,
 	Conflict,
+	Newer,
 }
 
 Kind :: obj.Kind

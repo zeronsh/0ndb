@@ -228,6 +228,7 @@
  *                 line_hi: uvarint, actor: id, seq: uvarint, op_actor: id,
  *                 op_seq: uvarint, redacted: bool
  *   Mounted    := object: object, root: str, line: str
+ *   Refused    := object: object, root: str
  *   Hit        := object: object, participant: id, msg: rid, ref: bytes,
  *                 part: uvarint, kind: enum kind, title: bool, hlc: uvarint,
  *                 score: f64, snippet: str, snippet_at: uvarint,
@@ -421,7 +422,8 @@ enum ondb_status {
 	ONDB_CANCELLED = 23,
 	ONDB_BUDGET = 24,
 	ONDB_SPAWN = 25,
-	ONDB_TIMEOUT = 26
+	ONDB_TIMEOUT = 26,
+	ONDB_NEWER = 27
 };
 
 /* Errors returned by Vfs and Spawner plug functions (0 = success). */
@@ -1313,7 +1315,7 @@ int ondb_tool_result(ondb *h, const uint8_t space[16], const uint8_t object[16],
 #define ONDB_OP_TREE_MOUNT 93u
 /* tree.unmount(object: object, root: str) -> {} */
 #define ONDB_OP_TREE_UNMOUNT 94u
-/* tree.mounts() -> mounts:[Mounted] */
+/* tree.mounts() -> mounts:[Mounted], refused:[Refused] */
 #define ONDB_OP_TREE_MOUNTS 95u
 /* tree.blame(object: object, path: str, line: str) -> line:str text:str spans:[Span] */
 #define ONDB_OP_TREE_BLAME 96u

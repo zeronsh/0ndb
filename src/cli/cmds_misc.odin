@@ -154,6 +154,10 @@ cmd_status :: proc(a: ^Args) -> int {
 		ob, _ := api.parse_object(jstr(m, "object"))
 		fmt.printfln("mount    %s → tree %s (%s)", jstr(m, "root"), short(hex(ob.id)), jstr(m, "line"))
 	}
+	for m in jarr(mt, "refused") {
+		ob, _ := api.parse_object(jstr(m, "object"))
+		fmt.printfln("mount    %s → tree %s (newer)%s", jstr(m, "root"), short(hex(ob.id)), status_hint(.Newer))
+	}
 	if rr.status == .Ok {
 		role := "runner" if jbool(rr.value, "runner") else "client"
 		fmt.printfln("runtime  %s · %d running · %d warm · %d runs started", role, jint(rr.value, "active_runs"), jint(rr.value, "warm_processes"), jint(rr.value, "runs_started"))
@@ -483,6 +487,10 @@ cmd_mount :: proc(a: ^Args) -> int {
 			ob, _ := api.parse_object(jstr(m, "object"))
 			fmt.printfln("%s → tree %s (%s)", jstr(m, "root"), short(hex(ob.id)), jstr(m, "line"))
 		}
+		for m in jarr(v, "refused") {
+			ob, _ := api.parse_object(jstr(m, "object"))
+			fmt.printfln("%s → tree %s (newer)%s", jstr(m, "root"), short(hex(ob.id)), status_hint(.Newer))
+		}
 		return 0
 	}
 	if len(a.pos) >= 2 && a.pos[0] == "rm" {
@@ -496,6 +504,12 @@ cmd_mount :: proc(a: ^Args) -> int {
 		return usage_error("usage: 0ndb mount DIR [--tree T] [--convo C] [--name NAME] | mount ls | mount rm DIR")
 	}
 	root := abs_path(a.pos[0])
+	has_tree := flag_bool(a, "tree")
+	for r in jarr(must(s, `{"op":"tree.mounts"}`), "refused") {
+		if jstr(r, "root") == root && !has_tree {
+			return report_error(.Newer, "cannot mount %s", root)
+		}
+	}
 	convo: api.Object
 	has_convo := false
 	if c, ok := flag_value(a, "convo"); ok {
