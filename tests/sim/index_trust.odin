@@ -12,7 +12,7 @@ import "../../src/prim"
 INDEX_TRUST_ROOT :: "/work/trust-n0-git"
 
 @(private = "file")
-IT_FILES :: 60
+it_files := 60
 
 @(private = "file")
 _it_name :: proc(i: int) -> string {
@@ -33,7 +33,7 @@ _it_body :: proc(tag: string, i: int) -> []u8 {
 	return b.buf[:]
 }
 
-index_trust_run :: proc(seed: u64, crash_at: u64) -> (failures: [dynamic]string, crashed: bool) {
+index_trust_run :: proc(seed: u64, crash_at: u64, budget: int) -> (failures: [dynamic]string, crashed: bool) {
 	failures = make([dynamic]string)
 	cfg := default_config(seed)
 	cfg.nodes = 1
@@ -46,6 +46,7 @@ index_trust_run :: proc(seed: u64, crash_at: u64) -> (failures: [dynamic]string,
 	cfg.bulk = false
 	cfg.mem_max = 1500
 	cfg.index_trust = true
+	cfg.pass_budget = budget
 	cfg.verbose = env_u64("SIM_VERBOSE", 0) != 0
 	w := new(World)
 	world_init(w, cfg)
@@ -102,7 +103,7 @@ _it_case :: proc(w: ^World, crash_at: u64) -> (crashed: bool) {
 	oi := len(m.objs) - 1
 	main_files := make([dynamic]Git_File, context.temp_allocator)
 	other_files := make([dynamic]Git_File, context.temp_allocator)
-	for i in 0 ..< IT_FILES {
+	for i in 0 ..< it_files {
 		append(&main_files, Git_File{name = _it_name(i), data = _it_body("main", i)})
 		append(&other_files, Git_File{name = _it_name(i), data = _it_body("other", i)})
 	}
@@ -131,7 +132,7 @@ _it_case :: proc(w: ^World, crash_at: u64) -> (crashed: bool) {
 		return
 	}
 	past := clock_wall(&n.clock) - 3_000_000_000
-	for i in 0 ..< IT_FILES {
+	for i in 0 ..< it_files {
 		if !_it_racy(i) {
 			if err := prim.set_times(vfs, fmt.tprintf("%s/%s", INDEX_TRUST_ROOT, _it_name(i)), past, past); err != .None {
 				world_fail(w, "trust: set_times %s: %v", _it_name(i), err)
@@ -143,7 +144,7 @@ _it_case :: proc(w: ^World, crash_at: u64) -> (crashed: bool) {
 		world_fail(w, "trust: index refresh: %v", err)
 		return
 	}
-	for i in 0 ..< IT_FILES {
+	for i in 0 ..< it_files {
 		if _it_racy(i) {
 			if err := _it_write(vfs, fmt.tprintf("%s/%s", INDEX_TRUST_ROOT, _it_name(i)), _it_body("OTHER", i)); err != .None {
 				world_fail(w, "trust: racy rewrite %s: %v", _it_name(i), err)
@@ -179,19 +180,23 @@ _it_case :: proc(w: ^World, crash_at: u64) -> (crashed: bool) {
 	defer node_after(n)
 	if !crashed {
 		racy := 0
-		for i in 0 ..< IT_FILES {
+		for i in 0 ..< it_files {
 			if _it_racy(i) {
 				racy += 1
 			}
 		}
-		if sm.m.trust_reads < IT_FILES - racy || sm.m.trust_refused < racy {
-			world_fail(w, "trust: the pass after the checkout read %d files from the index (want %d) and refused %d (want %d racy)", sm.m.trust_reads, IT_FILES - racy, sm.m.trust_refused, racy)
+		if sm.m.trust_reads < it_files - racy || sm.m.trust_refused < racy {
+			world_fail(w, "trust: the pass after the checkout read %d files from the index (want %d) and refused %d (want %d racy)", sm.m.trust_reads, it_files - racy, sm.m.trust_refused, racy)
 		}
 	}
-	for i in 0 ..< IT_FILES {
+	for i in 0 ..< it_files {
 		name := _it_name(i)
 		disk, derr := prim.read_file(vfs, fmt.tprintf("%s/%s", INDEX_TRUST_ROOT, name), context.temp_allocator)
 		text, found, terr := fs.mount_synced_text(sm.m, name, context.temp_allocator)
+		want := _it_body("OTHER" if _it_racy(i) else "other", i)
+		if derr == .None && string(disk) != string(want) {
+			world_fail(w, "trust: after a crash at op %d (crashed %v) %s holds %q, not the %q git checked out", crash_at, crashed, name, string(disk), string(want))
+		}
 		if derr != .None || terr != .None || !found || string(text) != string(disk) {
 			world_fail(w, "trust: after a crash at op %d (crashed %v) %s (racy %v) is synced as %q (found %v, %v), the work tree holds %q (%v)", crash_at, crashed, name, _it_racy(i), string(text), found, terr, string(disk), derr)
 		}
@@ -211,7 +216,7 @@ _it_precondition :: proc(w: ^World, n: ^Node, vfs: prim.Vfs) -> bool {
 	defer fs.index_close(&r)
 	index_mtime := fs.index_file_mtime_ns(&r)
 	racy := make(map[string]bool, context.temp_allocator)
-	for i in 0 ..< IT_FILES {
+	for i in 0 ..< it_files {
 		racy[_it_name(i)] = _it_racy(i)
 	}
 	seen := 0
@@ -246,8 +251,8 @@ _it_precondition :: proc(w: ^World, n: ^Node, vfs: prim.Vfs) -> bool {
 			return false
 		}
 	}
-	if seen != IT_FILES {
-		world_fail(w, "trust: the index holds %d of the %d files", seen, IT_FILES)
+	if seen != it_files {
+		world_fail(w, "trust: the index holds %d of the %d files", seen, it_files)
 		return false
 	}
 	return true
@@ -271,22 +276,26 @@ index_trust_pass :: proc(t: ^testing.T) {
 	}
 	test_begin(t)
 	defer test_end(t)
-	for k in u64(0) ..= 6000 {
-		failures, crashed := index_trust_run(1, k)
-		for f in failures {
-			fmt.eprintf("index_trust_pass at disk op %d: %s\n", k, f)
-			delete(f)
+	for budget in ([]int{1024, 6}) {
+		it_files = 60 if budget > 6 else 20
+		done := false
+		for k := u64(0); k <= 20000 && !done; k += 1 {
+			failures, crashed := index_trust_run(1, k, budget)
+			for f in failures {
+				fmt.eprintf("index_trust_pass budget %d at disk op %d: %s\n", budget, k, f)
+				delete(f)
+			}
+			testing.expect(t, len(failures) == 0, fmt.tprintf("index_trust_pass budget %d at disk op %d failed", budget, k))
+			n := len(failures)
+			delete(failures)
+			if n > 0 {
+				return
+			}
+			if k > 0 && !crashed {
+				fmt.eprintf("index_trust_pass budget %d: %d crash points\n", budget, k - 1)
+				done = true
+			}
 		}
-		testing.expect(t, len(failures) == 0, fmt.tprintf("index_trust_pass at disk op %d failed", k))
-		n := len(failures)
-		delete(failures)
-		if n > 0 {
-			return
-		}
-		if k > 0 && !crashed {
-			fmt.eprintf("index_trust_pass: %d crash points\n", k - 1)
-			return
-		}
+		testing.expect(t, done, fmt.tprintf("index_trust_pass budget %d: the pass never completed without a crash", budget))
 	}
-	testing.expect(t, false, "index_trust_pass: the pass never completed without a crash")
 }

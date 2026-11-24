@@ -195,11 +195,13 @@ Config :: struct {
 	promote:     i64,
 	persist_fault: bool,
 	index_trust: bool,
+	pass_budget: int,
 }
 
 World :: struct {
 	cfg:       Config,
 	now:       i64,
+	pause:     bool,
 	seq:       u64,
 	queue:     [dynamic]Sim_Event,
 	rng:       Rng,

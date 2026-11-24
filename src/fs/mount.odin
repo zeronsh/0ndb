@@ -23,6 +23,7 @@ Mount_Options :: struct {
 	line:         string,
 	follow_branch: bool,
 	index_trust:  bool,
+	pass_budget:  int,
 }
 
 DEFAULT_MOUNT :: Mount_Options {
@@ -35,6 +36,7 @@ DEFAULT_MOUNT :: Mount_Options {
 	line         = "main",
 	follow_branch = true,
 	index_trust  = ODIN_OS == .Windows,
+	pass_budget  = 1024,
 }
 
 Scope :: struct {
@@ -96,6 +98,19 @@ Registry :: struct {
 	on_line:   Line_Proc,
 	on_lock:   Git_Lock_Proc,
 	hook_data: rawptr,
+	on_park:   Park_Proc,
+	park_data: rawptr,
+}
+
+Park_Proc :: #type proc(m: ^Mount, data: rawptr)
+
+registry_set_park_note :: proc(reg: ^Registry, cb: Park_Proc, data: rawptr) {
+	reg.on_park = cb
+	reg.park_data = data
+}
+
+mount_pass_parked :: proc(m: ^Mount) -> bool {
+	return m.pass != nil
 }
 
 Line_Proc :: #type proc(m: ^Mount, from, to: string, data: rawptr)
@@ -436,6 +451,9 @@ Mount :: struct {
 	imported:    bool,
 	adopt_pending: bool,
 	hold_line:   bool,
+	pass:        ^Pass,
+	pass_turns:  int,
+	pass_turn_max: int,
 	alias:       [dynamic]Version,
 	unwatched:   [dynamic]string,
 	attrs:       ^Attr_Ctx,
@@ -755,8 +773,14 @@ mount_close :: proc(m: ^Mount) {
 	mount_unlock(m)
 	delete(m.lock_watches)
 	m.lock_watches = nil
+	if m.awake && m.pass != nil {
+		pass_drain(m)
+	}
 	if m.awake && len(m.dirty) > 0 {
 		mount_pass(m, false)
+	}
+	if m.pass != nil {
+		pass_abort(m.pass)
 	}
 	mount_hibernate(m)
 	if m.lock_fd >= 0 && m.dir != "" {
@@ -951,7 +975,7 @@ mount_hibernate :: proc(m: ^Mount) -> Error {
 	if !m.awake {
 		return .None
 	}
-	if len(m.dirty) > 0 || m.rescan || len(m.waits) > 0 {
+	if len(m.dirty) > 0 || m.rescan || len(m.waits) > 0 || m.pass != nil {
 		return .Busy
 	}
 	err := shadow_flush(m)
@@ -1602,18 +1626,19 @@ mount_step :: proc(m: ^Mount) -> Error {
 			fence = true
 		}
 	}
-	err := mount_pass(m, false, !fence)
+	err := mount_pass(m, false) if fence else mount_pass_step(m, true)
 	if err == .Deferred {
 		mount_touch(m)
 		return err
 	}
-	if err == .None {
+	parked := m.pass != nil
+	if err == .None && !parked {
 		err = mount_materialize(m)
 		if err != .None && err != .Reloading {
 			mount_reload_retry(m)
 		}
 	}
-	if err == .None && len(m.switch_to) > 0 {
+	if err == .None && !parked && len(m.switch_to) > 0 {
 		mount_switch_step(m)
 	}
 	if err == .Reloading {

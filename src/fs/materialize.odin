@@ -38,6 +38,9 @@ mount_materialize :: proc(m: ^Mount) -> Error {
 		return .None
 	}
 	mount_wake(m) or_return
+	if m.pass != nil {
+		return .None
+	}
 	if m.adopt_pending {
 		if !m.imported {
 			return .None
