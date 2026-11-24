@@ -269,6 +269,19 @@ run_disk_read :: proc(d: ^Disk, path: string, off: i64, n: int) {
 	}
 }
 
+Disk_Fault_Hook :: #type proc(d: ^Disk, path: string) -> prim.Error
+
+@(private = "file")
+_disk_fault: Disk_Fault_Hook
+
+register_disk_fault :: proc "contextless" (hook: Disk_Fault_Hook) {
+	_disk_fault = hook
+}
+
+run_disk_fault :: proc(d: ^Disk, path: string) -> prim.Error {
+	return .None if _disk_fault == nil else _disk_fault(d, path)
+}
+
 register_op :: proc "contextless" (order: int, name: string, weight: Op_Weight, run: Op_Run) {
 	_add(&reg.ops, Ext_Op{order, name, weight, run})
 }
