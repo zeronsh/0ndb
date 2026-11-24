@@ -83,9 +83,10 @@ Redacted_Hook :: struct {
 }
 
 Persist_Fault :: struct {
-	data:   rawptr,
-	fail:   proc(data: rawptr) -> bool,
-	zeroed: proc(data: rawptr),
+	data:        rawptr,
+	fail:        proc(data: rawptr) -> bool,
+	zeroed:      proc(data: rawptr),
+	blob_zeroed: proc(data: rawptr),
 }
 
 @(private)
@@ -2347,7 +2348,11 @@ content_read :: proc(data: rawptr, oid: crdt.Oid, offset: int, dst: []u8) -> boo
 			if d != nil {
 				delete(d, h.allocator)
 			}
-			return false
+			z, zok := zeroed_read(h, full)
+			if !zok {
+				return false
+			}
+			d = z
 		}
 		h.blob_data = d
 		h.blob_cache = full
