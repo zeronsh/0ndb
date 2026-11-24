@@ -633,57 +633,6 @@ cmd_record :: proc(a: ^Args) -> int {
 	return 0
 }
 
-cmd_redact :: proc(a: ^Args) -> int {
-	s := session(a)
-	if len(a.pos) >= 1 && a.pos[0] == "text" {
-		if len(a.pos) != 4 {
-			return usage_error("usage: 0ndb redact text OBJECT POS LEN")
-		}
-		pos, ok1 := strconv.parse_i64(a.pos[2])
-		n, ok2 := strconv.parse_i64(a.pos[3])
-		if !ok1 || !ok2 || pos < 0 || n <= 0 {
-			return usage_error("POS and LEN are byte counts")
-		}
-		r := req_begin("text.redact")
-		req_str(&r, "object", object_str(resolve_object(s, a.pos[1])))
-		req_int(&r, "pos", pos)
-		req_int(&r, "len", n)
-		must(s, req_end(&r), "cannot redact")
-		fmt.println("redacted")
-		return 0
-	}
-	if len(a.pos) >= 1 && a.pos[0] == "key" {
-		if len(a.pos) != 3 {
-			return usage_error("usage: 0ndb redact key MAP KEY")
-		}
-		kb := make([dynamic]u8, context.temp_allocator)
-		for c in transmute([]u8)a.pos[2] {
-			append(&kb, api.HEX[c >> 4], api.HEX[c & 15])
-		}
-		r := req_begin("map.redact")
-		req_str(&r, "object", object_str(resolve_object(s, a.pos[1])))
-		req_str(&r, "key", string(kb[:]))
-		must(s, req_end(&r), "cannot redact")
-		fmt.println("redacted")
-		return 0
-	}
-	ob, rest := _convo_and_rest(s, a, 1)
-	if len(rest) < 1 {
-		return usage_error("usage: 0ndb redact [CONVO] MSG")
-	}
-	msg := resolve_msg(s, ob, rest[0])
-	r := req_begin("redact")
-	req_str(&r, "object", object_str(ob))
-	req_str(&r, "msg", rid_str(msg))
-	v := must(s, req_end(&r), "cannot redact")
-	if a.json {
-		print_json(v)
-	} else {
-		fmt.printfln("redacted %s", short_rid(rid_str(msg)))
-	}
-	return 0
-}
-
 cmd_undo :: proc(a: ^Args) -> int {
 	s := session(a)
 	ob, rest := _convo_and_rest(s, a, 1)

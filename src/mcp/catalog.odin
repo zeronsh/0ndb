@@ -13,12 +13,11 @@ Catalog_Tool :: enum u8 {
 	Memory_Write,
 	Schedule,
 	History_Search,
-	Redact,
 }
 
 Catalog_Tools :: bit_set[Catalog_Tool;u16]
 
-ALL_CATALOG_TOOLS :: Catalog_Tools{.Spawn, .Send, .Wait, .List, .Cancel, .Result, .Merge, .Memory_Search, .Memory_Read, .Memory_Write, .Schedule, .History_Search, .Redact}
+ALL_CATALOG_TOOLS :: Catalog_Tools{.Spawn, .Send, .Wait, .List, .Cancel, .Result, .Merge, .Memory_Search, .Memory_Read, .Memory_Write, .Schedule, .History_Search}
 
 ORCHESTRATION_TOOLS :: Catalog_Tools{.Spawn, .Send, .Wait, .List, .Cancel, .Result, .Merge}
 
@@ -158,12 +157,5 @@ CATALOG := [Catalog_Tool]Catalog_Entry {
 		output_schema = `{"type":"object","properties":{"hits":{"type":"array","items":{"type":"object","properties":{"conversation":{"type":"string"},"title":{"type":"string"},"message":{"type":"string"},"role":{"type":"string"},"author":{"type":"string"},"time":{"type":"string","format":"date-time"},"snippet":{"type":"string"},"score":{"type":"number"}},"required":["conversation","message","snippet"]}},"next_cursor":{"type":"string"}},"required":["hits"]}`,
 		annotations = `{"title":"Search history","readOnlyHint":true,"openWorldHint":false}`,
 	},
-	.Redact = {
-		name = "redact",
-		title = "Redact",
-		description = "Permanently delete content everywhere it was replicated, keeping every id valid: a whole object, one message, one block, or a byte range of a text. Keys are destroyed, bytes are zero-filled on every replica and the relay, indexes are purged and provider session state is scrubbed. Cannot be undone; requires confirm: true.",
-		input_schema = `{"type":"object","properties":{"object":{"type":"string","pattern":"^[0-9a-f]{32}$","description":"Object (conversation, map, text or file tree) id."},"message":{"type":"string","minLength":1,"description":"Message record id within a conversation."},"block":{"type":"integer","minimum":0,"description":"Block index within the message; requires message."},"range":{"type":"object","properties":{"start":{"type":"integer","minimum":0},"end":{"type":"integer","minimum":0}},"required":["start","end"],"additionalProperties":false,"description":"Byte range within a text object, at its current version. Not combined with message."},"reason":{"type":"string","maxLength":2000},"confirm":{"type":"boolean","const":true}},"required":["object","confirm"],"additionalProperties":false}`,
-		output_schema = `{"type":"object","properties":{"redacted":{"type":"boolean"},"records":{"type":"integer"},"bytes":{"type":"integer"}},"required":["redacted"]}`,
-		annotations = `{"title":"Redact","readOnlyHint":false,"destructiveHint":true,"idempotentHint":true,"openWorldHint":false}`,
-	},
+
 }
