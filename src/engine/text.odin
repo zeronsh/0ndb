@@ -412,9 +412,7 @@ device_odb :: proc(e: ^Engine) -> (db: ^odb.Odb, err: Error) {
 			if left, lerr := odb.scrub_targets(&e.db, context.temp_allocator); lerr == .None {
 				_serve_drop_oids(e, left)
 			}
-			rstats, serr := odb.scrub_resume(&e.db, context.temp_allocator)
-			_redact_report(e, {}, {}, rstats.unreached)
-			if serr != .None {
+			if _, serr := odb.scrub_resume(&e.db, context.temp_allocator); serr != .None {
 				_log(e, .Warn, "a pending object scrub did not finish; it stays for the next open")
 			}
 		}
@@ -550,7 +548,6 @@ _on_offered :: proc(data: rawptr, hist: ^fs.History, dest: fstree.Inode_Id, sour
 _hist_options :: proc(h: ^Handle) -> fs.History_Options {
 	e := h.e
 	o := fs.History_Options{clock = _fs_clock(e), random = e.cfg.random, fault = e.cfg.history_fault}
-	o.redacted = fs.Redacted_Hook{data = h, call = _hist_redacted}
 	if h.sp.repl_on {
 		o.keep_at_least, _ = osync.replicator_floor(&h.sp.repl, &h.scope, h.name, 0)
 	}
@@ -811,9 +808,6 @@ _hist_catch_up :: proc(e: ^Engine, h: ^Handle) -> (blocked: bool) {
 				if hist.resolved != resolved {
 					_emit(e, Event{kind = .Authors_Resolved, space = h.sp.id, object = h.id})
 				}
-				if aerr == .None && len(owned) > 0 && owned[0] == fs.REC_REDACT {
-					_hist_redact_own(e, h, owned)
-				}
 				if aerr == .Not_Found {
 					blocked = true
 					break
@@ -837,53 +831,6 @@ _hist_catch_up :: proc(e: ^Engine, h: ^Handle) -> (blocked: bool) {
 		_log(e, .Warn, "history replay failed")
 	}
 	return
-}
-
-@(private)
-_hist_redacted :: proc(data: rawptr, list: []odb.Unreached) {
-	h := (^Handle)(data)
-	_ckpt_purge(h.e, h)
-	_redact_report(h.e, h.sp.id, h.id, list)
-}
-
-@(private)
-_hist_redact_own :: proc(e: ^Engine, h: ^Handle, body: []u8) {
-	rd := prim.reader(body[1:])
-	n := prim.read_uvarint(&rd)
-	if n > u64(len(body)) {
-		return
-	}
-	own := make([dynamic]crdt.Op_Span, context.temp_allocator)
-	for _ in 0 ..< n {
-		a := prim.read_id(&rd)
-		seq := prim.read_uvarint(&rd)
-		l := prim.read_uvarint(&rd)
-		if !prim.reader_ok(&rd) || l == 0 || l > crdt.MAX_RUN {
-			return
-		}
-		if a == e.self || fs.history_owns(h.hist, crdt.Op_Id{a, seq}) {
-			append(&own, crdt.Op_Span{crdt.Op_Id{a, seq}, int(l)})
-		}
-	}
-	if len(own) == 0 || !h.w_open {
-		_index_purge_object(e, h)
-		_index_item_add(e, h.sp.id, h.id, h.kind)
-		return
-	}
-	ctx := Text_Plan{e = e, h = h}
-	res, err := fs.history_redact(h.hist, own[:], context.temp_allocator, _text_plan(&ctx))
-	for r in res.ranges {
-		_own_redacted(e, h, r.from, r.to)
-	}
-	if err != .None {
-		if !_store_err(e, _ferr(err)) {
-			_log(e, .Warn, "own history redaction failed")
-		}
-		return
-	}
-	_handle_mark(h)
-	_index_purge_object(e, h)
-	_index_item_add(e, h.sp.id, h.id, h.kind)
 }
 
 Tree_Conflict :: struct {
@@ -1130,4 +1077,70 @@ _line_mount_id :: proc(line: string) -> (id: prim.Id) {
 	blake2b.update(&ctx, transmute([]u8)line)
 	blake2b.final(&ctx, id[:])
 	return
+}
+
+@(private)
+Replacement :: enum u8 {
+	Found,
+	Absent,
+	Missing,
+}
+
+@(private)
+_hist_replacement :: proc(h: ^Handle, s: ^Seg, off: i64) -> (synth: []u8, st: Replacement) {
+	end := journal.reader_end(&s.jr)
+	_, pos, ferr := journal.record_at(&s.jr, off)
+	if ferr != .Redacted {
+		return nil, .Absent
+	}
+	for pos < end {
+		body, next, rerr := journal.record_at(&s.jr, pos)
+		if rerr == .Missing {
+			if h.sp.repl_on {
+				r := [1]journal.Range{{pos, end}}
+				osync.replicator_want(&h.sp.repl, &h.scope, s.device, h.name, 0, r[:])
+			}
+			return nil, .Missing
+		}
+		if rerr != .None && rerr != .Redacted {
+			return nil, .Absent
+		}
+		pos = next
+		if rerr == .Redacted || journal.is_sig(body) || len(body) < 3 || body[0] != fs.REC_REPLACE {
+			continue
+		}
+		rp, ok := fs.replace_decode(body)
+		if !ok || !fs.replace_supersedes(rp, u64(off)) {
+			continue
+		}
+		kind := fs.REC_BATCH if rp.kind == fs.REC_REPLACE else rp.kind
+		if kind != fs.REC_BATCH && kind != fs.REC_IMPORT {
+			return nil, .Absent
+		}
+		out := make([]u8, 1 + len(rp.payload), context.temp_allocator)
+		out[0] = kind
+		copy(out[1:], rp.payload)
+		return out, .Found
+	}
+	if h.sp.repl_on && osync.replicator_relay_length(&h.sp.repl, &h.scope, s.device, h.name, 0) > end {
+		r := [1]journal.Range{{end, osync.replicator_relay_length(&h.sp.repl, &h.scope, s.device, h.name, 0)}}
+		osync.replicator_want(&h.sp.repl, &h.scope, s.device, h.name, 0, r[:])
+	}
+	return nil, .Missing
+}
+
+@(private)
+_hist_admit_redacted :: proc(e: ^Engine, h: ^Handle, s: ^Seg, off: i64) -> fs.Error {
+	synth, st := _hist_replacement(h, s, off)
+	switch st {
+	case .Missing:
+		return .Not_Found
+	case .Absent:
+		return .None
+	case .Found:
+	}
+	if _, err := fs.history_admit(h.hist, s.device, off, synth); err == .Not_Found {
+		return .Not_Found
+	}
+	return .None
 }
