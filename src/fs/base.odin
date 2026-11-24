@@ -629,8 +629,6 @@ rebase_changes :: proc(p: ^Pass) -> Error {
 			c.step = a.step
 			c.base = a.base
 			logged.needed = a.step == {} && (c.scope != nil || c.scope_id != {})
-		} else if c.scope != nil {
-			logged.needed = true
 		}
 		if logged.needed {
 			logged.actor = actor

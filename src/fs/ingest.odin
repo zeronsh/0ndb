@@ -1559,7 +1559,6 @@ step_mark :: proc(b: ^Builder, step: prim.Id) {
 @(private)
 Replayed :: struct {
 	inodes: map[fstree.Inode_Id]bool,
-	paths:  [dynamic]string,
 	heads:  [dynamic]crdt.Op_Id,
 }
 
@@ -1602,10 +1601,7 @@ replay_departing :: proc(m: ^Mount, long: runtime.Allocator, out: ^Replayed) -> 
 				break
 			}
 			cur = st.oid
-			if e.inode not_in out.inodes {
-				out.inodes[e.inode] = true
-				append(&out.paths, path)
-			}
+			out.inodes[e.inode] = true
 		}
 		if e.inode in out.inodes {
 			if named, found2 := shadow_get(&m.shadow, path) or_return; found2 && named.ver != 0 {
@@ -1969,7 +1965,6 @@ mount_pass :: proc(m: ^Mount, full: bool, settle := false) -> (err: Error) {
 			if follow {
 				replayed := Replayed {
 					inodes = make(map[fstree.Inode_Id]bool, p.long),
-					paths  = make([dynamic]string, p.long),
 					heads  = make([dynamic]crdt.Op_Id, p.long),
 				}
 				replay_departing(m, p.long, &replayed) or_return
@@ -2219,9 +2214,7 @@ line_follow :: proc(m: ^Mount, key: string, replayed: ^Replayed) -> Error {
 		history_set_line(h, key, ids) or_return
 		clear(&m.synced)
 		append(&m.synced, ..ids)
-		for path in replayed.paths {
-			mount_reshow_add(m, path)
-		}
+
 	} else {
 		target := v
 		if row, ok := shown_version(m, key, v); ok {
