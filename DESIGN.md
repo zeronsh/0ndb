@@ -1498,8 +1498,10 @@ concurrent typing is never lost or reverted.
   history that has no awake mount and no open buffer. One that is still
   waiting for its own durability answers Busy; the batch that completes with
   none outstanding tries those again, with no timer, because that batch is
-  the last event there will be. A read that wakes a sleeping history arms the
-  settle, as opening a handle does. After quiesce no mount is awake except
+  the last event there will be. A read or an own-length query that wakes a
+  sleeping history arms the settle, as opening a handle does; redaction
+  recovery wakes one only inside a settle, which sleeps it at its end, or at
+  engine open, where the opened handle arms it. After quiesce no mount is awake except
   for dirty paths, an owed rescan, durability waits or queued reverts, and no
   history is awake without an awake mount or an open buffer; the sim checks
   it with the idle check.
