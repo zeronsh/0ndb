@@ -343,6 +343,12 @@ _on_unserved :: proc(r: ^Replicator, ev: ^Event) {
 		_repl_flush(r)
 		return
 	}
+	if l, has := r.locals[Stream_Id(ev.id)]; has && l.peer && ev.tag == l.peer_tag && ev.device == l.peer_from {
+		l.peer_tag = 0
+		_local_peer_next(r, l)
+		_repl_flush(r)
+		return
+	}
 	rm, ok := r.remotes[Stream_Id(ev.id)]
 	if !ok {
 		return
@@ -440,6 +446,11 @@ _read_range :: proc(r: ^Replicator, rm: ^Remote, from, to: i64) {
 @(private)
 _on_served :: proc(r: ^Replicator, ev: ^Event) {
 	if _pipe_on_served(r, ev) {
+		return
+	}
+	if l, has := r.locals[Stream_Id(ev.id)]; has && l.peer {
+		_local_peer_served(r, l, ev)
+		_repl_flush(r)
 		return
 	}
 	rm, ok := r.remotes[Stream_Id(ev.id)]

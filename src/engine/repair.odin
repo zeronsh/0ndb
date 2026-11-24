@@ -21,6 +21,10 @@ Check :: struct {
 	tree:     ^Own_Tree,
 	done:     bool,
 	restored: bool,
+	peer:     bool,
+	at:       i64,
+	to:       i64,
+	kind:     Kind,
 }
 
 @(private)
@@ -111,6 +115,29 @@ _first_damage :: proc(e: ^Engine, object: prim.Id, kind: Kind, durable: i64) -> 
 }
 
 @(private)
+_damage_end :: proc(e: ^Engine, object: prim.Id, kind: Kind, at: i64, durable: i64) -> i64 {
+	limit := min(durable, at + 256 << 10)
+	path, perr := _own_stream_path(e, object, kind)
+	if perr != .None {
+		return limit
+	}
+	fd, oerr := prim.open_file(e.vfs, path)
+	if oerr != .None {
+		return limit
+	}
+	defer prim.close_file(e.vfs, fd)
+	head: [journal.HEADER]u8
+	if n, rerr := prim.read_at(e.vfs, fd, head[:], at); rerr != .None || n != len(head) {
+		return limit
+	}
+	size := i64(prim.get_u32le(head[:])) + journal.OVERHEAD
+	if size <= journal.OVERHEAD || size > durable - at || size > 256 << 10 {
+		return limit
+	}
+	return at + size
+}
+
+@(private)
 _damage_step :: proc(e: ^Engine) {
 	if len(e.damaged) == 0 {
 		return
@@ -121,11 +148,6 @@ _damage_step :: proc(e: ^Engine) {
 	for d in list {
 		sp, ok := e.spaces[d.space]
 		if !ok || !sp.open || !sp.repl_on || sp.keyless {
-			continue
-		}
-		if _storage_class(e, sp, d.object, d.kind) == .Device {
-			_log(e, .Error, "own stream damaged on disk with no relay copy to restore it from")
-			e.checks[d.stream] = Check{object = d.object, space = d.space, done = true}
 			continue
 		}
 		path, perr := _own_stream_path(e, d.object, d.kind)
@@ -142,16 +164,28 @@ _damage_step :: proc(e: ^Engine) {
 			e.checks[d.stream] = Check{object = d.object, space = d.space, done = true}
 			continue
 		}
-		_log(e, .Warn, "own stream damaged on disk; checking it against the relay copy")
 		sc := _object_scope(sp, d.object)
-		c := Check{object = d.object, space = d.space}
+		c := Check{object = d.object, space = d.space, kind = d.kind, at = at, to = _damage_end(e, d.object, d.kind, at, durable)}
+		if _storage_class(e, sp, d.object, d.kind) == .Device {
+			c.peer = true
+			_log(e, .Warn, "own stream damaged on disk; asking the devices that hold it")
+		} else {
+			_log(e, .Warn, "own stream damaged on disk; checking it against the relay copy")
+		}
 		if sp.mode != .Transparent {
 			if t, terr := _own_tree_get(e, sp, d.object, d.kind, &sc, false); terr == .None {
 				c.tree = t
 			}
 		}
 		e.checks[d.stream] = c
-		if err := osync.replicator_recheck(&sp.repl, &sc, _seg_name(d.kind, d.object), 0, path, at, &c.tree.tree if c.tree != nil else nil); err != .None {
+		tree := &c.tree.tree if c.tree != nil else nil
+		err: osync.Error
+		if c.peer {
+			err = osync.replicator_recheck_peers(&sp.repl, &sc, _seg_name(d.kind, d.object), 0, path, c.at, c.to, tree)
+		} else {
+			err = osync.replicator_recheck(&sp.repl, &sc, _seg_name(d.kind, d.object), 0, path, at, tree)
+		}
+		if err != .None {
 			_log(e, .Warn, "own stream recheck failed")
 			_check_release(e, d.stream)
 		}
@@ -164,6 +198,18 @@ _check_release :: proc(e: ^Engine, stream: osync.Stream_Id) {
 	c, ok := &e.checks[stream]
 	if !ok || c.done {
 		return
+	}
+	if !c.restored && !c.peer {
+		if sp, sok := e.spaces[c.space]; sok && sp.open && sp.repl_on {
+			c.peer = true
+			path, perr := _own_stream_path(e, c.object, c.kind)
+			sc := _object_scope(sp, c.object)
+			defer osync.scope_clear(&sc)
+			if perr == .None && osync.replicator_recheck_peers(&sp.repl, &sc, _seg_name(c.kind, c.object), 0, path, c.at, c.to, &c.tree.tree if c.tree != nil else nil) == .None {
+				_log(e, .Warn, "own stream not restored from the relay copy; asking the devices that hold it")
+				return
+			}
+		}
 	}
 	if c.tree != nil {
 		_own_tree_unref(e, c.tree)

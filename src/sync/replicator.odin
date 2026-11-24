@@ -167,6 +167,12 @@ Local :: struct {
 	verify:    [dynamic]u8,
 	hollow:    bool,
 	noting:    bool,
+	peer:      bool,
+	peer_tag:  u64,
+	peer_from: Device_Id,
+	peer_at:   i64,
+	peer_to:   i64,
+	peer_tried: [dynamic]Device_Id,
 }
 
 Remote :: struct {
@@ -967,6 +973,7 @@ _local_free :: proc(r: ^Replicator, l: ^Local) {
 		delete(l.drop_path, r.allocator)
 	}
 	delete(l.verify)
+	delete(l.peer_tried)
 	delete(l.name, r.allocator)
 	delete(l.path, r.allocator)
 	free(l, r.allocator)
@@ -1008,6 +1015,10 @@ _local_pump :: proc(r: ^Replicator, l: ^Local) {
 			_local_fatal(r, l, err, -1)
 			return
 		}
+	}
+	if l.peer && l.peer_tag == 0 && r.phase == .Ready && !l.fatal && !l.repairing && !_tree_missing(l) {
+		_local_peer_next(r, l)
+		return
 	}
 	if l.recheck >= 0 && r.phase == .Ready && !l.fatal && !l.repairing && l.inflight == 0 && !l.verifying && l.ahead == 0 && !_tree_missing(l) {
 		_local_recheck_start(r, l)
@@ -1317,6 +1328,28 @@ replicator_recheck :: proc(r: ^Replicator, scope: ^Scope, name: string, epoch: u
 	return .None
 }
 
+replicator_recheck_peers :: proc(r: ^Replicator, scope: ^Scope, name: string, epoch: u64, path: string, at, to: i64, tree: ^Key_Tree = nil) -> Error {
+	_enter(r)
+	defer _leave(r)
+	id := stream_id(scope, r.cfg.self, name, epoch)
+	l, ok := r.locals[id]
+	if !ok {
+		l = _local_open(r, scope, name, epoch, id, path) or_return
+	}
+	if tree != nil {
+		l.tree = tree
+	}
+	l.peer = true
+	l.peer_tag = 0
+	l.peer_from = {}
+	l.peer_at = at
+	l.peer_to = to
+	clear(&l.peer_tried)
+	_local_pump(r, l)
+	_repl_flush(r)
+	return .None
+}
+
 replicator_restored :: proc(r: ^Replicator, id: Stream_Id, err: Error) {
 	_enter(r)
 	defer _leave(r)
@@ -1376,6 +1409,81 @@ _local_recheck_done :: proc(r: ^Replicator, l: ^Local) {
 @(private)
 _local_checked :: proc(r: ^Replicator, l: ^Local) {
 	_emit(r, Repl_Event{kind = .Local_Checked, device = r.cfg.self, name = l.name, epoch = l.epoch, stream = l.id})
+}
+
+@(private)
+_local_peer_next :: proc(r: ^Replicator, l: ^Local) {
+	g, gok := r.groups[stream_id_suffix(l.id)]
+	if !gok {
+		_local_peer_lost(r, l)
+		return
+	}
+	for m in g.members {
+		if m == r.cfg.self {
+			continue
+		}
+		tried := false
+		for x in l.peer_tried {
+			tried ||= x == m
+		}
+		p, up := r.presence[m]
+		if tried || !up || !p.up {
+			continue
+		}
+		append(&l.peer_tried, m)
+		r.pull_tag += 1
+		l.peer_tag = r.pull_tag
+		l.peer_from = m
+		clear(&l.verify)
+		if client_pull(&r.client, m, l.peer_tag, l.id, l.peer_at, l.peer_to) == .None {
+			r.read_reqs += 1
+			return
+		}
+	}
+	l.peer_tag = 0
+	_local_peer_lost(r, l)
+}
+
+@(private)
+_local_peer_lost :: proc(r: ^Replicator, l: ^Local) {
+	l.peer = false
+	l.peer_tag = 0
+	clear(&l.verify)
+	_local_checked(r, l)
+	_local_maybe_free(r, l)
+}
+
+@(private)
+_local_peer_served :: proc(r: ^Replicator, l: ^Local, ev: ^Event) {
+	if ev.tag != l.peer_tag || ev.device != l.peer_from {
+		return
+	}
+	n := i64(len(l.verify))
+	if len(ev.data) > 0 {
+		if ev.at != l.peer_at + n || i64(len(ev.data)) + n > l.peer_to - l.peer_at {
+			clear(&l.verify)
+			l.peer_tag = 0
+			_local_peer_next(r, l)
+			return
+		}
+		append(&l.verify, ..ev.data)
+	}
+	if !ev.last || !ev.final {
+		return
+	}
+	l.peer_tag = 0
+	k := journal.record_bounds(l.verify[:])
+	if k == 0 || i64(len(l.verify)) != l.peer_to - l.peer_at || !_open_own(l, l.verify[:k], l.peer_at) {
+		_local_peer_next(r, l)
+		return
+	}
+	theirs := slice.clone(l.verify[:k], context.temp_allocator)
+	l.peer = false
+	clear(&l.verify)
+	if !_local_repair(r, l, theirs, l.peer_at) {
+		_local_checked(r, l)
+		_local_pump(r, l)
+	}
 }
 
 @(private)
