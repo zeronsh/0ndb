@@ -389,7 +389,7 @@ _mounts_wake_now :: proc(e: ^Engine, object: prim.Id) {
 	}
 	for mt in e.plug.mounts {
 		if mt.object.id == object {
-			fs.mount_schedule(&mt.mount, 0)
+			fs.mount_materialize_soon(&mt.mount)
 		}
 	}
 }
