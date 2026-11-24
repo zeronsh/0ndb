@@ -1205,7 +1205,7 @@ history_reload :: proc(h: ^History) {
 	history_wake(h)
 }
 
-history_marked :: proc(h: ^History, from: i64, mark: []u8, out: ^[dynamic]Intent) -> Error {
+history_marked :: proc(h: ^History, from: i64, mark: []u8, out: ^[dynamic]Intent, steps: ^map[prim.Id]bool = nil, redacted: ^bool = nil) -> Error {
 	end := journal.journal_durable_len(&h.journal)
 	if from >= end {
 		return .None
@@ -1218,6 +1218,9 @@ history_marked :: proc(h: ^History, from: i64, mark: []u8, out: ^[dynamic]Intent
 		body, next, jerr := journal.record_at(&r, off)
 		if jerr == .Redacted && next > off {
 			off = next
+			if redacted != nil {
+				redacted^ = true
+			}
 			continue
 		}
 		if jerr != .None {
@@ -1231,10 +1234,19 @@ history_marked :: proc(h: ^History, from: i64, mark: []u8, out: ^[dynamic]Intent
 		if derr != .None {
 			return .Corrupt
 		}
+		marked := false
 		for op in b.ops {
-			if op.kind == .Opaque && string(op.content) == string(mark) {
+			if op.kind != .Opaque || len(op.content) == 0 {
+				continue
+			}
+			if !marked && string(op.content) == string(mark) {
 				append(out, Intent{b.actor, b.seq, u64(crdt.batch_len(&b))})
-				break
+				marked = true
+			}
+			if steps != nil {
+				if step, sok := fshist.decode_step(op.content); sok {
+					steps[step] = true
+				}
 			}
 		}
 	}
@@ -2187,10 +2199,6 @@ apply_opaque :: proc(h: ^History, b: ^crdt.Batch, at: u64, lv: crdt.Lv, op: crdt
 	}
 	if len(op.content) > 0 && op.content[0] == fshist.TOP_SCOPE {
 		return scope_index(h, b, op.content)
-	}
-	if len(op.content) > 0 && op.content[0] == fshist.TOP_STEP {
-		step, sok := fshist.decode_step(op.content)
-		return kv_put(&h.kv, step_key(step), []u8{1}) if sok && stream == 0 else .None
 	}
 	decoded, ok := fshist.decode_opaque(op.content, h, proc(data: rawptr, id: crdt.Op_Id) -> fstree.Inode_Id {
 		return op_inode((^History)(data), id)
@@ -3507,24 +3515,6 @@ scope_index :: proc(h: ^History, b: ^crdt.Batch, content: []u8) -> Error {
 	nb: [8]u8
 	prim.put_u64le(nb[:], n + 1)
 	return kv_put(&h.kv, scope_count_key(b.actor), nb[:])
-}
-
-@(private)
-step_key :: proc(step: prim.Id) -> []u8 {
-	k := make([]u8, 4 + 16, context.temp_allocator)
-	copy(k, "stp:")
-	s := step
-	copy(k[4:], s[:])
-	return k
-}
-
-history_step_landed :: proc(h: ^History, step: prim.Id) -> (landed: bool, err: Error) {
-	if step == {} {
-		return false, .None
-	}
-	history_ready(h) or_return
-	_, found := kv_get(&h.kv, step_key(step), context.temp_allocator) or_return
-	return found, .None
 }
 
 history_scope_of :: proc(h: ^History, op: crdt.Op_Id) -> (scope: prim.Id, found: bool, err: Error) {
