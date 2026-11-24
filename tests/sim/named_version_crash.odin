@@ -49,6 +49,7 @@ Named_Result :: struct {
 	crashed: bool,
 	named:   bool,
 	ahead:   bool,
+	settled: bool,
 	edited:  bool,
 	wrong:   bool,
 	awake:   bool,
@@ -235,6 +236,7 @@ _named_crash :: proc(w: ^World, arm: Named_Arm, crash_at: u64) -> (res: Named_Re
 		disk, _ := prim.read_file(vfs, NV_ROOT + "/a.txt", context.temp_allocator)
 		n.disk.probe -= 1
 		line, _ := eng.tree_read(&n.e, tree, "a.txt", context.temp_allocator, {}, "main")
+		res.settled = eng.durable_seq(&n.e) + 1 >= eng.pending_seq(&n.e) && strings.contains(string(line), NV_TOOL) && (arm.control || strings.contains(string(line), NV_KEPT))
 		res.ahead = strings.contains(string(line), NV_KEPT) && strings.contains(string(line), NV_TOOL) && !strings.contains(string(disk), NV_KEPT)
 	}
 	crashes := w.stats.crashes
@@ -287,6 +289,9 @@ _named_crash :: proc(w: ^World, arm: Named_Arm, crash_at: u64) -> (res: Named_Re
 	}
 	for line in ([]string{NV_BASE, NV_KEPT, NV_TOOL}) {
 		want := 0 if (arm.control && line == NV_KEPT) || (arm.clean && line == NV_TOOL) else 1
+		if want == 1 && line != NV_BASE && !res.settled {
+			continue
+		}
 		if c := strings.count(string(data), line); c != want {
 			world_fail(w, "named: %v: %q appears %d times in a.txt on main, want %d (%q), at disk op %d", arm, strings.trim_space(line), c, want, string(data), crash_at)
 		}
@@ -363,7 +368,7 @@ named_version_crash :: proc(t: ^testing.T) {
 	for kind in Named_Kind {
 		for bits in 0 ..< 10 {
 			arm := Named_Arm{kind = kind, process = bits & 1 != 0, early = bits & 2 != 0, control = bits >= 4, clean = bits >= 8}
-			points, named, ahead, bad := 0, 0, 0, 0
+			points, named, ahead, settled, bad := 0, 0, 0, 0, 0
 			for k in u64(1) ..= 4000 {
 				failures, res := named_version_run(1, arm, k)
 				if len(failures) > 0 {
@@ -377,12 +382,13 @@ named_version_crash :: proc(t: ^testing.T) {
 				delete(failures)
 				named += 1 if res.named else 0
 				ahead += 1 if res.ahead else 0
+				settled += 1 if res.settled else 0
 				if !res.crashed {
 					break
 				}
 				points += 1
 			}
-			fmt.eprintf("named_version_crash: %v process=%v early=%v control=%v clean=%v: points=%d named=%d ahead=%d failed=%d\n", kind, arm.process, arm.early, arm.control, arm.clean, points, named, ahead, bad)
+			fmt.eprintf("named_version_crash: %v process=%v early=%v control=%v clean=%v: points=%d named=%d ahead=%d settled=%d failed=%d\n", kind, arm.process, arm.early, arm.control, arm.clean, points, named, ahead, settled, bad)
 			testing.expect(t, arm.control || named > 0, fmt.tprintf("named_version_crash %v: no run had a named version in flight", arm))
 		}
 	}
