@@ -6,6 +6,7 @@ import "core:strconv"
 import "core:strings"
 import "core:time"
 import "../capi/api"
+import "../fs"
 import "../prim"
 import osync "../sync"
 
@@ -506,7 +507,7 @@ cmd_mount :: proc(a: ^Args) -> int {
 	root := abs_path(a.pos[0])
 	has_tree := flag_bool(a, "tree")
 	for r in jarr(must(s, `{"op":"tree.mounts"}`), "refused") {
-		if jstr(r, "root") == root && !has_tree {
+		if !has_tree && fs.path_same(jstr(r, "root"), root) {
 			return report_error(.Newer, "cannot mount %s", root)
 		}
 	}
