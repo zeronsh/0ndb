@@ -194,7 +194,7 @@ _byzantine :: proc(c: ^Conn, bytes: []u8) {
 		pos += 5 + n
 		active := w.phase == .Workload && kind != 0x81
 		r := &w.net_rng
-		if active && (kind == 0x83 || kind == 0x84) && n == 40 && rng_chance(r, 1, 8) {
+		if active && (kind == 0x83 || kind == 0x84) && n == 40 && rng_chance(r, 1, 8) && env_u64("BW", 0) != 6 && env_u64("BW", 0) != 5 {
 			w.stats.tampered += 1
 			t := make([]u8, len(frame), context.temp_allocator)
 			copy(t, frame)
@@ -207,9 +207,17 @@ _byzantine :: proc(c: ^Conn, bytes: []u8) {
 		}
 		if active && rng_chance(r, 1, 25) {
 			act := rng_int(r, 4)
+			if m := env_u64("BW", 0); m == 5 || (m == 10 + u64(act)) {
+				append(&out, ..frame)
+				continue
+			}
 			w.stats.tampered += 1
 			switch act {
 			case 0:
+				if m := env_u64("BW", 0); m == 1 || (env_u64("BWK", 0) != 0 && u64(kind) == env_u64("BWK", 0)) || (m == 2 && kind == 0x8f) || (m == 3 && kind != 0x8f) {
+					append(&out, ..frame)
+					continue
+				}
 				world_note(w, "byzantine relay withholds a %x frame (%d bytes) from %s", kind, n, c.node.name)
 				continue
 			case 1:

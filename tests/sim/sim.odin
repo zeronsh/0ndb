@@ -9,6 +9,7 @@ import "core:sync"
 import "core:testing"
 import "core:time"
 import eng "../../src/engine"
+import omap "../../src/map"
 import "../../src/prim"
 import osync "../../src/sync"
 
@@ -428,6 +429,14 @@ finish :: proc(w: ^World) {
 		n.disk.failing = false
 	}
 	byzantine_flush(w)
+	if env_u64("BW", 0) == 4 {
+		for n in w.nodes {
+			fmt.eprintf("BWRESET %s conns %d connects %d\n", n.name, len(n.conns), n.connects)
+			for c in n.conns {
+				conn_reset(c, true)
+			}
+		}
+	}
 	if !w.relay.alive {
 		relay_start(&w.relay)
 	}
@@ -453,6 +462,64 @@ finish :: proc(w: ^World) {
 	run_until(w, w.now + 120_000_000_000, true)
 	if len(w.failures) > 0 {
 		return
+	}
+	bw := env_u64("BW", 0)
+	if bw != 0 {
+		defer for n in w.nodes {
+			for id, sp in n.e.spaces {
+				fmt.eprintf("BWMEM %s space %s settling %v have_naming %v mode %v current %d caught %v member %v removed %v revoked %v keyless %v repl_on %v open %v\n", n.name, id_short(id), eng.space_settling_dbg(&n.e, sp), sp.mem.have_naming, sp.mode, sp.mem.current, sp.mem.caught, sp.mem.member, sp.mem.removed, sp.mem.revoked, sp.keyless, sp.repl_on, sp.open)
+				h, ok := n.e.handles[sp.catalog]
+				if !ok {
+					fmt.eprintf("BWCAT %s space %s no catalog handle\n", n.name, id_short(id))
+					continue
+				}
+				fmt.eprintf("BWCAT %s space %s own %v w_open %v damaged %v segs %d waiting_space %v\n", n.name, id_short(id), h.own, h.w_open, h.damaged, len(h.segs), eng.space_settling_dbg(&n.e, sp))
+				for s in h.segs {
+					ln := osync.replicator_relay_length(&sp.repl, &h.scope, s.device, h.name, 0)
+					fmt.eprintf("BWCAT    seg %s in_view %v waiting %v probing %v probed %v tree %v loaded %v relay_len %d\n", id_short(s.device), s.in_view, s.waiting, s.probing, s.probed, s.tree != nil, s.tree != nil && s.tree.loaded, ln)
+				}
+			}
+		}
+	}
+	if bw >= 20 && bw <= 23 {
+		if bw == 20 || bw == 23 {
+			for n in w.nodes {
+				for c in n.conns {
+					if c.state == .Up {
+						fmt.eprintf("BWEV reset %s\n", n.name)
+						conn_reset(c, true)
+					}
+				}
+			}
+			run_until(w, w.now + 60_000_000_000, true)
+		}
+		if bw == 21 || bw == 23 {
+			for ob, oi in w.model.objs {
+				if ob.kind != .Map {
+					continue
+				}
+				n := w.nodes[ob.creator]
+				context = instance_context(&n.inst)
+				_, err := eng.map_set(&n.e, ob.o, transmute([]u8)string("bwkey"), []omap.Field{omap.field_str(1, "x")})
+				fmt.eprintf("BWEV map_set %s obj %s %v\n", n.name, id_short(ob.o.id), err)
+				node_after(n)
+			}
+			run_until(w, w.now + 60_000_000_000, true)
+		}
+		if bw == 22 || bw == 23 {
+			for ob in w.model.objs {
+				if ob.kind != .Map {
+					continue
+				}
+				for n in w.nodes {
+					context = instance_context(&n.inst)
+					_, found, err := eng.map_get(&n.e, ob.o, transmute([]u8)string("bwkey"), context.temp_allocator, eng.Ready{call = proc(data: rawptr, e: ^eng.Engine, err: eng.Error) {}, fresh = true})
+					fmt.eprintf("BWEV fresh read %s obj %s %v found %v\n", n.name, id_short(ob.o.id), err, found)
+					node_after(n)
+				}
+			}
+			run_until(w, w.now + 60_000_000_000, true)
+		}
 	}
 	before: []string
 	if w.cfg.verbose {

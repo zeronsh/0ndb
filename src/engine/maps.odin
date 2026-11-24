@@ -1002,3 +1002,7 @@ _catalog_members :: proc(e: ^Engine, h: ^Handle) {
 		}
 	}
 }
+
+space_settling_dbg :: proc(e: ^Engine, sp: ^Space) -> bool {
+	return _space_settling(e, sp)
+}
