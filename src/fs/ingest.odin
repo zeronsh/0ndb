@@ -1719,13 +1719,108 @@ line_follow :: proc(m: ^Mount, key: string) -> Error {
 	h := m.history
 	v, found := history_line(h, key, context.temp_allocator) or_return
 	if !found || len(v) == 0 {
-		history_set_line(h, key, m.synced[:]) or_return
+		fork := fork_version(m) or_return
+		history_set_line(h, key, fork) or_return
 	} else {
 		line_retarget(m, v) or_return
 	}
 	delete(m.line, m.allocator)
 	m.line, _ = clone_string(key, m.allocator)
 	return mount_line_actor(m)
+}
+
+@(private)
+Named_Entry :: struct {
+	inode: fstree.Inode_Id,
+	lvs:   []crdt.Lv,
+}
+
+@(private)
+named_entries :: proc(m: ^Mount, dir: string, out: ^[dynamic]Named_Entry) -> Error {
+	h := m.history
+	kids := make([dynamic]Shadow_Child, context.temp_allocator)
+	shadow_children(&m.shadow, dir, &kids, context.temp_allocator) or_return
+	for k in kids {
+		p, _ := path_join(dir, k.name, context.temp_allocator)
+		if k.entry.kind == .Dir {
+			named_entries(m, p, out) or_return
+			continue
+		}
+		if k.entry.ver == 0 {
+			continue
+		}
+		ids, ok := shadow_version(&m.shadow, k.entry)
+		if !ok || len(ids) == 0 {
+			continue
+		}
+		own := make([]crdt.Op_Id, len(ids), context.temp_allocator)
+		for id, i in ids {
+			own[i] = inode_op(h, id)
+		}
+		lvs := make([dynamic]crdt.Lv, context.temp_allocator)
+		if crdt.graph_version_lvs(&h.g, own, &lvs) != .None {
+			return .Corrupt
+		}
+		append(out, Named_Entry{k.entry.inode, lvs[:]})
+	}
+	return .None
+}
+
+@(private)
+fork_version :: proc(m: ^Mount) -> (v: Version, err: Error) {
+	h := m.history
+	sl := make([dynamic]crdt.Lv, context.temp_allocator)
+	if crdt.graph_version_lvs(&h.g, m.synced[:], &sl) != .None {
+		return nil, .Corrupt
+	}
+	named := make([dynamic]Named_Entry, context.temp_allocator)
+	named_entries(m, "", &named) or_return
+	acc := make([dynamic]crdt.Lv, context.temp_allocator)
+	append(&acc, ..sl[:])
+	for x in named {
+		only_a := make([dynamic]crdt.Lv_Span, context.temp_allocator)
+		only_b := make([dynamic]crdt.Lv_Span, context.temp_allocator)
+		crdt.graph_diff(&h.g, sl[:], x.lvs, &only_a, &only_b)
+		if len(only_b) == 0 {
+			continue
+		}
+		touched := make(map[fstree.Inode_Id]bool, context.temp_allocator)
+		spans_touched(h, only_b[:], &touched) or_return
+		held := true
+		for ino in prim.sorted_keys(touched) {
+			covered := false
+			for y in named {
+				if y.inode != ino {
+					continue
+				}
+				all := true
+				for sp in only_b {
+					for lv in sp.lv ..< sp.lv + crdt.Lv(sp.len) {
+						if !crdt.graph_contains(&h.g, y.lvs, lv) {
+							all = false
+							break
+						}
+					}
+					if !all {
+						break
+					}
+				}
+				covered ||= all
+			}
+			if !covered {
+				held = false
+				break
+			}
+		}
+		if !held {
+			m.fork_rejected += 1
+			continue
+		}
+		next := make([dynamic]crdt.Lv, context.temp_allocator)
+		crdt.version_union(&h.g, acc[:], x.lvs, &next)
+		acc = next
+	}
+	return crdt.graph_version_ids(&h.g, acc[:], context.temp_allocator), .None
 }
 
 @(private)
