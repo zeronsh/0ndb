@@ -508,8 +508,13 @@ _agent_scope_close :: proc(w: ^World, n: ^Node, s: ^fs.Scope) -> fs.Error {
 	if w.cfg.persist_fault && rng_chance(&w.fault_rng, 1, 3) {
 		n.persist_fail = 1
 	}
+	armed := n.persist_fail
 	err := fs.scope_close(n.reg, s)
+	fired := n.persist_fail < armed
 	n.persist_fail = 0
+	if err == .Reloading && !fired && !outage_active(n) && !n.disk.dead && w.cfg.io_rate == 0 {
+		world_fail(w, "%s scope_close deferred with no persist fault", n.name)
+	}
 	return err
 }
 
@@ -561,7 +566,7 @@ agent_finish :: proc(w: ^World, n: ^Node) {
 	}
 	_writer_set(w, n, abs, Writer_Info{scope = pa.scope, agent = true})
 	oerr := fs.mount_observe_begin(sm.m, pa.name, pa.scope)
-	if oerr != .None && oerr != .Reloading && !n.disk.dead && w.cfg.io_rate == 0 {
+	if oerr != .None && !(oerr == .Reloading && outage_active(n)) && !n.disk.dead && w.cfg.io_rate == 0 {
 		world_fail(w, "%s mount_observe_begin failed: %v", n.name, oerr)
 	}
 	if oerr == .Reloading {
@@ -696,7 +701,7 @@ _rewrite_same_size :: proc(w: ^World, n: ^Node, sm: ^Sim_Mount, name: string, ag
 	}
 	_writer_set(w, n, abs, Writer_Info{scope = scope, agent = agent})
 	if agent {
-		if oerr := fs.mount_observe_begin(sm.m, name, scope); oerr != .None && oerr != .Reloading && !n.disk.dead && w.cfg.io_rate == 0 {
+		if oerr := fs.mount_observe_begin(sm.m, name, scope); oerr != .None && !(oerr == .Reloading && outage_active(n)) && !n.disk.dead && w.cfg.io_rate == 0 {
 			world_fail(w, "%s mount_observe_begin failed: %v", n.name, oerr)
 		}
 	}
@@ -809,7 +814,7 @@ _disk_edit_at :: proc(w: ^World, n: ^Node, sm: ^Sim_Mount, name: string, agent: 
 	if agent {
 		oerr = fs.mount_observe_begin(sm.m, name, scope)
 		if oerr != .None && !n.disk.dead {
-			if w.cfg.io_rate == 0 && oerr != .Reloading {
+			if w.cfg.io_rate == 0 && !(oerr == .Reloading && outage_active(n)) {
 				world_fail(w, "%s mount_observe_begin failed: %v", n.name, oerr)
 			}
 		} else if oerr == .None {
@@ -1272,7 +1277,7 @@ op_line_switch :: proc(w: ^World, n: ^Node) {
 		}
 		obj_add_line(&w.model, sm.oi, key)
 		stat_add(w, STAT_LINE_SWITCHES)
-	} else if !n.disk.dead && !(w.cfg.io_rate > 0 && (err == .Io || err == .No_Space)) && err != .Busy && !(err == .Reloading && n.persist_outage) {
+	} else if !n.disk.dead && !(w.cfg.io_rate > 0 && (err == .Io || err == .No_Space)) && err != .Busy && !(err == .Reloading && outage_active(n)) {
 		world_fail(w, "%s 0ndb switch to %s failed: %v", n.name, branch, err)
 	} else if !n.disk.dead && w.cfg.io_rate > 0 {
 		n.restart_pending = true
