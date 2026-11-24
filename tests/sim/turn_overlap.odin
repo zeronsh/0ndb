@@ -198,8 +198,17 @@ _tv_case :: proc(w: ^World, step: int) {
 		world_fail(w, "turn overlap: b.txt on main is %q (%v), step %d", string(data), berr, step)
 		return
 	}
-	after := slice.clone(_line_heads(sm.m), w.allocator)
-	if rerr := fs.mount_revert(sm.m, fs.Version(before), fs.Version(after), agent); rerr != .None {
+	_, aspans, aerr := eng.tree_blame(&n.e, tree, "a.txt", context.temp_allocator, "main")
+	if aerr != .None {
+		world_fail(w, "turn overlap: blame a.txt: %v, step %d", aerr, step)
+		return
+	}
+	for sp in aspans {
+		if sp.id.actor == agent {
+			world_fail(w, "turn overlap: %d bytes of a.txt are credited to the agent that opened later, step %d", sp.len, step)
+		}
+	}
+	if _, rerr := fs.mount_revert_set(sm.m, fs.Version(before), []prim.Id{agent}); rerr != .None {
 		world_fail(w, "turn overlap: undo of the agent's turn failed: %v, step %d", rerr, step)
 		return
 	}
