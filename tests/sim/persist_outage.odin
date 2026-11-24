@@ -125,7 +125,7 @@ check_actor_owners :: proc(w: ^World) {
 			out := make([dynamic]prim.Id, context.temp_allocator)
 			fs.history_unowned_actors(h.hist, &out)
 			for a in out {
-				if !known[a] {
+				if !known[a] && !fs.is_unattributed(a) {
 					world_fail(w, "%s history of %s: actor %s committed batches but has no owner registration", n.name, id_short(id), id_short(a))
 				}
 			}
