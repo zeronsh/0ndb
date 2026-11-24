@@ -208,6 +208,7 @@ _named_edit :: proc(w: ^World, arm: Named_Edit_Arm, crash_at: u64) -> (res: Name
 		res.behind = strings.contains(string(line), NV_KEPT) && strings.contains(string(line), NV_TOOL) && !strings.contains(disk, NV_KEPT)
 	}
 	crashes := w.stats.crashes
+	cut := false
 	if crash_at > 0 {
 		n.disk.force_process = arm.process
 		n.disk.crash_at = n.disk.stats.ops + crash_at
@@ -223,10 +224,28 @@ _named_edit :: proc(w: ^World, arm: Named_Edit_Arm, crash_at: u64) -> (res: Name
 				world_fail(w, "named edit: the person's edit")
 				return
 			}
+			cut = !arm.atomic
 		}
 		typed: {
 			context = instance_context(&n.inst)
 			node_after(n)
+		}
+	}
+	for limit := w.now + 20_000_000_000; cut && w.now < limit; {
+		t, ok := next_time(w)
+		if !ok {
+			break
+		}
+		run_until(w, t, false)
+		if w.stats.crashes > crashes && n.alive {
+			context = instance_context(&n.inst)
+			n.disk.probe += 1
+			have, herr := prim.read_file(vfs, NV_ROOT + "/a.txt", context.temp_allocator)
+			n.disk.probe -= 1
+			if herr == .None {
+				res.torn_save = !strings.has_prefix(string(have), disk)
+				break
+			}
 		}
 	}
 	if arm.again {
@@ -283,9 +302,7 @@ _named_edit :: proc(w: ^World, arm: Named_Edit_Arm, crash_at: u64) -> (res: Name
 	n.disk.probe += 1
 	shown, _ := prim.read_file(vfs, NV_ROOT + "/a.txt", context.temp_allocator)
 	n.disk.probe -= 1
-
-	if crash_at > 0 && !arm.atomic && len(shown) == 0 {
-		res.torn_save = true
+	if res.torn_save {
 		return
 	}
 	edited := crash_at == 0 || strings.contains(string(shown), NV_EDIT)
@@ -374,6 +391,7 @@ named_version_edit :: proc(t: ^testing.T) {
 			}
 			fmt.eprintf("named_version_edit: crash more=%v process=%v atomic=%v: points=%d typed_after=%d failed=%d torn_nonatomic_save=%d most event actors=%d\n", more, process, arm.atomic, points, typed, bad, torn, events)
 			testing.expect(t, bad == 0, fmt.tprintf("named_version_edit crash more=%v process=%v failed", more, process))
+			testing.expect(t, torn <= 1, "named_version_edit: more than one crash point tore the person's own save")
 			testing.expect(t, !more || arm.atomic || typed > 0, "named_version_edit: nobody typed after a crash")
 		}
 	}
