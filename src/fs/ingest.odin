@@ -1417,7 +1417,7 @@ attribute_changes :: proc(p: ^Pass) -> Error {
 		matched, broken, gone := false, false, false
 		replayed := false
 		cur := c.old.oid if c.kind == .Modify else odb.Oid{}
-		for st in steps_pending(steps[:], cur) {
+		for st in steps_pending(m, steps[:], cur, c.old.inode) or_return {
 			if st.oid == cur {
 				continue
 			}
@@ -1490,15 +1490,81 @@ attrib_chain_settle :: proc(p: ^Pass) {
 }
 
 @(private)
-steps_pending :: proc(steps: []Attrib_Step, shown: odb.Oid) -> []Attrib_Step {
-	if shown != {} {
-		#reverse for st, i in steps {
-			if st.oid == shown {
-				return steps[i + 1:]
-			}
+steps_pending :: proc(m: ^Mount, steps: []Attrib_Step, shown: odb.Oid, inode: fstree.Inode_Id) -> (pending: []Attrib_Step, err: Error) {
+	#reverse for st, i in steps {
+		if (shown != {} && st.oid == shown) || (step_landed(m, st, inode) or_return) {
+			return steps[i + 1:], .None
 		}
 	}
-	return steps
+	return steps, .None
+}
+
+@(private)
+STEP_WALK :: 4096
+
+@(private)
+step_landed :: proc(m: ^Mount, st: Attrib_Step, inode: fstree.Inode_Id) -> (landed: bool, err: Error) {
+	h := m.history
+	if st.scope == {} || st.oid == {} {
+		return false, .None
+	}
+	t, data, rerr := odb.read(m.db, st.oid, context.temp_allocator)
+	if rerr != .None || t != .Blob {
+		return false, .None
+	}
+	hash := _content_hash(data)
+	target := inode_op(h, inode)
+	actors := make([dynamic]prim.Id, context.temp_allocator)
+	append(&actors, st.actor)
+	owned := history_owned_actors(h, []prim.Id{st.actor}, context.temp_allocator) or_return
+	append(&actors, ..owned)
+	for actor in actors {
+		seq := crdt.graph_known(&h.g, actor)
+		for n := 0; seq > 0 && n < STEP_WALK; n += 1 {
+			lv, ok := crdt.graph_lv(&h.g, crdt.Op_Id{actor, seq - 1})
+			if !ok {
+				break
+			}
+			first, _, stream, off, bok := history_batch_at(h, lv)
+			if !bok {
+				break
+			}
+			b, berr := history_read_batch(h, stream, off, context.temp_allocator)
+			if berr == .None {
+				mine, touches, merged := st.scope == actor, false, false
+				for op in b.ops {
+					if op.kind != .Opaque {
+						touches ||= op.target == target
+						continue
+					}
+					if len(op.content) == 0 {
+						continue
+					}
+					if sc, sok := fshist.decode_scope(op.content); sok {
+						mine ||= sc == st.scope
+					}
+					if op.content[0] == fshist.TOP_OBSERVE {
+						if o, dok := fshist.decode_observe(op.content); dok && o.kind == .Step && o.inode == target && o.hash == hash {
+							merged = true
+						}
+					}
+				}
+				if mine && merged {
+					return true, .None
+				}
+				if mine && touches {
+					end := [1]crdt.Op_Id{{actor, b.seq + u64(crdt.batch_len(&b)) - 1}}
+					text, terr := history_text_at(h, inode, end[:], context.temp_allocator)
+					if terr == .None && string(text) == string(data) {
+						return true, .None
+					}
+				}
+			}
+			back := u64(lv - first) + 1
+			seq = seq - min(seq, back)
+		}
+	}
+	return false, .None
 }
 
 @(private)
@@ -1529,7 +1595,7 @@ replay_departing :: proc(m: ^Mount, long: runtime.Allocator, replayed: ^map[fstr
 		}
 		c := Change{kind = .Modify, path = path, disk = .File, old = e}
 		cur := e.oid
-		for st in steps_pending(steps, e.oid) {
+		for st in steps_pending(m, steps, e.oid, e.inode) or_return {
 			if st.oid == cur {
 				continue
 			}
@@ -1611,20 +1677,9 @@ step_base_resolve :: proc(p: ^Pass, c: ^Change, st: Attrib_Step, inode: fstree.I
 	switch st.base.kind {
 	case STEP_BASE_VERSION:
 		sb := st.base
-		ids := slice.clone(sb.ver[:sb.n], context.temp_allocator)
-		for id in ids {
-			if _, ok := crdt.graph_lv(&h.g, id); !ok {
-				return nil, .None
-			}
+		if ids := slice.clone(sb.ver[:sb.n], context.temp_allocator); version_reads(m, inode, ids, sb.oid) {
+			return ids, .None
 		}
-		t, terr := history_text_at(h, inode, ids, context.temp_allocator)
-		if terr != .None {
-			return nil, .None
-		}
-		if oid, _ := odb.hash(m.db.format, .Blob, t); oid != st.base.oid {
-			return nil, .None
-		}
-		return ids, .None
 	case STEP_BASE_CHAIN:
 		if c.old.ver == 0 || c.old.inode != inode || (st.base.oid != {} && st.base.oid != c.old.oid) {
 			return nil, .None
@@ -1637,16 +1692,39 @@ step_base_resolve :: proc(p: ^Pass, c: ^Change, st: Attrib_Step, inode: fstree.I
 		for id, i in ids {
 			out[i] = inode_op(h, id)
 		}
-		t, terr := history_text_at(h, inode, out, context.temp_allocator)
-		if terr != .None {
-			return nil, .None
+		if version_reads(m, inode, out, c.old.oid) {
+			return out, .None
 		}
-		if oid, _ := odb.hash(m.db.format, .Blob, t); oid != c.old.oid {
-			return nil, .None
+		return nil, .None
+	}
+	if st.base.kind == STEP_BASE_VERSION || st.base.kind == STEP_BASE_CONTENT {
+		if version_reads(m, inode, m.synced[:], st.base.oid) {
+			return slice.clone(m.synced[:], context.temp_allocator), .None
 		}
-		return out, .None
+		if head, found := history_line(h, m.line, context.temp_allocator) or_return; found && version_reads(m, inode, head, st.base.oid) {
+			return head, .None
+		}
 	}
 	return nil, .None
+}
+
+@(private)
+version_reads :: proc(m: ^Mount, inode: fstree.Inode_Id, v: []crdt.Op_Id, want: odb.Oid) -> bool {
+	h := m.history
+	if len(v) == 0 || want == {} {
+		return false
+	}
+	for id in v {
+		if _, ok := crdt.graph_lv(&h.g, id); !ok {
+			return false
+		}
+	}
+	t, terr := history_text_at(h, inode, v, context.temp_allocator)
+	if terr != .None {
+		return false
+	}
+	oid, _ := odb.hash(m.db.format, .Blob, t)
+	return oid == want
 }
 
 @(private)
@@ -1695,6 +1773,9 @@ replay_merge :: proc(p: ^Pass, c: ^Change, st: Attrib_Step, actor: prim.Id, inod
 				b.scope = scope_marker(actor, st.scope)
 			}
 			emit_text_edits(m, &b, inode, c.path, line_text, merged) or_return
+			buf := make([dynamic]u8, context.temp_allocator)
+			fshist.encode_observe(&buf, fshist.Observe_Op{kind = .Step, inode = inode_op(h, inode), path = c.path, version = head, hash = _content_hash(data)})
+			builder_opaque(&b, buf[:])
 			if b.scope != nil {
 				builder_opaque(&b, b.scope)
 				b.scope = nil
@@ -2127,8 +2208,12 @@ line_retarget :: proc(m: ^Mount, target: Version, replayed: map[fstree.Inode_Id]
 		tracked := make(map[string]Commit_Entry, context.temp_allocator)
 		has_git_tree := departed_entries(m, &tracked)
 		order := sorted_inodes(touched)
+		named := make(map[fstree.Inode_Id]Entry, context.temp_allocator)
 		for ino in order {
-			if old, _, had := shadow_by_inode(&m.shadow, ino, context.temp_allocator) or_return; had {
+			if old, e, had := shadow_by_inode(&m.shadow, ino, context.temp_allocator) or_return; had {
+				if entry_holds(m, old, e, tl[:]) {
+					named[ino] = e
+				}
 				shadow_remove(&m.shadow, old) or_return
 			}
 		}
@@ -2152,6 +2237,11 @@ line_retarget :: proc(m: ^Mount, target: Version, replayed: map[fstree.Inode_Id]
 				mount_absent_add(m, p)
 				continue
 			}
+			if e, kept := named[ino]; kept && disk_matches(m, p, e) {
+				shadow_put(&m.shadow, p, e) or_return
+				mount_reshow_add(m, p)
+				continue
+			}
 			shadow_put(&m.shadow, p, Entry{inode = ino, kind = info.kind}) or_return
 		}
 	}
@@ -2159,6 +2249,24 @@ line_retarget :: proc(m: ^Mount, target: Version, replayed: map[fstree.Inode_Id]
 	append(&m.synced, ..target)
 	m.rescan = true
 	return .None
+}
+
+@(private)
+entry_holds :: proc(m: ^Mount, path: string, e: Entry, tl: []crdt.Lv) -> bool {
+	if e.ver == 0 || e.kind != .File {
+		return false
+	}
+	ids, ok := shadow_version(&m.shadow, e)
+	if !ok || len(ids) == 0 {
+		return false
+	}
+	for id in ids {
+		lv, known := crdt.graph_lv(&m.history.g, inode_op(m.history, id))
+		if !known || !crdt.graph_contains(&m.history.g, tl, lv) {
+			return false
+		}
+	}
+	return disk_matches(m, path, e)
 }
 
 @(private)
