@@ -470,6 +470,15 @@ convo_moves_settle :: proc(e: ^Engine, o: Object) -> Error {
 	if w.phase != .Released {
 		return .None
 	}
+	if head, over := _cu_overridden(e, o, w) or_return; over {
+		if head.seg != e.self {
+			return .None
+		}
+		move := new_id(e)
+		from := _cu_target(e, o, w) or_return
+		_cu_undo_write(e, o, move, w.msg, .Staged, nil, w.id, {cause = .Rebase, from = from, to = head}) or_return
+		return _cu_drive_new(e, o, move)
+	}
 	if w.staged.seg != e.self {
 		target := w.to
 		if obj.rid_none(target) && (w.cause == .Undo || w.cause == .Edit) {
@@ -544,26 +553,122 @@ convo_moves_settle :: proc(e: ^Engine, o: Object) -> Error {
 }
 
 @(private)
-_cu_follow_move :: proc(e: ^Engine, o: Object, w: convo.Undo_State, target: Rid) -> Error {
-	newer :: proc(e: ^Engine, o: Object, at, target: Rid, stamp: prim.Hlc) -> (yes: bool, err: Error) {
-		if at == target || obj.rid_none(at) {
-			return false, .None
-		}
-		m := convo_message(e, o, {msg = at}, context.temp_allocator) or_return
-		if m.hlc <= stamp {
-			return false, .None
-		}
-		return _cu_descends(e, o, at, target)
+_cu_target :: proc(e: ^Engine, o: Object, w: convo.Undo_State) -> (target: Rid, err: Error) {
+	if obj.rid_none(w.to) && (w.cause == .Undo || w.cause == .Edit) {
+		return _cu_parent(e, o, w.msg)
 	}
+	return w.to, .None
+}
+
+@(private)
+_cu_continues :: proc(e: ^Engine, o: Object, at: Rid, w: convo.Undo_State) -> (yes: bool, err: Error) {
+	target := _cu_target(e, o, w) or_return
+	if obj.rid_none(target) {
+		if w.cause != .Undo && w.cause != .Edit {
+			return true, .None
+		}
+		old := _cu_descends(e, o, at, w.msg) or_return
+		return !old, .None
+	}
+	under := _cu_descends(e, o, at, target) or_return
+	if !under || (_cu_descends(e, o, target, w.msg) or_return) {
+		return under, .None
+	}
+	old := _cu_descends(e, o, at, w.msg) or_return
+	return !old, .None
+}
+
+@(private)
+_cu_overridden :: proc(e: ^Engine, o: Object, w: convo.Undo_State) -> (head: Rid, yes: bool, err: Error) {
+	st := convo_status(e, o) or_return
+	if obj.rid_none(st.head) || st.head_hlc <= w.stamp {
+		return st.head, false, .None
+	}
+	if _cu_continues(e, o, st.head, w) or_return {
+		return st.head, false, .None
+	}
+	for x := st.head; !obj.rid_none(x); {
+		m := convo_message(e, o, {msg = x}, context.temp_allocator) or_return
+		if m.role == .User {
+			return st.head, m.hlc > w.stamp, .None
+		}
+		x = m.parent
+	}
+	return st.head, false, .None
+}
+
+@(private)
+_cu_unseen :: proc(e: ^Engine, o: Object, w: convo.Undo_State, allocator := context.temp_allocator) -> (lines: []convo.Undo_Line, err: Error) {
+	h := _handle_get(e, o, .Conversation) or_return
+	_handle_refresh(h)
+	own, serr := convo.scope_actors(&h.view, context.temp_allocator, e.self)
+	if serr != .None {
+		return nil, _oerr(serr)
+	}
+	if len(own) == 0 {
+		return nil, .None
+	}
+	out := make([dynamic]convo.Undo_Line, allocator)
+	for l in w.set {
+		if len(l.park) == 0 {
+			continue
+		}
+		th := _handle_get(e, Object{o.space, l.tree}, .File_Tree) or_return
+		_hist_ready(e, th) or_return
+		park, derr := fs.decode_version(l.park, context.temp_allocator)
+		if derr != .None {
+			return nil, .Corrupt
+		}
+		cur := tree_version(e, Object{o.space, l.tree}, l.line, context.temp_allocator) or_return
+		unseen, joined, uerr := fs.history_unseen(th.hist, park, cur, own, allocator)
+		if uerr != .None {
+			return nil, _ferr(uerr)
+		}
+		if len(unseen) == 0 {
+			continue
+		}
+		vb := make([dynamic]u8, allocator)
+		fs.encode_version(&vb, joined)
+		append(&out, convo.Undo_Line{tree = l.tree, line = l.line, base = l.base, actors = unseen, park = vb[:]})
+	}
+	return out[:], .None
+}
+
+@(private)
+_cu_follow_move :: proc(e: ^Engine, o: Object, w: convo.Undo_State, target: Rid) -> Error {
 	pos := _cu_position(e, o) or_return
-	if pos == target || (newer(e, o, pos, target, w.stamp) or_return) {
+	if pos == target {
 		return .None
 	}
+	if !obj.rid_none(pos) {
+		m := convo_message(e, o, {msg = pos}, context.temp_allocator) or_return
+		if m.hlc > w.stamp && (_cu_continues(e, o, pos, w) or_return) {
+			return .None
+		}
+	}
 	st := convo_status(e, o) or_return
-	if newer(e, o, st.head, target, w.stamp) or_return {
-		return _cu_set_leaf(e, o, {})
+	if st.head_hlc > w.stamp && (_cu_continues(e, o, st.head, w) or_return) {
+		return _cu_set_leaf(e, o, st.head)
+	}
+	unseen := _cu_unseen(e, o, w) or_return
+	if len(unseen) > 0 {
+		move := new_id(e)
+		_cu_undo_write(e, o, move, w.msg, .Staged, nil, w.id, {cause = .Rebase, from = pos, to = target}) or_return
+		return _cu_drive_new(e, o, move)
 	}
 	return _cu_set_leaf(e, o, target)
+}
+
+convo_unsettled :: proc(e: ^Engine, o: Object) -> bool {
+	context = context_for(e)
+	now := hlc_now(e)
+	floor := prim.hlc_make(max(prim.hlc_ms(now) - MOVE_SETTLE_WINDOW_MS, 0), 0)
+	list, err := convo_undos(e, o, context.temp_allocator, floor)
+	if err != .None || len(list) == 0 {
+		return false
+	}
+	_, over, oerr := _cu_overridden(e, o, list[len(list) - 1])
+	return oerr == .None && over
 }
 
 convo_undos :: proc(e: ^Engine, o: Object, allocator := context.allocator, floor: prim.Hlc = 0) -> (out: []convo.Undo_State, err: Error) {
@@ -985,6 +1090,50 @@ _cu_undo_set :: proc(e: ^Engine, o: Object, msg: Rid, convs: []Undo_Conv) -> (se
 }
 
 @(private)
+_cu_cancel_set :: proc(e: ^Engine, o: Object, st: ^convo.Undo_State, list: []convo.Undo_State) -> (set: []convo.Undo_Line, err: Error) {
+	lines := make([dynamic]convo.Undo_Line, context.temp_allocator)
+	#reverse for u in list {
+		if u.id == st.id {
+			continue
+		}
+		if _cu_continues(e, o, st.to, u) or_return {
+			break
+		}
+		un, uerr := _cu_undone_of(e, o, u.id)
+		if uerr == .Not_Found {
+			continue
+		} else if uerr != .None {
+			return nil, uerr
+		}
+		for r in un.reverts {
+			th := _handle_get(e, Object{o.space, r.tree}, .File_Tree) or_return
+			_hist_ready(e, th) or_return
+			before, ferr := fs.revert_parents(th.hist, r.revert, context.temp_allocator)
+			if ferr != .None {
+				return nil, _ferr(ferr)
+			}
+			vb := make([dynamic]u8, context.temp_allocator)
+			fs.encode_version(&vb, before)
+			actors := make([dynamic]prim.Id, context.temp_allocator)
+			append(&actors, r.revert)
+			x := -1
+			for l, i in lines {
+				if l.tree == r.tree && l.line == r.line {
+					x = i
+				}
+			}
+			if x >= 0 {
+				append(&actors, ..lines[x].actors)
+				lines[x].base, lines[x].actors = vb[:], actors[:]
+			} else {
+				append(&lines, convo.Undo_Line{tree = r.tree, line = r.line, base = vb[:], actors = actors[:]})
+			}
+		}
+	}
+	return lines[:], .None
+}
+
+@(private)
 _cu_files_key :: proc(e: ^Engine, o: Object, at: Rid) -> (key: Rid, err: Error) {
 	for x := at; !obj.rid_none(x); {
 		m := convo_message(e, o, {msg = x}, context.temp_allocator) or_return
@@ -1058,6 +1207,17 @@ _cu_switch_set :: proc(e: ^Engine, o: Object, st: ^convo.Undo_State, convs: []Un
 	lines := make([dynamic]convo.Undo_Line, context.temp_allocator)
 	list := convo_undos(e, o, context.temp_allocator) or_return
 	if st.cause == .Rebase {
+		for u, i in list {
+			if u.id != st.redo {
+				continue
+			}
+			if (_cu_target(e, o, u) or_return) != st.to {
+				return _cu_cancel_set(e, o, st, list[:i + 1])
+			}
+			if u.staged.seg != e.self && st.staged.seg == e.self {
+				return _cu_unseen(e, o, u)
+			}
+		}
 		for u in list {
 			if u.id == st.redo {
 				for l in u.set {
@@ -1113,6 +1273,9 @@ _cu_reply_on :: proc(e: ^Engine, o: Object, path: []Rid) -> (reply: Rid, err: Er
 @(private)
 _cu_park :: proc(e: ^Engine, space: prim.Id, set: []convo.Undo_Line) -> Error {
 	for &l in set {
+		if len(l.park) > 0 {
+			continue
+		}
 		v := tree_version(e, Object{space, l.tree}, l.line, context.temp_allocator) or_return
 		vb := make([dynamic]u8, context.temp_allocator)
 		fs.encode_version(&vb, v)
