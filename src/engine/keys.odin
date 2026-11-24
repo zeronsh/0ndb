@@ -181,14 +181,6 @@ _own_tree_uploaded :: proc(e: ^Engine, stream: osync.Stream_Id, length: i64) {
 }
 
 @(private)
-_own_tree_puncture :: proc(e: ^Engine, t: ^Own_Tree, from, to: i64, keep: []i64) -> Error {
-	_serr(osync.keytree_puncture_except(&t.tree, from, to, keep)) or_return
-	t.dirty = true
-	_touch(e)
-	return .None
-}
-
-@(private)
 _trees_persist :: proc(e: ^Engine) {
 	for k in _sorted_keys(e.own_trees) {
 		t := e.own_trees[k]
@@ -220,13 +212,6 @@ _own_tree_stage :: proc(e: ^Engine, t: ^Own_Tree) -> Error {
 	t.stored = i64(len(buf))
 	_touch(e)
 	return .None
-}
-
-@(private)
-_own_tree_punctured :: proc(e: ^Engine, t: ^Own_Tree) {
-	t.dirty = true
-	t.after = max(t.after, e.batch_seq + 1)
-	_touch(e)
 }
 
 @(private)
