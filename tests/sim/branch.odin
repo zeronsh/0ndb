@@ -748,7 +748,7 @@ _br_cut :: proc(n: ^Node, cut: bool) {
 }
 
 @(private = "file")
-_br_concurrent :: proc(w: ^World, arena: ^virtual.Arena) {
+_br_pair :: proc(w: ^World, arena: ^virtual.Arena) -> (c: ^Br_Ctx, u_a, u_b, u_c: obj.Rid, ok: bool) {
 	if virtual.arena_init_growing(arena, 1 << 20) != nil {
 		return
 	}
@@ -757,32 +757,29 @@ _br_concurrent :: proc(w: ^World, arena: ^virtual.Arena) {
 		world_fail(w, "branch concurrent: relay start")
 		return
 	}
-	c, ok := _br_setup(w, alloc, true)
-	if !ok {
-		return
-	}
+	c = _br_setup(w, alloc, true) or_return
 	a, b := w.nodes[0], w.nodes[1]
 	_, r0, tok := _br_turn(c, true, {{"b.txt", "<b4>\n<b5>\n<t0>\n"}})
 	if !tok {
 		return
 	}
 	c.r0 = r0
-	u_a, _, aok := _br_turn(c, true, {{"a.txt", "<b1>\n<A1>\n<b3>\n"}, {"x.txt", "<A2>\n"}, {"b.txt", ""}})
+	ua, _, aok := _br_turn(c, true, {{"a.txt", "<b1>\n<A1>\n<b3>\n"}, {"x.txt", "<A2>\n"}, {"b.txt", ""}})
 	if !aok {
 		return
 	}
-	u_b, bok := _br_edit(c, r0)
+	ub, bok := _br_edit(c, r0)
 	if !bok {
 		return
 	}
 	if _, _, tok2 := _br_turn(c, false, {{"a.txt", "<B1>\n<b2>\n<b3>\n"}, {"y.txt", "<B2>\n"}}); !tok2 {
 		return
 	}
-	u_c, cok := _br_edit(c, r0)
+	uc, cok := _br_edit(c, r0)
 	if !cok {
 		return
 	}
-	_br_switch(c, u_b)
+	_br_switch(c, ub)
 	run_until(w, w.now + 5_000_000_000, true)
 	c.parent = {}
 	if !node_start(b) {
@@ -839,6 +836,18 @@ _br_concurrent :: proc(w: ^World, arena: ^virtual.Arena) {
 		world_fail(w, "branch concurrent: the devices sit at %v and %v before the switches", pa, pb)
 		return
 	}
+	return c, ua, ub, uc, true
+}
+
+@(private = "file")
+_br_concurrent :: proc(w: ^World, arena: ^virtual.Arena) {
+	c, u_a, u_b, u_c, ok := _br_pair(w, arena)
+	if !ok {
+		return
+	}
+	_ = u_b
+	alloc := virtual.arena_allocator(arena)
+	a, b := w.nodes[0], w.nodes[1]
 	_br_cut(a, true)
 	_br_cut(b, true)
 	_br_switch(c, u_a)
@@ -906,6 +915,143 @@ _br_concurrent :: proc(w: ^World, arena: ^virtual.Arena) {
 	if rebased == 0 {
 		world_fail(w, "branch concurrent: the winner never rebased over the concurrent switch")
 	}
+}
+
+@(private = "file")
+_br_remote :: proc(w: ^World, arena: ^virtual.Arena) {
+	c, u_a, u_b, u_c, ok := _br_pair(w, arena)
+	if !ok {
+		return
+	}
+	a, b := w.nodes[0], w.nodes[1]
+	disk_r0 := _br_map({"a.txt", "<b1>\n<b2>\n<b3>\n"}, {"b.txt", "<b4>\n<b5>\n<t0>\n"})
+	disk_a := _br_map({"a.txt", "<b1>\n<A1>\n<b3>\n"}, {"x.txt", "<A2>\n"})
+	disk_b := _br_map({"a.txt", "<B1>\n<b2>\n<b3>\n"}, {"b.txt", "<b4>\n<b5>\n<t0>\n"}, {"y.txt", "<B2>\n"})
+	defer {
+		delete(disk_r0)
+		delete(disk_a)
+		delete(disk_b)
+	}
+	check :: proc(c: ^Br_Ctx, what: string, want: map[string]string) -> (pos: obj.Rid) {
+		w := c.w
+		pos, _ = _br_position(c, w.nodes[0])
+		for n in w.nodes[:2] {
+			p, pok := _br_position(c, n)
+			if !pok || p != pos {
+				world_fail(w, "branch remote: after %s %s sits at off %d, not where the moving device sits, off %d", what, n.name, p.off, pos.off)
+			}
+			if got := _br_disk_of(c, n); !_br_same_disk(got, want) {
+				world_fail(w, "branch remote: after %s %s holds %v, not %v", what, n.name, got, want)
+			}
+		}
+		return
+	}
+	settle :: proc(w: ^World) {
+		run_until(w, w.now + 60_000_000_000, true)
+	}
+	check(c, "the setup", disk_b)
+	undo: prim.Id
+	{
+		context = instance_context(&a.inst)
+		u, err := eng.convo_undo(&a.e, c.conv, u_b)
+		node_after(a)
+		if err != .None && err != .Pending {
+			world_fail(w, "branch remote: undo: %v", err)
+			return
+		}
+		undo = u
+	}
+	settle(w)
+	check(c, "an undo", disk_r0)
+	{
+		context = instance_context(&a.inst)
+		_, err := eng.convo_redo(&a.e, c.conv, undo)
+		node_after(a)
+		if err != .None && err != .Pending {
+			world_fail(w, "branch remote: redo: %v", err)
+			return
+		}
+	}
+	settle(w)
+	check(c, "a redo", disk_b)
+	_br_switch(c, u_a)
+	settle(w)
+	check(c, "a switch", disk_a)
+	{
+		context = instance_context(&a.inst)
+		_, err := eng.convo_regenerate(&a.e, c.conv, u_a)
+		node_after(a)
+		if err != .None && err != .Pending {
+			world_fail(w, "branch remote: regenerate: %v", err)
+			return
+		}
+	}
+	settle(w)
+	check(c, "a regenerate", disk_r0)
+	c.parent = u_a
+	if _, _, tok := _br_turn(c, false, {{"a.txt", "<C1>\n<b2>\n<b3>\n"}}); !tok {
+		return
+	}
+	settle(w)
+	disk_c := _br_map({"a.txt", "<C1>\n<b2>\n<b3>\n"}, {"b.txt", "<b4>\n<b5>\n<t0>\n"})
+	defer delete(disk_c)
+	check(c, "the regenerated turn", disk_c)
+	{
+		context = instance_context(&a.inst)
+		_, err := eng.exec(&a.e, eng.Cmd_Send{object = c.conv, text = "edited", parent = c.r0})
+		node_after(a)
+		if err != .None && err != .Pending {
+			world_fail(w, "branch remote: edit: %v", err)
+			return
+		}
+	}
+	settle(w)
+	check(c, "an edit", disk_r0)
+	_br_switch(c, u_c)
+	settle(w)
+	check(c, "a switch to a branch without a turn", disk_r0)
+	_ = b
+}
+
+@(test)
+branch_remote :: proc(t: ^testing.T) {
+	if s, ok := os.lookup_env("SIM_SEED", context.temp_allocator); ok && len(s) > 0 {
+		return
+	}
+	test_begin(t)
+	defer test_end(t)
+	bad := 0
+	count := env_u64("BR_REMOTE_SEEDS", 5)
+	for seed in u64(1) ..= count {
+		cfg := default_config(seed)
+		cfg.nodes = 2
+		cfg.spaces = 0
+		cfg.ops = 0
+		cfg.crash_rate = 0
+		cfg.fault_rate = 0
+		cfg.io_rate = 0
+		cfg.byzantine = false
+		cfg.bulk = false
+		cfg.mem_max = 1500
+		cfg.verbose = env_u64("SIM_VERBOSE", 0) != 0
+		w := new(World)
+		world_init(w, cfg)
+		a: virtual.Arena
+		_br_remote(w, &a)
+		for f in w.failures {
+			if bad < 30 {
+				fmt.eprintf("branch_remote seed %d: %s\n", seed, f)
+			}
+		}
+		if len(w.failures) > 0 {
+			bad += 1
+		}
+		world_destroy(w)
+		free(w)
+		virtual.arena_destroy(&a)
+	}
+	fmt.eprintf("branch_remote: %d seeds, %d failed\n", count, bad)
+	testing.expect(t, bad == 0, fmt.tprintf("branch_remote: %d failures", bad))
 }
 
 @(test)

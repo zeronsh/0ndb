@@ -470,11 +470,7 @@ convo_moves_settle :: proc(e: ^Engine, o: Object) -> Error {
 		if obj.rid_none(target) {
 			return .None
 		}
-		pos := _cu_position(e, o) or_return
-		if !(_cu_descends(e, o, pos, target) or_return) {
-			return _cu_set_leaf(e, o, target)
-		}
-		return .None
+		return _cu_follow_move(e, o, w, target)
 	}
 	if len(list) < 2 || !_cu_switch_like(w) {
 		return .None
@@ -530,6 +526,29 @@ convo_moves_settle :: proc(e: ^Engine, o: Object) -> Error {
 	}
 	_, err := convo_move(e, o, .Rebase, w.to, w.id)
 	return err
+}
+
+@(private)
+_cu_follow_move :: proc(e: ^Engine, o: Object, w: convo.Undo_State, target: Rid) -> Error {
+	newer :: proc(e: ^Engine, o: Object, at, target: Rid, stamp: prim.Hlc) -> (yes: bool, err: Error) {
+		if at == target || obj.rid_none(at) {
+			return false, .None
+		}
+		m := convo_message(e, o, {msg = at}, context.temp_allocator) or_return
+		if m.hlc <= stamp {
+			return false, .None
+		}
+		return _cu_descends(e, o, at, target)
+	}
+	pos := _cu_position(e, o) or_return
+	if pos == target || (newer(e, o, pos, target, w.stamp) or_return) {
+		return .None
+	}
+	st := convo_status(e, o) or_return
+	if newer(e, o, st.head, target, w.stamp) or_return {
+		return _cu_set_leaf(e, o, {})
+	}
+	return _cu_set_leaf(e, o, target)
 }
 
 convo_undos :: proc(e: ^Engine, o: Object, allocator := context.allocator, floor: prim.Hlc = 0) -> (out: []convo.Undo_State, err: Error) {
@@ -1275,17 +1294,16 @@ _cu_undo_leaves :: proc(e: ^Engine, o: Object, st: ^convo.Undo_State, convs: []U
 			u := _cu_undone_of(e, o, st.redo) or_return
 			for l in u.leaves {
 				if l.conv != o.id {
-					_cu_restore_leaf(e, Object{o.space, l.conv}, l.leaf) or_return
+					_cu_set_leaf(e, Object{o.space, l.conv}, l.leaf) or_return
 				}
 			}
-			return _cu_restore_leaf(e, o, st.to)
 		}
 		return _cu_set_leaf(e, o, st.to)
 	}
 	if st.redo != {} {
 		u := _cu_undone_of(e, o, st.redo) or_return
 		for l in u.leaves {
-			_cu_restore_leaf(e, Object{o.space, l.conv}, l.leaf) or_return
+			_cu_set_leaf(e, Object{o.space, l.conv}, l.leaf) or_return
 		}
 		return .None
 	}
@@ -1320,15 +1338,6 @@ _cu_set_root :: proc(e: ^Engine, o: Object) -> Error {
 		return _oerr(x)
 	}
 	return _cu_durable(e, h)
-}
-
-@(private)
-_cu_restore_leaf :: proc(e: ^Engine, o: Object, leaf: Rid) -> Error {
-	st := convo_status(e, o) or_return
-	if leaf == st.head {
-		return _cu_set_leaf(e, o, {})
-	}
-	return _cu_set_leaf(e, o, leaf)
 }
 
 @(private)
