@@ -946,8 +946,14 @@ _br_remote :: proc(w: ^World, arena: ^virtual.Arena) {
 		}
 		return
 	}
-	settle :: proc(w: ^World) {
+	settle :: proc(c: ^Br_Ctx) {
+		w := c.w
 		run_until(w, w.now + 60_000_000_000, true)
+		for n in w.nodes[:2] {
+			if _, warm := _br_position(c, n); !warm {
+				run_until(w, w.now + 60_000_000_000, true)
+			}
+		}
 	}
 	check(c, "the setup", disk_b)
 	undo: prim.Id
@@ -961,7 +967,7 @@ _br_remote :: proc(w: ^World, arena: ^virtual.Arena) {
 		}
 		undo = u
 	}
-	settle(w)
+	settle(c)
 	check(c, "an undo", disk_r0)
 	{
 		context = instance_context(&a.inst)
@@ -972,10 +978,10 @@ _br_remote :: proc(w: ^World, arena: ^virtual.Arena) {
 			return
 		}
 	}
-	settle(w)
+	settle(c)
 	check(c, "a redo", disk_b)
 	_br_switch(c, u_a)
-	settle(w)
+	settle(c)
 	check(c, "a switch", disk_a)
 	{
 		context = instance_context(&a.inst)
@@ -986,13 +992,13 @@ _br_remote :: proc(w: ^World, arena: ^virtual.Arena) {
 			return
 		}
 	}
-	settle(w)
+	settle(c)
 	check(c, "a regenerate", disk_r0)
 	c.parent = u_a
 	if _, _, tok := _br_turn(c, false, {{"a.txt", "<C1>\n<b2>\n<b3>\n"}}); !tok {
 		return
 	}
-	settle(w)
+	settle(c)
 	disk_c := _br_map({"a.txt", "<C1>\n<b2>\n<b3>\n"}, {"b.txt", "<b4>\n<b5>\n<t0>\n"})
 	defer delete(disk_c)
 	check(c, "the regenerated turn", disk_c)
@@ -1005,10 +1011,10 @@ _br_remote :: proc(w: ^World, arena: ^virtual.Arena) {
 			return
 		}
 	}
-	settle(w)
+	settle(c)
 	check(c, "an edit", disk_r0)
 	_br_switch(c, u_c)
-	settle(w)
+	settle(c)
 	check(c, "a switch to a branch without a turn", disk_r0)
 	_ = b
 }
