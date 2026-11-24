@@ -3710,6 +3710,10 @@ that line's version and a write is parented on it and advances it, so an
 edit on a device whose folder is on a feature branch lands on that branch.
 When the line is at the history's heads (the only case with one line), the
 loaded state is used directly, exactly as before.
+`tree_list` reports a file's size from its history record when the file's
+text at that version is its checkpoint (no ops since, the version contains
+the checkpoint's), so listing an imported directory reads no blobs; any
+other file's text is loaded to measure it.
 
 A whole-file write never removes what its reader did not see. `tree_read`
 and `tree_list` return the version they read (`base`), and `tree_write`

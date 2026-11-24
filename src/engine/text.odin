@@ -227,11 +227,15 @@ _tree_entries :: proc(e: ^Engine, o: Object, path: string, allocator: runtime.Al
 		case .File:
 			x.mode = 0o755 if iok && .Exec in info.flags else 0o644
 			if sizes {
-				text, terr := _tree_text(e, h, &at, k.inode)
-				if terr != .None {
-					return nil, _pending_result(e, h, terr, ready)
+				if sz, sok, _ := fs.history_text_size(h.hist, k.inode, at.version); sok {
+					x.size = sz
+				} else {
+					text, terr := _tree_text(e, h, &at, k.inode)
+					if terr != .None {
+						return nil, _pending_result(e, h, terr, ready)
+					}
+					x.size = i64(len(text))
 				}
-				x.size = i64(len(text))
 			}
 		}
 		out[i] = x
