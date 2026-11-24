@@ -76,6 +76,7 @@ Cont :: struct {
 	fd:      prim.Fd,
 	size:    i64,
 	live:    i64,
+	ck_live: i64,
 	dirty:   bool,
 	lent:    bool,
 	busy:    bool,

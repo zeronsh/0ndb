@@ -144,6 +144,9 @@ _snap_take :: proc(p: ^Pack, s: ^Snap) {
 	}
 	s.conts = make([dynamic]Cont, 0, len(p.conts), p.allocator)
 	append(&s.conts, ..p.conts[:])
+	for &c in s.conts {
+		c.live = c.ck_live
+	}
 }
 
 @(private)

@@ -109,11 +109,16 @@ _rc_idle :: proc(r: ^Rc_Rig) -> (turns: int, ok: bool) {
 			return turns, false
 		}
 	}
-	if r.job {
-		return turns, false
+	for c, i in r.pk.conts {
+		data := c.size - 4096
+		if i == r.pk.active || data <= 0 {
+			continue
+		}
+		if f64(data - c.live) >= 0.5 * f64(data) {
+			return turns, false
+		}
 	}
-	more, e := pack.step(&r.pk)
-	return turns, e == .None && !more && !r.job
+	return turns, !r.job
 }
 
 @(private = "file")
