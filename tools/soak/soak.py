@@ -5,8 +5,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
 WINDOWS = os.name == "nt"
-VMEM = os.environ.get("SOAK_VMEM", "4000000")
-LIMIT = [] if WINDOWS else ["bash", "-c", 'ulimit -v %s 2>/dev/null; exec "$@"' % VMEM, "x"]
+MARKER = b"ondb-soak-no-provider"
+DATA = os.environ.get("SOAK_DATA_KB", "4000000")
+LIMIT = [] if WINDOWS else ["bash", "-c", 'ulimit -d %s 2>/dev/null; exec "$@"' % DATA, "x"]
+TRACE = os.environ.get("SOAK_TRACE", "")
 MODEL = "claude-opus-5-5"
 AGENT_PATHS = 24
 PERSON_PATHS = 12
@@ -159,6 +161,7 @@ class Daemon:
     def __init__(self, d, port, bin_path):
         self.dir = d
         self.bin = os.path.abspath(bin_path)
+        assert_bin(self.bin)
         base = tempfile.gettempdir()
         self.rt = tempfile.mkdtemp(prefix="0s", dir=base if len(base) < 40 else "/tmp")
         self.env = dict(os.environ, ONDB_HOME=os.path.join(d, "home"), ONDB_RUNTIME_DIR=self.rt, ANTHROPIC_BASE_URL="http://127.0.0.1:%d" % port, ANTHROPIC_API_KEY="x")
@@ -168,7 +171,7 @@ class Daemon:
     def start(self):
         group = dict(creationflags=subprocess.CREATE_NEW_PROCESS_GROUP) if WINDOWS else dict(start_new_session=True)
         self.log = open(os.path.join(self.dir, "daemon.log"), "a")
-        self.proc = subprocess.Popen(LIMIT + [self.bin, "daemon"], cwd=self.dir, env=self.env, stdout=self.log, stderr=subprocess.STDOUT, **group)
+        self.proc = subprocess.Popen(LIMIT + (["strace", "-f", "-tt", "-o", TRACE] if TRACE else []) + [self.bin, "daemon"], cwd=self.dir, env=self.env, stdout=self.log, stderr=subprocess.STDOUT, **group)
         self.sock = os.path.join(self.rt, "daemon.sock")
         for _ in range(800):
             if os.path.exists(self.sock):
@@ -227,6 +230,13 @@ def isolated():
         return False
 
 
+def assert_bin(path):
+    b = open(path, "rb").read()
+    hosts = [h for h in (b"api.anthropic.com", b"api.openai.com") if h in b]
+    if MARKER not in b or hosts:
+        sys.exit("soak: %s is not a soak build; build it with -define:ONDB_TEST_MODEL_URL=http://127.0.0.1:1/%s" % (path, MARKER.decode()))
+
+
 def isolate():
     if isolated():
         return
@@ -234,8 +244,6 @@ def isolate():
         if not shutil.which("unshare"):
             sys.exit("soak: unshare is needed to keep the daemon off the network")
         os.execvp("unshare", ["unshare", "-rn", "sh", "-c", 'ip link set lo up; exec "$@"', "x", sys.executable, os.path.abspath(__file__)] + sys.argv[1:])
-    if os.environ.get("SOAK_ALLOW_NETWORK") != "1":
-        sys.exit("soak: this platform cannot cut the daemon off the network, and a daemon that loses ANTHROPIC_BASE_URL would call the real API; set SOAK_ALLOW_NETWORK=1 only with that host's egress blocked another way")
 
 
 def sample_proc(pid):
@@ -784,7 +792,7 @@ def main():
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--restart", type=float, default=10, help="minutes between daemon restarts")
     ap.add_argument("--dir", default="")
-    ap.add_argument("--bin", default=os.environ.get("ONDB_BIN", os.path.join(REPO, "bin", "0ndb.exe" if WINDOWS else "0ndb")))
+    ap.add_argument("--bin", default=os.environ.get("ONDB_BIN", os.path.join(REPO, "bin", "0ndb-soak.exe" if WINDOWS else "0ndb-soak")))
     ap.add_argument("--probe", action="store_true", help="print the daemon's state at each error")
     ap.add_argument("--skip", default="", help="steps to leave out, for example redo")
     ap.add_argument("--stop", action="store_true", help="stop at the first finding")
