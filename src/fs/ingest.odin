@@ -1369,6 +1369,17 @@ attribute_consumed :: proc(p: ^Pass, actor: prim.Id, idx: []int, scope := prim.I
 @(private)
 attribute_changes :: proc(p: ^Pass) -> Error {
 	m := p.m
+	consumed := make(map[string]bool, context.temp_allocator)
+	defer if len(consumed) > 0 {
+		keep := make([dynamic]Change, 0, len(p.changes), context.temp_allocator)
+		for c in p.changes {
+			if !consumed[c.path] {
+				append(&keep, c)
+			}
+		}
+		clear(&p.changes)
+		append(&p.changes, ..keep[:])
+	}
 	for &c in p.changes {
 		if c.scope != nil {
 			continue
@@ -1389,8 +1400,8 @@ attribute_changes :: proc(p: ^Pass) -> Error {
 			append(&steps, ..chain[:])
 			attrib_chain_drop(m, c.path)
 		}
-		if has && a.oid != {} && (len(steps) == 0 || steps[len(steps) - 1] != Attrib_Step{a.actor, a.oid, a.scope}) {
-			append(&steps, Attrib_Step{a.actor, a.oid, a.scope})
+		if has && a.oid != {} && (len(steps) == 0 || steps[len(steps) - 1] != Attrib_Step{a.actor, a.oid, a.scope, a.base}) {
+			append(&steps, Attrib_Step{a.actor, a.oid, a.scope, a.base})
 		}
 		if !m.lost {
 			kept := 0
@@ -1422,14 +1433,9 @@ attribute_changes :: proc(p: ^Pass) -> Error {
 			continue
 		}
 		matched, broken, gone := false, false, false
+		replayed := false
 		cur := c.old.oid if c.kind == .Modify else odb.Oid{}
 		for st in steps {
-			if disk_oid == st.oid {
-				c.actor = st.actor
-				c.scope_id = st.scope
-				matched = true
-				break
-			}
 			if st.oid == cur {
 				continue
 			}
@@ -1437,12 +1443,24 @@ attribute_changes :: proc(p: ^Pass) -> Error {
 				broken = true
 				break
 			}
-			committed := attribute_step(p, &c, st) or_return
+			committed := replay_step(p, &c, st) or_return
 			if !committed {
 				gone = true
 				break
 			}
+			replayed = true
 			cur = st.oid
+			if disk_oid == st.oid {
+				c.actor = st.actor
+				c.scope_id = st.scope
+				matched = true
+				break
+			}
+		}
+		if matched && replayed {
+			k, _ := clone_string(c.path, p.long)
+			consumed[k] = true
+			continue
 		}
 		if matched || gone {
 			continue
@@ -1487,6 +1505,201 @@ attrib_chain_settle :: proc(p: ^Pass) {
 	for k in drop {
 		attrib_chain_drop(m, k)
 	}
+}
+
+@(private)
+replay_step :: proc(p: ^Pass, c: ^Change, st: Attrib_Step) -> (committed: bool, err: Error) {
+	m := p.m
+	h := m.history
+	if h == nil || c.kind != .Modify || c.old.kind != .File || c.moved != "" || c.disk != .File {
+		return attribute_step(p, c, st)
+	}
+	inode := c.old.inode
+	if .Opaque in tree_flags(h, inode) {
+		return attribute_step(p, c, st)
+	}
+	actor := st.actor
+	if st.scope != {} && !actor_on_line(m, actor) {
+		actor = scope_line_actor(m, actor)
+	}
+	if v := step_base_resolve(p, c, st, inode) or_return; v != nil {
+		event := false
+		if known := crdt.graph_known(&h.g, actor); known > 0 {
+			vl := make([dynamic]crdt.Lv, context.temp_allocator)
+			own, ok := crdt.graph_lv(&h.g, crdt.Op_Id{actor, known - 1})
+			event = !ok || crdt.graph_version_lvs(&h.g, v, &vl) != .None || !crdt.graph_contains(&h.g, vl[:], own)
+		}
+		if m.override == nil {
+			m.override = make(map[string]odb.Oid, m.allocator)
+		}
+		k, _ := clone_string(c.path, m.allocator)
+		m.override[k] = st.oid
+		first := c^
+		first.stat = {}
+		first.scope = nil
+		first.scope_id = st.scope
+		done, rerr := rebase_commit(p, &first, v, inode, actor, event)
+		key, _ := delete_key(&m.override, k)
+		delete(key, m.allocator)
+		if rerr != .None && rerr != .Reloading {
+			return false, rerr
+		}
+		if done {
+			attrib_set(m, c.path, st.actor, true, st.oid, st.scope)
+			e, found := shadow_get(&m.shadow, c.path) or_return
+			if !found {
+				return false, rerr
+			}
+			mount_reshow_add(m, c.path)
+			c.kind = .Modify
+			c.old = e
+			c.actor = {}
+			return true, rerr
+		}
+	}
+	return replay_merge(p, c, st, actor, inode)
+}
+
+@(private)
+step_base_resolve :: proc(p: ^Pass, c: ^Change, st: Attrib_Step, inode: fstree.Inode_Id) -> (v: []crdt.Op_Id, err: Error) {
+	m := p.m
+	h := m.history
+	switch st.base.kind {
+	case STEP_BASE_VERSION:
+		sb := st.base
+		ids := slice.clone(sb.ver[:sb.n], context.temp_allocator)
+		for id in ids {
+			if _, ok := crdt.graph_lv(&h.g, id); !ok {
+				return nil, .None
+			}
+		}
+		t, terr := history_text_at(h, inode, ids, context.temp_allocator)
+		if terr != .None {
+			return nil, .None
+		}
+		if oid, _ := odb.hash(m.db.format, .Blob, t); oid != st.base.oid {
+			return nil, .None
+		}
+		return ids, .None
+	case STEP_BASE_CHAIN:
+		if c.old.ver == 0 || c.old.inode != inode || (st.base.oid != {} && st.base.oid != c.old.oid) {
+			return nil, .None
+		}
+		ids, ok := shadow_version(&m.shadow, c.old)
+		if !ok || len(ids) == 0 {
+			return nil, .None
+		}
+		out := make([]crdt.Op_Id, len(ids), context.temp_allocator)
+		for id, i in ids {
+			out[i] = inode_op(h, id)
+		}
+		t, terr := history_text_at(h, inode, out, context.temp_allocator)
+		if terr != .None {
+			return nil, .None
+		}
+		if oid, _ := odb.hash(m.db.format, .Blob, t); oid != c.old.oid {
+			return nil, .None
+		}
+		return out, .None
+	}
+	return nil, .None
+}
+
+@(private)
+replay_merge :: proc(p: ^Pass, c: ^Change, st: Attrib_Step, actor: prim.Id, inode: fstree.Inode_Id) -> (committed: bool, err: Error) {
+	m := p.m
+	h := m.history
+	head: Version = m.synced[:]
+	if lv, found := history_line(h, m.line, context.temp_allocator) or_return; found && len(lv) > 0 {
+		head = lv
+	}
+	line_text := history_text_at(h, inode, head, context.temp_allocator) or_return
+	t, data, rerr := odb.read(m.db, st.oid, context.temp_allocator)
+	if rerr != .None || t != .Blob {
+		return false, .None
+	}
+	if textdiff.is_binary(data) || textdiff.is_binary(line_text) {
+		return attribute_step(p, c, st)
+	}
+	merged: []u8
+	if st.base.oid != {} && odb.exists(m.db, st.base.oid) {
+		bt, bdata, berr := odb.read(m.db, st.base.oid, context.temp_allocator)
+		if berr == .None && bt == .Blob {
+			if res, merr := textdiff.merge3(bdata, line_text, data, {}, context.temp_allocator); merr == nil && res.conflicts == 0 {
+				merged = res.data
+			}
+		}
+	}
+	if merged == nil {
+		merged = insert_only(line_text, data) or_return
+	}
+	if string(merged) != string(line_text) {
+		event := false
+		if known := crdt.graph_known(&h.g, actor); known > 0 {
+			vl := make([dynamic]crdt.Lv, context.temp_allocator)
+			own, ok := crdt.graph_lv(&h.g, crdt.Op_Id{actor, known - 1})
+			event = !ok || crdt.graph_version_lvs(&h.g, head, &vl) != .None || !crdt.graph_contains(&h.g, vl[:], own)
+		}
+		who := actor
+		if event {
+			who = event_actor(m, actor, head, _event_digest(inode_op(h, inode), merged)) or_return
+		}
+		if crdt.graph_known(&h.g, who) == 0 || !event {
+			b: Builder
+			builder_init(&b, h, who)
+			if st.scope != {} {
+				b.scope = scope_marker(actor, st.scope)
+			}
+			emit_text_edits(m, &b, inode, c.path, line_text, merged) or_return
+			if b.scope != nil {
+				builder_opaque(&b, b.scope)
+				b.scope = nil
+			}
+			ch, has, cerr := builder_commit_at(m, &b, head)
+			if cerr != .None && cerr != .Reloading {
+				return false, cerr
+			}
+			if has {
+				append(&p.rebased, ch)
+			}
+		} else {
+			append(&p.rebased, crdt.Op_Id{who, crdt.graph_known(&h.g, who) - 1})
+		}
+	}
+	e := c.old
+	e.oid = st.oid
+	e.stat = {}
+	e.ver = 0
+	shadow_put(&m.shadow, c.path, e) or_return
+	attrib_set(m, c.path, st.actor, true, st.oid, st.scope)
+	mount_reshow_add(m, c.path)
+	c.kind = .Modify
+	c.old = e
+	c.actor = {}
+	return true, .None
+}
+
+@(private)
+insert_only :: proc(ours, theirs: []u8) -> (out: []u8, err: Error) {
+	a, aerr := textdiff.split_lines(ours, context.temp_allocator)
+	b, berr := textdiff.split_lines(theirs, context.temp_allocator)
+	if aerr != nil || berr != nil {
+		return nil, .No_Memory
+	}
+	edits, derr := textdiff.diff_lines(a, b, textdiff.DEFAULT_DIFF, context.temp_allocator)
+	if derr != nil {
+		return nil, .No_Memory
+	}
+	buf := make([dynamic]u8, 0, len(ours) + len(theirs), context.temp_allocator)
+	at := u32(0)
+	for e in edits {
+		end := e.a_start + e.a_len
+		append(&buf, ..ours[a.offs[at]:a.offs[end]])
+		append(&buf, ..theirs[b.offs[e.b_start]:b.offs[e.b_start + e.b_len]])
+		at = end
+	}
+	append(&buf, ..ours[a.offs[at]:])
+	return buf[:], .None
 }
 
 @(private)
