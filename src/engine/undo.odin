@@ -442,7 +442,14 @@ _moves_settle_step :: proc(e: ^Engine) {
 		}
 	}
 	for o in list {
+		_, open := e.handles[o.id]
 		convo_moves_settle(e, o)
+		if open {
+			continue
+		}
+		if h, ok := e.handles[o.id]; ok && h.pins == 0 && !h.w_open && !h.local {
+			_handle_close(e, h)
+		}
 	}
 }
 
