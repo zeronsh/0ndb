@@ -205,8 +205,6 @@ orch_call :: proc(r: ^Runtime, caller: Object, a: ^Agent_Info, tool: mcp.Catalog
 		schedule_tool(r, caller, a, v, rep)
 	case .History_Search:
 		_orch_history(r, caller, v, rep)
-	case .Redact:
-		_orch_redact(r, caller, v, rep)
 	}
 	return 0
 }
@@ -1213,85 +1211,6 @@ _file_key :: proc(data: rawptr, path: string, out: ^[dynamic]u8) -> bool {
 		return true
 	}
 	return false
-}
-
-@(private)
-_orch_redact :: proc(r: ^Runtime, caller: Object, v: json.Value, rep: Reply) {
-	if !jbool(v, "confirm") {
-		reply_done(r, rep, "confirm must be true", "", true)
-		return
-	}
-	o, ok := _obj_arg(v, "object", caller.space)
-	if !ok {
-		reply_done(r, rep, "object must be an id", "", true)
-		return
-	}
-	c, found, _ := eng.catalog_get(r.e, o, context.temp_allocator)
-	if !found {
-		reply_done(r, rep, "unknown object", "", true)
-		return
-	}
-	count := 0
-	err: eng.Error
-	#partial switch c.kind {
-	case .Conversation:
-		if m := jstr(v, "message"); len(m) > 0 {
-			rid, rok := parse_rid(m)
-			if !rok {
-				reply_done(r, rep, "message must be a record id", "", true)
-				return
-			}
-			err = eng.convo_redact(r.e, o, rid)
-			count = 1
-		} else {
-			ev, verr := eng.convo_view(r.e, o)
-			if verr != .None {
-				reply_done(r, rep, "the conversation could not be read", "", true)
-				return
-			}
-			t, terr := convo.view_tail(ev, r.self, context.temp_allocator)
-			if terr != .None {
-				reply_done(r, rep, "the conversation is not fully replicated", "", true)
-				return
-			}
-			pg, _ := convo.page(ev, &t, {}, 1_000_000, context.temp_allocator)
-			for m in pg.messages {
-				if e2 := eng.convo_redact(r.e, o, m.id); e2 == .None || e2 == .Pending {
-					count += 1
-				} else {
-					err = e2
-				}
-			}
-		}
-	case .Text:
-		if jhas(v, "range") {
-			rg := jget(v, "range")
-			s := int(jint(rg, "start"))
-			e := int(jint(rg, "end"))
-			if e < s {
-				reply_done(r, rep, "range end precedes start", "", true)
-				return
-			}
-			err = eng.text_redact(r.e, o, s, e - s)
-		} else {
-			data, rerr := eng.text_read(r.e, o, context.temp_allocator)
-			if rerr != .None {
-				reply_done(r, rep, "the text could not be read", "", true)
-				return
-			}
-			err = eng.text_redact(r.e, o, 0, len(data))
-		}
-		count = 1
-	case:
-		reply_done(r, rep, "redaction of this object kind is done per key or range", "", true)
-		return
-	}
-	b := make(Buf, context.temp_allocator)
-	append(&b, '{')
-	jw_kbool(&b, "redacted", err == .None || err == .Pending)
-	jw_kint(&b, "records", i64(count))
-	append(&b, '}')
-	reply_done(r, rep, "", string(b[:]), err != .None && err != .Pending)
 }
 
 @(private)
