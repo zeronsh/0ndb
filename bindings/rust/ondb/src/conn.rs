@@ -464,6 +464,7 @@ pub const EVENT_NAMES: [&str; 34] = [
     "rename_offered",
     "redact_unreached",
     "models_changed",
+    "authors_resolved",
 ];
 
 fn events_frame(mask: u64) -> Vec<u8> {
