@@ -1,0 +1,8 @@
+# name | setup | turn ops | note | tree after undo/regenerate/switch (overrides)
+ps_same        | a.txt=x | write a.txt agent; person a.txt person-after | whole one-line file | a.txt=person-after
+ps_far         | a.txt=1\n2\n3\n4\n5\n | write a.txt 'A\n2\n3\n4\n5\n'; person a.txt 'A\n2\n3\n4\nP\n' | far line | a.txt=1\n2\n3\n4\nP\n
+ps_adj         | a.txt=1\n2\n3\n | write a.txt 'A\n2\n3\n'; person a.txt 'A\nP\n3\n' | adjacent line | a.txt=1\nP\n3\n
+ps_two         | a.txt=1\n2\n3\n | write a.txt 'A\nB\n3\n'; person a.txt 'A\nP\n3\n' | one of two changed lines | a.txt=1\nP\n3\n
+ps_mix         | a.txt=x | write a.txt agent-one; person a.txt agent-one-plus | part of the turn's line | a.txt=agent-one-plus
+ps_created     | k.txt=x | write n.txt agent; person n.txt 'agent\nperson\n' | file the turn created | n.txt=person\n
+ps_created_mix | k.txt=x | write n.txt 'a1\na2\n'; person n.txt 'a1-plus\na2\n' | part of a line in a created file | n.txt=a1-plus\n

@@ -1,0 +1,2 @@
+# name | setup | turn ops | note | tree after undo/regenerate/switch (overrides; !path = absent)
+ps_created_del | k.txt=x | write n.txt 'a1\na2\n'; person n.txt 'a2\n' | person only deletes a line of a created file: removed | !n.txt

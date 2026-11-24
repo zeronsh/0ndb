@@ -1,0 +1,3 @@
+# name | setup | turn ops | note | tree after undo/regenerate/switch (overrides)
+ps_del         | a.txt=1\n2\n3\n | write a.txt 'A\n2\n3\n'; person a.txt '2\n3\n' | person deletes the turn's line: stays deleted | a.txt=2\n3\n
+ps_del_other   | a.txt=1\n2\n3\n | write a.txt 'A\n2\n3\n'; person a.txt 'A\n2\n' | person deletes a line the turn left alone | a.txt=1\n2\n
