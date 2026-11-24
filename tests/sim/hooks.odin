@@ -5,6 +5,7 @@ import "core:fmt"
 import "core:os"
 import "core:slice"
 import "core:strings"
+import "core:sync"
 import eng "../../src/engine"
 import "../../src/prim"
 
@@ -99,12 +100,18 @@ Registry :: struct {
 reg: Registry
 
 @(private = "file")
+_sort_lock: sync.Mutex
+
+@(private = "file")
 _sorted :: proc() {
 	assert(!reg.overflow)
+	if sync.atomic_load_explicit(&reg.sorted, .Acquire) {
+		return
+	}
+	sync.guard(&_sort_lock)
 	if reg.sorted {
 		return
 	}
-	reg.sorted = true
 	by :: proc(a, b: Ordered($P)) -> bool {
 		return a.order < b.order
 	}
@@ -126,6 +133,7 @@ _sorted :: proc() {
 	slice.stable_sort_by(reg.lines.items[:reg.lines.n], proc(a, b: Stat_Line) -> bool {
 		return a.order < b.order
 	})
+	sync.atomic_store_explicit(&reg.sorted, true, .Release)
 }
 
 @(private = "file")
