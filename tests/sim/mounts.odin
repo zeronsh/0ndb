@@ -70,13 +70,17 @@ _w_stop :: proc(data: rawptr, reg: ^fs.Registry) {
 
 @(private = "file")
 _w_poll :: proc(data: rawptr, reg: ^fs.Registry) -> fs.Error {
-	watch_deliver((^Node)(data), reg)
+	n := (^Node)(data)
+	run_wait_points(n.w, n)
+	watch_deliver(n, reg)
 	return .None
 }
 
 @(private = "file")
 _w_wait :: proc(data: rawptr, reg: ^fs.Registry, ms: i32) -> bool {
-	return watch_deliver((^Node)(data), reg) > 0
+	n := (^Node)(data)
+	run_wait_points(n.w, n)
+	return watch_deliver(n, reg) > 0
 }
 
 @(private = "file")

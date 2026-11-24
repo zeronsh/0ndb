@@ -1638,6 +1638,8 @@ observer_wait :: proc(reg: ^Registry) -> Error {
 	}
 	defer virtual.arena_destroy(&arena)
 	context.temp_allocator = virtual.arena_allocator(&arena)
+	prim.loop_nest(reg.loop)
+	defer prim.loop_unnest(reg.loop)
 	return from_prim(prim.loop_step(reg.loop, true))
 }
 
