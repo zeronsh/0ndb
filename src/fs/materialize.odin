@@ -1666,18 +1666,32 @@ mat_snapshot_named :: proc(m: ^Mount, it: ^Mat_Item, at: []fstree.Op_Id, base, p
 		v[i] = inode_op(h, id)
 	}
 	old := history_text_at(h, it.inode, v, context.temp_allocator) or_return
+	a, attributed := m.attrib[it.old]
+	attributed &&= !a.used
 	e := it.entry
 	e.stat = st
 	e.oid = oid
 	if string(old) != string(data) {
-		history_register_actor(h, base, pseudo) or_return
-		actor := event_actor(m, base, v, _event_digest(inode_op(h, it.inode), data)) or_return
-		if known := crdt.graph_known(&h.g, actor); known > 0 {
+		who := a.actor if attributed else base
+		if !attributed {
+			history_register_actor(h, base, pseudo) or_return
+		}
+		actor := who
+		blocked := _chain_blocks(h, who, v)
+		if blocked {
+			actor = event_actor(m, who, v, _event_digest(inode_op(h, it.inode), data)) or_return
+		}
+		if known := crdt.graph_known(&h.g, actor); blocked && known > 0 {
 			head = crdt.Op_Id{actor, known - 1}
 		} else {
 			b: Builder
 			builder_init(&b, h, actor)
 			emit_text_edits(m, &b, it.inode, it.path, old, data) or_return
+			if attributed {
+				if mk := scope_marker(who, a.scope); mk != nil {
+					builder_opaque(&b, mk)
+				}
+			}
 			ch, has, cerr := builder_commit_at(m, &b, v)
 			if cerr != .None && cerr != .Reloading {
 				return {}, cerr
@@ -1692,7 +1706,22 @@ mat_snapshot_named :: proc(m: ^Mount, it: ^Mat_Item, at: []fstree.Op_Id, base, p
 	}
 	shadow_put(&m.shadow, it.path, e) or_return
 	it.entry = e
+	if attributed {
+		attrib_set(m, it.old, a.actor, true, {}, a.scope)
+		_base_note(m, it.old, .Current, a.actor)
+	}
 	return head, .None
+}
+
+@(private)
+_chain_blocks :: proc(h: ^History, actor: prim.Id, v: []crdt.Op_Id) -> bool {
+	known := crdt.graph_known(&h.g, actor)
+	if known == 0 {
+		return false
+	}
+	vl := make([dynamic]crdt.Lv, context.temp_allocator)
+	own, ok := crdt.graph_lv(&h.g, crdt.Op_Id{actor, known - 1})
+	return !ok || crdt.graph_version_lvs(&h.g, v, &vl) != .None || !crdt.graph_contains(&h.g, vl[:], own)
 }
 
 @(private)
@@ -1705,12 +1734,7 @@ mat_snapshot_writer :: proc(m: ^Mount, it: ^Mat_Item, a: Attrib, st: Stat, data:
 	e.oid = oid
 	if string(old) != string(data) {
 		actor := a.actor
-		blocked := false
-		if known := crdt.graph_known(&h.g, actor); known > 0 {
-			vl := make([dynamic]crdt.Lv, context.temp_allocator)
-			own, ok := crdt.graph_lv(&h.g, crdt.Op_Id{actor, known - 1})
-			blocked = !ok || crdt.graph_version_lvs(&h.g, v, &vl) != .None || !crdt.graph_contains(&h.g, vl[:], own)
-		}
+		blocked := _chain_blocks(h, actor, v)
 		if blocked {
 			actor = event_actor(m, a.actor, v, _event_digest(inode_op(h, it.inode), data)) or_return
 		}
@@ -1746,19 +1770,20 @@ mat_snapshot_writer :: proc(m: ^Mount, it: ^Mat_Item, a: Attrib, st: Stat, data:
 mat_snapshot_dirty :: proc(m: ^Mount, items: []Mat_Item, target: Version) -> (out: []crdt.Op_Id, took: bool, err: Error) {
 	h := m.history
 	pseudo := mount_snapshot_pseudo(m.id, m.line)
-	actor := fshist.ingestion_actor(h.self, pseudo)
-	parents := make([dynamic]crdt.Op_Id, context.temp_allocator)
-	append(&parents, ..m.merge_base)
-	if known := crdt.graph_known(&h.g, actor); known > 0 {
-		append(&parents, crdt.Op_Id{actor, known - 1})
+	base := fshist.ingestion_actor(h.self, pseudo)
+	parents := slice.clone(m.merge_base, context.temp_allocator)
+	Snap :: struct {
+		i:    int,
+		data: []u8,
+		stat: Stat,
+		oid:  odb.Oid,
+		old:  []u8,
+		at:   []fstree.Op_Id,
 	}
-	b: Builder
-	builder_init(&b, h, actor)
-	head: crdt.Op_Id
 	heads := make([dynamic]crdt.Op_Id, context.temp_allocator)
-	snapped := make([dynamic]int, context.temp_allocator)
-	ours := make([dynamic]Stat, context.temp_allocator)
-	oids := make([dynamic]odb.Oid, context.temp_allocator)
+	plain := make([dynamic]Snap, context.temp_allocator)
+	named := make([dynamic]Snap, context.temp_allocator)
+	changed := false
 	for &it, i in items {
 		if !it.present || it.kind != .File || !it.has_old || it.old != it.path || .Opaque in it.flags || it.entry.kind != .File || disk_matches(m, it.old, it.entry) {
 			continue
@@ -1784,6 +1809,12 @@ mat_snapshot_dirty :: proc(m: ^Mount, items: []Mat_Item, target: Version) -> (ou
 			it.entry = e
 			continue
 		}
+		if it.entry.ver != 0 && it.entry.inode == it.inode {
+			if at, vok := shadow_version(&m.shadow, it.entry); vok && len(at) > 0 {
+				append(&named, Snap{i = i, data = slice.clone(data, context.temp_allocator), stat = d.stat, oid = oid, at = slice.clone(at, context.temp_allocator)})
+				continue
+			}
+		}
 		if a, attributed := m.attrib[it.old]; attributed && !a.used && it.entry.ver == 0 {
 			ev := mat_snapshot_writer(m, &it, a, d.stat, data, oid) or_return
 			if ev != {} {
@@ -1791,58 +1822,74 @@ mat_snapshot_dirty :: proc(m: ^Mount, items: []Mat_Item, target: Version) -> (ou
 			}
 			continue
 		}
-		if it.entry.ver != 0 && it.entry.inode == it.inode {
-			if at, vok := shadow_version(&m.shadow, it.entry); vok && len(at) > 0 {
-				ev := mat_snapshot_named(m, &it, at, actor, pseudo, d.stat, data, oid) or_return
-				if ev != {} {
-					append(&heads, ev)
+		old := history_text_at(h, it.inode, parents, context.temp_allocator) or_return
+		x := Snap{i = i, data = slice.clone(data, context.temp_allocator), stat = d.stat, oid = oid, old = slice.clone(old, context.temp_allocator)}
+		changed ||= string(x.old) != string(x.data)
+		append(&plain, x)
+	}
+	if len(plain) > 0 && (changed || len(parents) > 0) {
+		vids := make([dynamic]fstree.Op_Id, context.temp_allocator)
+		head: crdt.Op_Id
+		if changed {
+			history_register_actor(h, base, pseudo) or_return
+			actor := base
+			blocked := _chain_blocks(h, base, parents)
+			if blocked {
+				ctx: blake2b.Context
+				blake2b.init(&ctx, 32)
+				tag := "0ndb event snapshot"
+				blake2b.update(&ctx, transmute([]u8)tag)
+				for x in plain {
+					if string(x.old) != string(x.data) {
+						one := _event_digest(inode_op(h, items[x.i].inode), x.data)
+						blake2b.update(&ctx, one[:])
+					}
 				}
-				continue
+				sum: [32]u8
+				blake2b.final(&ctx, sum[:])
+				actor = event_actor(m, base, parents, sum) or_return
+			}
+			if known := crdt.graph_known(&h.g, actor); blocked && known > 0 {
+				head = crdt.Op_Id{actor, known - 1}
+			} else {
+				b: Builder
+				builder_init(&b, h, actor)
+				for x in plain {
+					if string(x.old) != string(x.data) {
+						emit_text_edits(m, &b, items[x.i].inode, items[x.i].path, x.old, x.data) or_return
+					}
+				}
+				ch, has, cerr := builder_commit_at(m, &b, parents)
+				if cerr != .None && cerr != .Reloading {
+					return nil, false, cerr
+				}
+				if !has {
+					return nil, false, .None
+				}
+				head = ch
+			}
+			append(&vids, op_inode(h, head))
+		} else {
+			head = parents[len(parents) - 1]
+			for q in parents {
+				append(&vids, op_inode(h, q))
 			}
 		}
-		old := history_text_at(h, it.inode, parents[:], context.temp_allocator) or_return
-		if string(old) != string(data) {
-			emit_text_edits(m, &b, it.inode, it.path, old, data) or_return
+		ver := shadow_version_add(&m.shadow, vids[:]) or_return
+		for x in plain {
+			e := items[x.i].entry
+			e.ver = ver
+			e.stat = x.stat
+			e.oid = x.oid
+			shadow_put(&m.shadow, items[x.i].path, e) or_return
 		}
-		append(&snapped, i)
-		append(&ours, d.stat)
-		append(&oids, oid)
+		append(&heads, head)
 	}
-	if len(snapped) == 0 {
-		return heads[:], len(heads) > 0, .None
-	}
-	if b.n > 0 {
-		history_register_actor(h, actor, pseudo) or_return
-		ch, has, cerr := builder_commit_at(m, &b, parents[:])
-		if cerr != .None && cerr != .Reloading {
-			return nil, false, cerr
+	for x in named {
+		ev := mat_snapshot_named(m, &items[x.i], x.at, base, pseudo, x.stat, x.data, x.oid) or_return
+		if ev != {} {
+			append(&heads, ev)
 		}
-		if !has {
-			return nil, false, .None
-		}
-		head = ch
-	} else {
-		if len(parents) == 0 {
-			return nil, false, .None
-		}
-		head = parents[len(parents) - 1]
 	}
-	vids := make([dynamic]fstree.Op_Id, context.temp_allocator)
-	if b.n == 0 {
-		for p in parents {
-			append(&vids, op_inode(h, p))
-		}
-	} else {
-		append(&vids, op_inode(h, head))
-	}
-	ver := shadow_version_add(&m.shadow, vids[:]) or_return
-	for i, k in snapped {
-		e := items[i].entry
-		e.ver = ver
-		e.stat = ours[k]
-		e.oid = oids[k]
-		shadow_put(&m.shadow, items[i].path, e) or_return
-	}
-	append(&heads, head)
-	return heads[:], true, .None
+	return heads[:], len(heads) > 0, .None
 }
