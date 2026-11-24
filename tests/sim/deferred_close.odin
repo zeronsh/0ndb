@@ -29,6 +29,9 @@ STAT_CLOSE_DEFERRED: Stat
 STAT_CLOSE_RESUMED: Stat
 STAT_CLOSE_CRASHED: Stat
 STAT_CLOSE_UNDONE: Stat
+STAT_CLOSE_TOKEN_GONE: Stat
+STAT_CLOSE_NODE_GONE: Stat
+STAT_CLOSE_READ_FAILED: Stat
 STAT_CLOSE_OTHER_LINE: Stat
 
 @(private = "file")
@@ -45,7 +48,10 @@ _deferred_close_init :: proc "contextless" () {
 	STAT_CLOSE_RESUMED = register_stat(72, 1, "resumed")
 	STAT_CLOSE_CRASHED = register_stat(72, 2, "crashed")
 	STAT_CLOSE_UNDONE = register_stat(72, 3, "undone")
-	STAT_CLOSE_OTHER_LINE = register_stat(72, 4, "token_gone")
+	STAT_CLOSE_TOKEN_GONE = register_stat(72, 4, "token_gone")
+	STAT_CLOSE_NODE_GONE = register_stat(72, 5, "node_gone")
+	STAT_CLOSE_READ_FAILED = register_stat(72, 6, "read_failed")
+	STAT_CLOSE_OTHER_LINE = register_stat(72, 7, "other_line")
 }
 
 @(private = "file")
@@ -56,13 +62,17 @@ _closes_init :: proc(w: ^World) {
 
 @(private = "file")
 _closes_destroy :: proc(w: ^World) {
-	for c in _closes {
-		delete(c.root, w.allocator)
-		delete(c.path, w.allocator)
+	for l in ([2][]Deferred_Close{_closes[:], _resumed[:]}) {
+		for c in l {
+			delete(c.root, w.allocator)
+			delete(c.path, w.allocator)
+			delete(c.line, w.allocator)
+			delete(c.before, w.allocator)
+		}
 	}
 	delete(_closes)
-	_closes = nil
 	delete(_resumed)
+	_closes = nil
 	_resumed = nil
 }
 
@@ -100,6 +110,29 @@ check_deferred_closes :: proc(w: ^World) {
 }
 
 @(private = "file")
+_dc_files :: proc(n: ^Node, tree: eng.Object, line: string) -> (out: map[string]string, err: eng.Error) {
+	out = make(map[string]string, context.temp_allocator)
+	names := tree_walk(n, tree, {}, line) or_return
+	for p in names {
+		t := eng.tree_read(&n.e, tree, p, context.temp_allocator, {}, line) or_return
+		out[strings.clone(p, context.temp_allocator)] = strings.clone(string(t), context.temp_allocator)
+	}
+	return
+}
+
+@(private = "file")
+_dc_without :: proc(text: string, tokens: []string) -> string {
+	b := strings.builder_make(context.temp_allocator)
+	it := text
+	for l in strings.split_after_iterator(&it, "\n") {
+		if !slice.contains(tokens, strings.trim_suffix(l, "\n")) {
+			strings.write_string(&b, l)
+		}
+	}
+	return strings.to_string(b)
+}
+
+@(private = "file")
 _deferred_undo :: proc(w: ^World, ev: ^Sim_Event) {
 	if len(w.failures) > 0 || int(ev.arg) >= len(_resumed) {
 		return
@@ -107,6 +140,7 @@ _deferred_undo :: proc(w: ^World, ev: ^Sim_Event) {
 	c := _resumed[ev.arg]
 	n := w.nodes[ev.node]
 	if !n.alive || !n.e_open || int(n.incarnation) != c.inc {
+		stat_add(w, STAT_CLOSE_NODE_GONE)
 		return
 	}
 	m := &w.model
@@ -115,18 +149,18 @@ _deferred_undo :: proc(w: ^World, ev: ^Sim_Event) {
 	defer node_after(n)
 	tree := m.objs[op.obj].o
 	line := line_eng(strings.clone(op.line, context.temp_allocator))
-	paths := TREE_PATHS
-	was := make(map[string]string, context.temp_allocator)
-	for p in paths {
-		t, terr := eng.tree_read(&n.e, tree, p, context.temp_allocator, {}, line)
-		if terr != .None && terr != .Not_Found {
-			return
-		}
-		was[p] = strings.clone(string(t), context.temp_allocator)
+	if line != line_eng(c.line) {
+		stat_add(w, STAT_CLOSE_OTHER_LINE)
+		return
+	}
+	was, werr := _dc_files(n, tree, line)
+	if werr != .None {
+		stat_add(w, STAT_CLOSE_READ_FAILED)
+		return
 	}
 	for tok in op.tokens {
 		if !strings.contains(was[c.path], tok) {
-			stat_add(w, STAT_CLOSE_OTHER_LINE)
+			stat_add(w, STAT_CLOSE_TOKEN_GONE)
 			return
 		}
 	}
@@ -134,28 +168,30 @@ _deferred_undo :: proc(w: ^World, ev: ^Sim_Event) {
 		world_fail(w, "deferred close: undo of %s's turn on %s failed: %v", id_short(op.actor), c.root, rerr)
 		return
 	}
-	for p in paths {
-		t, terr := eng.tree_read(&n.e, tree, p, context.temp_allocator, {}, line)
-		if terr != .None && terr != .Not_Found {
-			world_fail(w, "deferred close: cannot read %s on %s after the undo: %v", p, line, terr)
-			return
+	now, nerr := _dc_files(n, tree, line)
+	if nerr != .None {
+		world_fail(w, "deferred close: cannot read %s on %s after the undo: %v", c.root, line, nerr)
+		return
+	}
+	for tok in op.tokens {
+		if strings.contains(now[c.path], tok) {
+			world_fail(w, "deferred close: undo of %s's turn on %s left its token %s in %s (%q)", id_short(op.actor), c.root, tok, c.path, now[c.path])
 		}
-		if p == c.path {
-			for tok in op.tokens {
-				if strings.contains(string(t), tok) {
-					world_fail(w, "deferred close: undo of %s's turn on %s left its token %s in %s (%q)", id_short(op.actor), c.root, tok, p, string(t))
-				}
-			}
+	}
+	for p in prim.sorted_keys(was, context.temp_allocator) {
+		want := _dc_without(was[p], op.tokens[:]) if p == c.path else was[p]
+		got, kept := now[p]
+		if got != want || (!kept && p != c.path) {
+			world_fail(w, "deferred close: undo of %s's turn on %s changed %s beyond its tokens: was %q now %q want %q", id_short(op.actor), c.root, p, was[p], got, want)
 		}
-		it := was[p]
-		for l in strings.split_lines_iterator(&it) {
-			if p == c.path && slice.contains(op.tokens[:], l) {
-				continue
-			}
-			if len(l) > 0 && !strings.contains(string(t), l) {
-				world_fail(w, "deferred close: undo of %s's turn on %s removed %q from %s (%q)", id_short(op.actor), c.root, l, p, string(t))
-			}
+	}
+	for p in prim.sorted_keys(now, context.temp_allocator) {
+		if p not_in was {
+			world_fail(w, "deferred close: undo of %s's turn on %s made %s (%q)", id_short(op.actor), c.root, p, now[p])
 		}
+	}
+	if len(w.failures) > 0 {
+		return
 	}
 	dop := new_op(m, .Disk_Person, n, op.obj)
 	dop.path = strings.clone(c.path, w.allocator)
