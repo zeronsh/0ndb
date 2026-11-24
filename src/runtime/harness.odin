@@ -48,6 +48,7 @@ Proc :: struct {
 	cwd:        string,
 	token:      string,
 	closing:    bool,
+	auth_failed: bool,
 	kill_timer: prim.Timer,
 }
 
@@ -677,6 +678,7 @@ _proc_event :: proc(p: ^Proc, e: agent.Event) {
 		run.checkpoint = clone(ev.checkpoint, run.alloc)
 		if ev.auth {
 			provider_auth_failed(run.r, run.ai.provider)
+			p.auth_failed = true
 			run_error(run, concat(ev.message, ". ", _not_signed_in_notice(run.r, run.ai.provider)), NOT_SIGNED_IN)
 		} else {
 			run_error(run, ev.message)
@@ -759,6 +761,10 @@ _proc_on_kill :: proc(l: ^prim.Loop, data: rawptr) {
 _proc_free :: proc(p: ^Proc, kill: bool) {
 	r := p.r
 	lp := eng.loop(r.e)
+	settle := strings.clone(p.desc.id, context.temp_allocator) if p.auth_failed else ""
+	defer if len(settle) > 0 {
+		provider_auth_settled(r, settle)
+	}
 	if p.run != nil {
 		run := p.run
 		p.run = nil

@@ -2196,9 +2196,11 @@ live runner by default:
   whose auth files exist but whose session the provider rejects (claude's
   `authentication_failed`) fails its run the same way and is marked not
   signed in: the runner directory and the model list report it so, and later
-  runs fail at once without spawning it, until a run succeeds or its auth
-  files change after a settling window (the CLI rewrites them itself when a
-  refresh fails), which is what signing in again does.
+  runs fail at once without spawning it. The mark records the auth files'
+  identity (size, mtime and a content hash) once the failed run's process
+  has exited, after the CLI's own rewrite of them; any later change to that
+  identity is a new sign-in and clears the mark at the next check, and so
+  does a run that succeeds.
 - **Model list.** `models` answers at once from each provider's last known
   list (persisted per provider under the work root's `.models/`) plus the
   native models, with `refreshing` set while probes run. A stale list
