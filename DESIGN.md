@@ -736,7 +736,16 @@ equal in both directions.
   open the records past the image's offset are replayed over it. A crash
   that loses a history commit therefore reopens with the attributions that
   commit consumed still pending, and the re-detected change is credited to
-  its writer, not to the device. An observation record is synced before the
+  its writer, not to the device. A recorded content step belongs to the file
+  it was recorded for, not to the path: a change whose disk content equals
+  its shadow entry replays no step and settles the path (the recorded
+  content never reached this file's history and is no longer on disk), and a
+  materialization that removes a path or places another inode there settles
+  it too, so a write a power cut lost is never replayed into the file that
+  took its name. Settling drops the path's unused entry and steps and
+  appends a record with a zero actor and a content oid; an open scope's
+  bare observation is kept, and an entry a commit consumed is untouched.
+  An observation record is synced before the
   observed write proceeds wherever the observer can hold the write:
   `mount_observe_begin` completes its `done` only once the record is synced,
   observations arriving together share one fdatasync run off the loop
