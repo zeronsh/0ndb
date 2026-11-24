@@ -868,6 +868,15 @@ poll :: proc(p: ^Pack) -> Error {
 		return e
 	}
 	_fire_waiters(p)
+	if _reclaim_owed(p) {
+		if _, e := _reclaim(p); e != .None {
+			_fail_waiters(p, e)
+			return e
+		}
+		if p.fl.on {
+			return .None
+		}
+	}
 	if p.want_flush || _over_budget(p, 1) {
 		if e := _flush_start(p); e != .None {
 			_fail_waiters(p, e)
@@ -892,6 +901,46 @@ poll :: proc(p: ^Pack) -> Error {
 			_fail_waiters(p, e)
 			return e
 		}
+	}
+	if e := _reclaim_idle(p); e != .None {
+		_fail_waiters(p, e)
+		return e
+	}
+	return .None
+}
+
+@(private)
+_reclaim :: proc(p: ^Pack) -> (more: bool, err: Error) {
+	if p.poisoned || p.reclaiming {
+		return false, .None
+	}
+	p.reclaiming = true
+	defer p.reclaiming = false
+	more = _compact_work(p, RECLAIM_SLICE, false) or_return
+	if more {
+		p.reclaimed = true
+		if !p.fl.on {
+			p.fl.kind = .Commit
+			_submit(p) or_return
+		}
+	}
+	return more, .None
+}
+
+@(private)
+_reclaim_idle :: proc(p: ^Pack) -> Error {
+	if p.fl.on || !_async(p) || _polled(p) || p.opts.compact_ratio <= 0 || p.nrec > 0 || len(p.dirty) > 0 || len(p.waiters) > 0 || p.closing {
+		return .None
+	}
+	if more := _reclaim(p) or_return; more {
+		return .None
+	}
+	if _compact_blocked(p) {
+		return _flush_start(p)
+	}
+	if p.reclaimed {
+		p.reclaimed = false
+		_shrink(p)
 	}
 	return .None
 }
