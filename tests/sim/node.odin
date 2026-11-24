@@ -368,7 +368,7 @@ node_drain :: proc(n: ^Node) -> bool {
 	}
 	context = instance_context(&n.inst)
 	for i := 0; ; i += 1 {
-		if !n.alive {
+		if !n.alive || w.pause {
 			return did
 		}
 		if !loop_ready(&n.inst.loop) && !loop_due(&n.inst.loop) {

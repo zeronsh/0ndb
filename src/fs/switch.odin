@@ -124,6 +124,9 @@ mount_switch_step :: proc(m: ^Mount) {
 
 @(private)
 switch_advance :: proc(m: ^Mount) -> (finished: bool, err: Error) {
+	if m.pass != nil {
+		return false, .None
+	}
 	to, _ := clone_string(m.switch_to, context.temp_allocator)
 	from, _ := clone_string(m.switch_from, context.temp_allocator)
 	if m.switch_phase <= SWITCH_INGEST {

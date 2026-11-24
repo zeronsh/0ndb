@@ -479,6 +479,25 @@ equal in both directions.
   objects, never opened. The first open of a file another process just wrote
   pays the on-access scan, about 6 ms there, while a packed object store is
   one open; elsewhere reading the file is cheaper than inflating the blob.
+- **Resumable passes**: a full pass (a git write, a rescan) walks the
+  shadow and the disk one directory frame at a time, each frame keeping its
+  listing and position, so the walk can stop between any two entries. A
+  scheduled pass spends a count budget (`pass_budget`, 1024: one unit per
+  entry examined, 16 per file read; counted, never timed, so the sim
+  replays it) and then commits what it collected and parks, to resume on
+  the next loop turn. Everything that runs once per pass stays at its end:
+  publishing the held line, the head, index stamp and reflog position
+  recorded when it started, the commit version. A parked pass owns its
+  memory from the mount's allocator. While one is parked, a pass a caller
+  needs (a scope's close or observation, a fence) is a keyed side pass over
+  the dirty paths only: no git detection, no full walk, no head update,
+  credited as usual, and the parked walk later finds those files clean.
+  Paths that change in a part the walk already passed stay dirty for the
+  next pass. Materialization and switches wait: `mount_materialize` returns
+  while a pass is parked and a switch's advance does not start, and both run
+  from the step that finishes the pass. Only closing a mount finishes a
+  parked pass in one call; a full pass requested while one is parked (an
+  open's recovery, a rescan) also drains it first.
 - **Watching**: Linux shares one inotify instance across all mounts;
   fanotify (`FAN_REPORT_DFID_NAME`, `FAN_MODIFY`, with the writing pid) is
   used when permitted, which lets ingestion credit each write to the process
@@ -916,7 +935,11 @@ equal in both directions.
   path) move
   to the line's paths with their stat cleared, the synced version becomes the line's, and the full pass diffs
   disk against the line, so git's writes (and anything git carried) land on
-  that line only. A path the line has that is missing on disk after the
+  that line only. A line the synced version already holds is not retargeted: a
+  crash can leave a git pass's own chunks durable on a line it had not yet
+  published, and following that line again keeps the synced version (and
+  the disk) where they are instead of moving them back to the line's
+  older version over git's files. A path the line has that is missing on disk after the
   switch and that the departing commit's git tree does not hold (a collision
   copy or another file of that line git never tracked) is owed: it is
   materialized like a pending path and never ingested as a removal; one the
