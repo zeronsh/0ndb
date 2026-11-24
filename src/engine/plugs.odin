@@ -206,7 +206,7 @@ tree_mount :: proc(e: ^Engine, o: Object, root: string, opts := fs.DEFAULT_MOUNT
 	context = context_for(e)
 	reg := registry(e) or_return
 	for r in e.plug.refused {
-		if r.root == root && r.object != o {
+		if r.object != o && fs.path_same(r.root, root) {
 			return nil, .Newer
 		}
 	}
@@ -254,7 +254,7 @@ tree_mount :: proc(e: ^Engine, o: Object, root: string, opts := fs.DEFAULT_MOUNT
 @(private)
 _refuse :: proc(e: ^Engine, o: Object, root: string) -> Error {
 	for r in e.plug.refused {
-		if r.root == root {
+		if fs.path_same(r.root, root) {
 			return .None
 		}
 	}
@@ -275,7 +275,7 @@ tree_refused :: proc(e: ^Engine) -> []Refused {
 
 tree_refused_clear :: proc(e: ^Engine, root: string) -> bool {
 	for r, i in e.plug.refused {
-		if r.root == root {
+		if fs.path_same(r.root, root) {
 			delete(r.root, e.allocator)
 			ordered_remove(&e.plug.refused, i)
 			return true
