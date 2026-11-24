@@ -277,6 +277,21 @@ record := len:u32le  tag:[16]u8  body:[len]u8  len:u32le
   the record redacted in its tag slot, keeping lengths and offsets. The
   record's plaintext key was already destroyed by puncturing the key tree,
   so zero-filling removes the only remaining ciphertext.
+- Redacting a message needs only that message's own records. If its page
+  or its plan cannot be read because another record is damaged, the
+  redaction plans from the message's own records alone: it walks the
+  segment from the message by framing, takes the message's blocks and its
+  seal, and counts a damaged record as the message's only when one of its
+  blocks or its seal points to it. Those records are zero-filled at once,
+  including a damaged one (a damaged record inside the range is zeroed,
+  never refused; signature records are kept as always). A damaged record
+  of another message is never touched. Whatever could not be attributed,
+  and blob ids that could not be decoded, are owed in the redaction log
+  (a per-message entry) before anything is zeroed, and retried once the
+  stream reads again, for instance after a repair. Puncture and relay erase
+  stay owed as before. `redactions_owed` lists every owed part (plan,
+  blobs, local, relay) with its object and offset; a blob id lost with a
+  damaged record that was zeroed stays listed as blobs, never as done.
 - Restoring a damaged own record is the other. `journal_restore(off, rec)`
   writes back exactly the bytes the writer appended at `off`, taken from the
   relay copy after it opened as this device's own sealed write (or passed its

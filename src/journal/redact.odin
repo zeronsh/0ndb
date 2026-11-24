@@ -114,12 +114,10 @@ _redact_plan :: proc(t: ^_Redact_Target, from, to: i64, offs: ^[dynamic]i64) -> 
 		skip := false
 		switch classify(buf[:], pos) {
 		case .Invalid:
-			return .Corrupt
 		case .Sealed:
 			if !t.sealed {
-				return .Corrupt
-			}
-			if is_sig(body) {
+				skip = is_sig(body)
+			} else if is_sig(body) {
 				if t.keys.key == nil {
 					return .No_Key
 				}

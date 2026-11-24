@@ -1,13 +1,16 @@
 package sim
 
+import "core:strings"
 import eng "../../src/engine"
 import "../../src/obj"
+import "../../src/prim"
 
 REDACT_NEAR_OFF :: 0
 REDACT_NEAR_NEIGHBOUR :: 1
 REDACT_NEAR_OFFLINE :: 2
 REDACT_NEAR_TARGET :: 3
 REDACT_NEAR_CONTROL :: 4
+REDACT_NEAR_HEADER :: 5
 
 STAT_REDACT_NEAR: Stat
 
@@ -44,10 +47,18 @@ check_redact_near :: proc(w: ^World) {
 		}
 		run_until(w, w.now + 5_000_000_000, true)
 	}
-	damaged := t if mode == REDACT_NEAR_TARGET else prev
+	damaged := t if mode == REDACT_NEAR_TARGET || mode == REDACT_NEAR_HEADER else prev
+	at := damaged.rid.off + 5
+	if mode == REDACT_NEAR_TARGET {
+		tok, tok_ok := _redact_near_token_at(n, ol, t.token, t.rid.off)
+		if !tok_ok {
+			return
+		}
+		at = tok + 1
+	}
 	if mode != REDACT_NEAR_CONTROL {
 		context = instance_context(&n.inst)
-		_bitrot_write(w, n, ol, damaged.rid.off + 5, 1)
+		_bitrot_write(w, n, ol, at, 1)
 		node_after(n)
 	}
 	world_note(w, "redact near: mode %d, %s redacts its message %s at %d of %s; damaged %s at %d (device-only %v)", mode, n.name, t.token, t.rid.off, id_short(o.id), damaged.token, damaged.rid.off, ol.device)
@@ -67,10 +78,60 @@ check_redact_near :: proc(w: ^World) {
 	}
 	if mode == REDACT_NEAR_OFFLINE {
 		n.partitioned = false
-		for _ in 0 ..< 6 {
-			run_until(w, w.now + 120_000_000_000, true)
+	}
+	for _ in 0 ..< 6 {
+		run_until(w, w.now + 120_000_000_000, true)
+	}
+	if len(w.failures) > 0 || w.aborted || !n.alive || !n.e_open {
+		return
+	}
+	got := digest_object(w, n, t.obj)
+	if got.complete {
+		if strings.contains(got.text, t.token) {
+			world_fail(w, "redact near: mode %d, %s still reads %s in %s after its redaction", mode, n.name, t.token, id_short(o.id))
+		}
+		delete(got.text, w.allocator)
+	}
+	context = instance_context(&n.inst)
+	damage, _ := eng.scrub(&n.e)
+	owed := eng.redactions_owed(&n.e, context.temp_allocator)
+	plan := 0
+	for x in owed {
+		if x.object != o.id {
+			continue
+		}
+		world_note(w, "redact near: %s still owes %v of %s at %d (damage left %d)", n.name, x.part, id_short(o.id), x.from, damage)
+		if x.part == .Plan {
+			plan += 1
 		}
 	}
+	node_after(n)
+	context = w.ctx
+	if plan > 0 && damage == 0 {
+		world_fail(w, "redact near: mode %d, %s still owes the plan of %s with no damage left", mode, n.name, t.token)
+	}
+}
+
+@(private = "file")
+_redact_near_token_at :: proc(n: ^Node, ol: eng.Own_Length, token: string, from: i64) -> (at: i64, ok: bool) {
+	context = instance_context(&n.inst)
+	defer node_after(n)
+	fd, oerr := prim.open_file(n.e.vfs, ol.path)
+	if oerr != .None {
+		return
+	}
+	defer prim.close_file(n.e.vfs, fd)
+	buf := make([]u8, int(min(ol.durable - from, 1 << 20)), context.temp_allocator)
+	got, rerr := prim.read_at(n.e.vfs, fd, buf, from)
+	if rerr != .None {
+		return
+	}
+	for i in 0 ..< got - len(token) + 1 {
+		if string(buf[i:][:len(token)]) == token {
+			return from + i64(i), true
+		}
+	}
+	return
 }
 
 @(private = "file")

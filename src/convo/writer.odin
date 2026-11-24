@@ -910,6 +910,156 @@ redact_ranges :: proc(v: ^obj.View, msg: Rid, allocator := context.allocator) ->
 	return list[:], .None
 }
 
+Redact_Scan :: struct {
+	ranges:   []obj.Redaction,
+	oids:     [dynamic][]u8,
+	ids:      [dynamic]string,
+	texts:    [dynamic]string,
+	complete: bool,
+}
+
+redact_scan :: proc(v: ^obj.View, msg: Rid, allocator := context.allocator) -> (out: Redact_Scan, err: Error) {
+	x, verr := obj.vref(v, msg)
+	if verr == .Not_Found && record_damaged(v, msg) {
+		x, verr = obj.vref_pos(v, msg)
+	}
+	if verr != .None {
+		return out, verr
+	}
+	jr := v.segs[x.seg].jr
+	if jr == nil {
+		return out, .Unknown_Segment
+	}
+	out.oids = make([dynamic][]u8, allocator)
+	out.ids = make([dynamic]string, allocator)
+	out.texts = make([dynamic]string, allocator)
+	own := make([dynamic]obj.Redaction, context.temp_allocator)
+	damaged := make([dynamic]obj.Redaction, context.temp_allocator)
+	refs := make(map[i64]bool, context.temp_allocator)
+	seg := v.segs[x.seg].id
+	end := journal.reader_end(jr)
+	_, pos, ferr := obj.jrec_at(jr, x.off)
+	complete := ferr == .None || pos > x.off
+	for complete && pos < end {
+		body, next, je := obj.jrec_at(jr, pos)
+		if je == .Missing || next <= pos {
+			complete = false
+			break
+		}
+		if je != .None {
+			append(&damaged, obj.Redaction{seg, pos, next})
+			pos = next
+			continue
+		}
+		k := obj.record_kind(body) if len(body) > 0 else 0
+		if k != u8(Kind.Block) && k != u8(Kind.Seal) && k != u8(Kind.Interrupted) {
+			pos = next
+			continue
+		}
+		rec, de := decode_record(body, pos, v.scratch)
+		if de != .None {
+			append(&damaged, obj.Redaction{seg, pos, next})
+			pos = next
+			continue
+		}
+		sealed := false
+		#partial switch r in rec.body {
+		case Block:
+			if r.msg == x.off {
+				append(&own, obj.Redaction{seg, pos, next})
+				refs[r.prev] = true
+				if .Ref in r.flags && len(r.blob.oid) > 0 {
+					oid, _ := _clone_bytes(r.blob.oid, allocator)
+					append(&out.oids, oid)
+				}
+				if len(r.id) > 0 {
+					append(&out.ids, strings.clone(r.id, allocator))
+				}
+				if len(r.data) > 0 && (r.kind == .Text || r.kind == .Reasoning) {
+					append(&out.texts, strings.clone(string(r.data), allocator))
+				}
+			}
+		case Seal:
+			if r.msg == x.off {
+				refs[r.last_block] = true
+				sealed = true
+			}
+		case Interrupted:
+			if r.msg == x.off {
+				refs[r.last_block] = true
+				sealed = true
+			}
+		}
+		pos = next
+		if sealed {
+			break
+		}
+	}
+	for d in damaged {
+		if refs[d.from] {
+			append(&own, d)
+		} else {
+			complete = false
+		}
+	}
+	slice_sort_redactions(own[:])
+	list := make([dynamic]obj.Redaction, allocator)
+	for r in own {
+		if n := len(list); n > 0 && list[n - 1].to == r.from {
+			list[n - 1].to = r.to
+		} else {
+			append(&list, r)
+		}
+	}
+	out.ranges = list[:]
+	out.complete = complete
+	return out, .None
+}
+
+@(private)
+_clone_bytes :: proc(b: []u8, allocator: runtime.Allocator) -> ([]u8, runtime.Allocator_Error) {
+	out, err := make([]u8, len(b), allocator)
+	if err == nil {
+		copy(out, b)
+	}
+	return out, err
+}
+
+record_damaged :: proc(v: ^obj.View, msg: Rid) -> bool {
+	x, err := obj.vref_pos(v, msg)
+	if err != .None || v.segs[x.seg].jr == nil {
+		return false
+	}
+	_, _, je := obj.jrec_at(v.segs[x.seg].jr, x.off)
+	return je == .Corrupt
+}
+
+@(private)
+slice_sort_redactions :: proc(list: []obj.Redaction) {
+	for i in 1 ..< len(list) {
+		for j := i; j > 0 && list[j].from < list[j - 1].from; j -= 1 {
+			list[j], list[j - 1] = list[j - 1], list[j]
+		}
+	}
+}
+
+writer_redact_given :: proc(w: ^Writer, msg: Rid, ranges: []obj.Redaction) -> Error {
+	_prepare(w, false) or_return
+	v := w.core.v
+	x := obj.vref_pos(v, msg) or_return
+	for r in ranges {
+		s := obj.view_find(v, r.seg)
+		if s < 0 {
+			continue
+		}
+		if body, _, je := journal.record_at(v.segs[s].jr, r.from); je == .Redacted || (je == .None && obj.is_redacted(body)) {
+			continue
+		}
+		_redact_record(w, Vref{s, r.from}, r.to, x) or_return
+	}
+	return .None
+}
+
 writer_redact :: proc(w: ^Writer, msg: Rid) -> (ranges: []obj.Redaction, err: Error) {
 	_prepare(w, false) or_return
 	v := w.core.v

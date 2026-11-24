@@ -447,40 +447,84 @@ _oerr2b :: proc(a: $A, err: obj.Error) -> Error {
 
 @(private)
 _redact_message :: proc(e: ^Engine, h: ^Handle, msg: Rid) -> Error {
+	m: convo.Message
+	whole := false
+	damaged := convo.record_damaged(h.cw.core.v, msg)
 	t, terr := convo.view_tail(&h.view, e.self, context.temp_allocator)
-	if terr != .None {
+	if terr != .None && terr != .Corrupt {
 		return _oerr(terr)
 	}
-	m, merr := convo.message(&h.view, &t, convo.Position{msg = msg}, context.temp_allocator)
-	if merr != .None {
-		return _oerr(merr)
+	if terr == .None {
+		x, merr := convo.message(&h.view, &t, convo.Position{msg = msg}, context.temp_allocator)
+		if merr != .None && merr != .Corrupt && !(merr == .Not_Found && damaged) {
+			return _oerr(merr)
+		}
+		m, whole = x, merr == .None
 	}
+	plan, perr := convo.writer_redact_plan(&h.cw, msg, context.temp_allocator)
+	if perr != .None && perr != .Corrupt && !(perr == .Not_Found && damaged) {
+		return _oerr(perr)
+	}
+	scan: convo.Redact_Scan
+	if !whole || perr != .None {
+		serr: convo.Error
+		scan, serr = convo.redact_scan(h.cw.core.v, msg, context.temp_allocator)
+		if serr != .None {
+			return _oerr(serr if perr == .None else perr)
+		}
+		if perr != .None {
+			plan = scan.ranges
+		}
+	}
+	complete := perr == .None || scan.complete
+	oids := make([dynamic]odb.Oid, context.temp_allocator)
+	if whole {
+		for b in m.blocks {
+			if b.is_ref && len(b.blob.oid) == 20 {
+				x: odb.Oid
+				copy(x[:], b.blob.oid)
+				append(&oids, x)
+			}
+		}
+	} else {
+		for o in scan.oids {
+			if len(o) == 20 {
+				x: odb.Oid
+				copy(x[:], o)
+				append(&oids, x)
+			}
+		}
+	}
+	_redact_blobs(e, oids[:], whole || scan.complete) or_return
 	_drafts_drop(h, msg.seg, msg.off)
 	if msg.seg == e.self {
 		_draft_redact_own(e, h, msg.off)
 	}
-	plan, perr := convo.writer_redact_plan(&h.cw, msg, context.temp_allocator)
-	if perr != .None {
-		return _oerr(perr)
-	}
-	oids := make([dynamic]odb.Oid, context.temp_allocator)
-	for b in m.blocks {
-		if b.is_ref && len(b.blob.oid) == 20 {
-			x: odb.Oid
-			copy(x[:], b.blob.oid)
-			append(&oids, x)
-		}
-	}
-	if len(oids) > 0 {
-		db := device_odb(e) or_return
-		_derr(odb.scrub_note(db, oids[:])) or_return
-	}
 	for r in plan {
 		_redact_intent(e, h, r.seg, r.from, r.to, msg.off) or_return
 	}
-	ranges, rerr := convo.writer_redact(&h.cw, msg)
-	if rerr != .None {
-		return _oerr(rerr)
+	if msg.seg == e.self && (!complete || !(whole || scan.complete)) {
+		_redact_owe(e, h, msg.off, !complete, !(whole || scan.complete)) or_return
+	}
+	ranges := plan
+	if perr == .None && whole {
+		rr, rerr := convo.writer_redact(&h.cw, msg)
+		if rerr != .None {
+			return _oerr(rerr)
+		}
+		ranges = rr
+	} else if gerr := convo.writer_redact_given(&h.cw, msg, plan); gerr != .None {
+		return _oerr(gerr)
+	}
+	if !whole {
+		views := make([dynamic]convo.Block_View, context.temp_allocator)
+		for id in scan.ids {
+			append(&views, convo.Block_View{id = id})
+		}
+		for tx in scan.texts {
+			append(&views, convo.Block_View{text = transmute([]u8)tx})
+		}
+		m = convo.Message{id = msg, blocks = views[:]}
 	}
 	for r in ranges {
 		if r.seg == e.self {
@@ -559,6 +603,161 @@ _apply_remote_redact_msg :: proc(e: ^Engine, h: ^Handle, vs: int, body: []u8, at
 		}
 	}
 	return .None
+}
+
+@(private)
+REDACT_OWED_PLAN :: i64(1)
+@(private)
+REDACT_OWED_BLOBS :: i64(2)
+
+Redaction_Owed :: struct {
+	space:   prim.Id,
+	object:  prim.Id,
+	device:  prim.Id,
+	from:    i64,
+	to:      i64,
+	part:    Redaction_Part,
+}
+
+Redaction_Part :: enum u8 {
+	Plan,
+	Blobs,
+	Local,
+	Relay,
+}
+
+redactions_owed :: proc(e: ^Engine, allocator := context.allocator) -> []Redaction_Owed {
+	context = context_for(e)
+	out := make([dynamic]Redaction_Owed, allocator)
+	if !_rlog_ready(e) {
+		return out[:]
+	}
+	for kk in prim.sorted_keys(e.rlog.live) {
+		if kk not_in e.rlog.live {
+			continue
+		}
+		x := e.rlog.live[kk]
+		k := kk
+		o := Redaction_Owed{from = i64(prim.get_u64le(k[32:40])), to = x.to, device = e.self}
+		copy(o.space[:], k[:16])
+		copy(o.object[:], k[16:32])
+		switch int(k[56]) {
+		case 41:
+			o.to = -1
+			if x.to & REDACT_OWED_PLAN != 0 {
+				o.part = .Plan
+				append(&out, o)
+			}
+			if x.to & REDACT_OWED_BLOBS != 0 {
+				o.part = .Blobs
+				append(&out, o)
+			}
+		case 40:
+			o.part = .Relay if x.done else .Local
+			append(&out, o)
+		case 56:
+			copy(o.device[:], k[40:56])
+			o.part = .Relay
+			append(&out, o)
+		}
+	}
+	return out[:]
+}
+
+@(private)
+_redact_owe :: proc(e: ^Engine, h: ^Handle, msg: i64, plan, blobs: bool) -> Error {
+	k: [41]u8
+	a, b := h.sp.id, h.id
+	copy(k[:16], a[:])
+	copy(k[16:32], b[:])
+	prim.put_u64le(k[32:40], u64(msg))
+	k[40] = 'M'
+	flags := (REDACT_OWED_PLAN if plan else 0) | (REDACT_OWED_BLOBS if blobs else 0)
+	if x, found := _rlog_get(e, k[:]); found {
+		flags |= x.to & REDACT_OWED_BLOBS
+		if x.to == flags {
+			return .None
+		}
+	}
+	if flags == 0 {
+		_rlog_clear(e, k[:])
+		return .None
+	}
+	return _rlog_intent(e, k[:], Rlog_Entry{kind = h.kind, to = flags, target = msg}, true)
+}
+
+@(private)
+_redact_blobs :: proc(e: ^Engine, oids: []odb.Oid, complete: bool) -> Error {
+	if len(oids) == 0 {
+		return .None
+	}
+	db := device_odb(e) or_return
+	return _derr(odb.scrub_note(db, oids))
+}
+
+@(private)
+_redact_owed_retry :: proc(e: ^Engine) {
+	Owed :: struct {
+		space:  prim.Id,
+		object: prim.Id,
+		msg:    i64,
+		flags:  i64,
+	}
+	list := make([dynamic]Owed, context.temp_allocator)
+	for kk in prim.sorted_keys(e.rlog.live) {
+		if kk not_in e.rlog.live {
+			continue
+		}
+		k := kk
+		x := e.rlog.live[kk]
+		if int(k[56]) != 41 || x.to & REDACT_OWED_PLAN == 0 {
+			continue
+		}
+		o := Owed{msg = i64(prim.get_u64le(k[32:40])), flags = x.to}
+		copy(o.space[:], k[:16])
+		copy(o.object[:], k[16:32])
+		append(&list, o)
+	}
+	for o in list {
+		if _, ok := e.spaces[o.space]; !ok {
+			continue
+		}
+		h, err := _handle_get(e, Object{o.space, o.object}, .Conversation)
+		if err != .None || !h.w_open {
+			continue
+		}
+		msg := convo.Rid{seg = e.self, off = o.msg}
+		scan, serr := convo.redact_scan(h.cw.core.v, msg, context.temp_allocator)
+		if serr != .None || !scan.complete {
+			continue
+		}
+		oids := make([dynamic]odb.Oid, context.temp_allocator)
+		for x in scan.oids {
+			if len(x) == 20 {
+				y: odb.Oid
+				copy(y[:], x)
+				append(&oids, y)
+			}
+		}
+		if _redact_blobs(e, oids[:], true) != .None {
+			continue
+		}
+		fail := false
+		for r in scan.ranges {
+			if _redact_intent(e, h, r.seg, r.from, r.to, o.msg) != .None {
+				fail = true
+			}
+		}
+		if fail || convo.writer_redact_given(&h.cw, msg, scan.ranges) != .None {
+			continue
+		}
+		for r in scan.ranges {
+			_own_redacted(e, h, r.from, r.to)
+		}
+		_redact_owe(e, h, o.msg, false, o.flags & REDACT_OWED_BLOBS != 0)
+		_handle_mark(h)
+		_object_changed(e, h.sp.id, h.id, .Redacted)
+	}
 }
 
 @(private)
@@ -730,6 +929,9 @@ _redact_settle :: proc(e: ^Engine) {
 	e.redact_tick = e.tick
 	e.rlog.idle = true
 	_redact_recover(e)
+	if _rlog_ready(e) {
+		_redact_owed_retry(e)
+	}
 }
 
 @(private)
