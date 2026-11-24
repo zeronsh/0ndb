@@ -1,5 +1,7 @@
 package fs
 
+import "core:fmt"
+
 import "base:runtime"
 import "core:hash/xxhash"
 import "core:crypto/blake2b"

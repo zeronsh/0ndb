@@ -1,5 +1,7 @@
 package fs
 
+import "core:fmt"
+
 import "base:runtime"
 import "core:mem/virtual"
 import "core:slice"
@@ -1497,7 +1499,7 @@ admit_import :: proc(h: ^History, si: u32, off: i64, body: []u8, dict: ^crdt.Act
 	return n, history_persist(h)
 }
 
-history_persist :: proc(h: ^History) -> Error {
+history_persist :: proc(h: ^History, loc := #caller_location) -> Error {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	h.persist_due = true
 	buf := make([dynamic]u8, context.temp_allocator)
@@ -1545,6 +1547,7 @@ history_persist :: proc(h: ^History) -> Error {
 	}
 	fstree.mark_persisted(&h.tree)
 	if f := h.opts.fault; f.fail != nil && f.fail(f.data) {
+		fmt.eprintf("DBG persist fault from %v\n", loc)
 		return .Io
 	}
 	persist_moves(h) or_return
