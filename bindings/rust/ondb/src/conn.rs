@@ -429,7 +429,7 @@ impl Client {
     }
 }
 
-pub const EVENT_NAMES: [&str; 34] = [
+pub const EVENT_NAMES: [&str; 35] = [
     "connected",
     "disconnected",
     "durable",
