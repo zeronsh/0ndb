@@ -276,10 +276,64 @@ _own_keys_verify :: proc(e: ^Engine, id: prim.Id, kind: Kind, out: ^[dynamic]str
 	return .None
 }
 
+@(private)
+_catalog_refs_verify :: proc(e: ^Engine, out: ^[dynamic]string) -> Error {
+	for sid in _sorted_keys(e.spaces) {
+		sp := e.spaces[sid]
+		if !sp.open || sp.keyless {
+			continue
+		}
+		h, herr := _catalog_handle(e, sp)
+		if herr != .None {
+			continue
+		}
+		if merr := _map_sync(e, h); merr != .None && merr != .Missing {
+			continue
+		}
+		for archived in ([2]bool{false, true}) {
+			cur: omap.Cursor
+			for {
+				rows, more, lerr := omap.catalog_list(&h.table, archived, &cur, 256, context.temp_allocator)
+				if lerr != .None {
+					return _oerr(lerr)
+				}
+				for r in rows {
+					if r.object == sp.catalog {
+						continue
+					}
+					c, found, gerr := omap.catalog_get(&h.table, r.object, context.temp_allocator)
+					if gerr != .None || !found {
+						continue
+					}
+					mine := false
+					for p in c.participants {
+						if p == e.self {
+							mine = true
+						}
+					}
+					if !mine {
+						continue
+					}
+					kind := Kind(c.kind)
+					n := _own_stream_len(e, r.object, kind) or_return
+					if n == 0 {
+						append(out, fmt.tprintf("catalog: %v %s lists this device as a participant but its own stream is absent", kind, prim.id_hex(r.object)))
+					}
+				}
+				if !more {
+					break
+				}
+			}
+		}
+	}
+	return .None
+}
+
 verify_derived :: proc(e: ^Engine, allocator := context.allocator) -> (notes: []string, err: Error) {
 	context = context_for(e)
 	out := make([dynamic]string, context.temp_allocator)
 	_reg_audit(e, nil, &out) or_return
+	_catalog_refs_verify(e, &out) or_return
 	objects := _reg_collect(e, ROOT_OBJECTS) or_return
 	for &f in objects {
 		if f.klen != 16 {
