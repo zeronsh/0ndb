@@ -3,10 +3,8 @@ package rt
 import "core:hash/xxhash"
 import "core:strings"
 import "../agent"
-import "../convo"
 import eng "../engine"
 import omap "../map"
-import "../obj"
 import "../prim"
 
 @(private)
@@ -265,141 +263,6 @@ port_import :: proc(r: ^Runtime, o: Object, desc: agent.Provider_Descriptor, ni:
 	ni.home = r.cfg.home_dir
 	native_put(r, o, ni^)
 	return ni.session, true
-}
-
-purge_hook :: proc(r: ^Runtime) -> eng.Purge_Hook {
-	return eng.Purge_Hook{data = r, purge = _purge}
-}
-
-@(private)
-_purge :: proc(data: rawptr, e: ^eng.Engine, req: ^eng.Purge_Request) {
-	context = eng.context_for((^Runtime)(data).e)
-	r := (^Runtime)(data)
-	if !r.opened {
-		return
-	}
-	o := req.object
-	raw_purge(r, o, req.msg, req.claim, req.bodies)
-	if p := proc_for(r, o); p != nil && p.run == nil {
-		proc_kill(p)
-	}
-	ni, found := native_get(r, o)
-	if !found || len(ni.session) == 0 {
-		return
-	}
-	desc, ok := _descriptor(r, ni.provider)
-	if !ok {
-		return
-	}
-	targets := make([dynamic]agent.Purge_Target, context.temp_allocator)
-	v, verr := eng.convo_view(r.e, o)
-	if verr == .None {
-		if t, terr := convo.view_tail(v, r.self, context.temp_allocator); terr == .None {
-			if m, merr := convo.message(v, &t, convo.Position{msg = req.msg}, context.temp_allocator); merr == .None {
-				if m.role == .Assistant {
-					sn := m.seal_native
-					to := sn if len(sn) > 0 && sn[0] != 0 else ""
-					if !obj.rid_none(m.parent) {
-						append(&targets, agent.Purge_Target{from = rid_uuid(m.parent), to = to, keep_from = true})
-					}
-				} else {
-					u := rid_uuid(req.msg)
-					append(&targets, agent.Purge_Target{from = u, to = u})
-				}
-			}
-		}
-	}
-	for t in req.texts {
-		if len(t) > 0 {
-			append(&targets, agent.Purge_Target{text = t})
-		}
-	}
-	if len(targets) == 0 {
-		return
-	}
-	cwd := ni.cwd
-	env := port_env(r, cwd)
-	plan := agent.purge_session(desc, env, ni.session, ni.native, targets[:], context.temp_allocator)
-	outputs := make(map[string]string, context.temp_allocator)
-	vfs := r.e.base
-	for step in plan.steps {
-		switch step.kind {
-		case .Edit, .Scrub:
-			paths := make([dynamic]Port_Entry, context.temp_allocator)
-			path := step.path
-			if len(step.match) > 0 {
-				path = _match_file(r, step.path, step.match)
-			}
-			st, serr := prim.stat(vfs, path)
-			if serr != .None {
-				continue
-			}
-			if st.kind == .Dir {
-				_walk_files(r, path, "", &paths, "", 0)
-			} else {
-				append(&paths, Port_Entry{path = path})
-			}
-			for pe in paths {
-				d, rerr := prim.read_file(vfs, pe.path, context.temp_allocator)
-				if rerr != .None {
-					continue
-				}
-				res := agent.purge_bytes(plan, d, context.temp_allocator) if step.kind == .Edit else agent.purge_text(plan, d, context.temp_allocator)
-				if string(res) != string(d) {
-					prim.replace_atomic(vfs, pe.path, res)
-				}
-			}
-		case .Delete:
-			path := step.path
-			if len(step.match) > 0 {
-				path = _match_file(r, step.path, step.match)
-			}
-			_remove_tree(r, path)
-		case .Write:
-			if s, has := outputs[step.key]; has {
-				res := agent.purge_bytes(plan, transmute([]u8)s, context.temp_allocator)
-				prim.replace_atomic(vfs, step.path, res)
-			}
-		case .Run:
-			_, out, _ := run_blocking(r, step.argv, step.cwd)
-			if len(step.key) > 0 {
-				outputs[step.key] = string(out)
-			}
-		case .Sql:
-			text, rerr := prim.read_file(vfs, step.launcher, context.temp_allocator)
-			interp := "python3"
-			if rerr == .None {
-				if py, _ := agent.launcher_interpreter(string(text)); len(py) > 0 {
-					interp = py
-				}
-			}
-			argv := make([dynamic]string, context.temp_allocator)
-			append(&argv, interp, "-c", step.script)
-			append(&argv, ..step.args)
-			run_blocking(r, argv[:], cwd)
-		}
-	}
-	if s := agent.purge_result(desc, plan, nil, context.temp_allocator); len(s) > 0 && s != ni.session {
-		ni.session = s
-	} else if plan.seeded {
-		ni.session = ""
-	}
-	meta := meta_object(o)
-	for &row in map_rows(r, meta, transmute([]u8)string(KEY_FILE), 4096) {
-		tid := entry_id(&row.entry, 1)
-		to := Object{o.space, tid}
-		if cur, cerr := eng.text_read(r.e, to, context.temp_allocator); cerr == .None && len(cur) > 0 {
-			eng.text_redact(r.e, to, 0, len(cur))
-		}
-		map_clear(r, meta, row.key, 1, 2, 3)
-	}
-	native_put(r, o, ni)
-	if len(ni.session) > 0 {
-		port_export(r, o, desc, &ni, cwd)
-	}
-	if p := proc_for(r, o); p != nil && p.run == nil {
-		_proc_close(p)
-	}
 }
 
 @(private)
