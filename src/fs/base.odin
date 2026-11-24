@@ -215,7 +215,7 @@ history_observations :: proc(h: ^History, from: crdt.Lv, out: ^[dynamic]Observat
 		at := first
 		for op in b.ops {
 			if op.kind == .Opaque && at >= lv && len(op.content) > 0 && op.content[0] == fshist.TOP_OBSERVE {
-				if o, dok := fshist.decode_observe(op.content, allocator); dok {
+				if o, dok := fshist.decode_observe(op.content, allocator); dok && o.kind != .Step {
 					o.path, _ = clone_string(o.path, allocator)
 					append(out, Observation{actor = b.actor, lv = at, op = o})
 				}
