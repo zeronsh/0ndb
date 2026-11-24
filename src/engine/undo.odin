@@ -220,6 +220,47 @@ convo_line_key :: proc(id: prim.Id, allocator := context.temp_allocator) -> stri
 	return strings.concatenate({"l/", string(h[:])}, allocator)
 }
 
+convo_warm :: proc(e: ^Engine, o: Object, ready: Ready = {}) -> Error {
+	context = context_for(e)
+	h := _handle_get(e, o, .Conversation) or_return
+	_handle_refresh(h)
+	err := _cu_warm(e, o, h)
+	if err != .None && err != .Missing {
+		return err
+	}
+	if err == .None && !_handle_waiting(h) {
+		convo_moves_settle(e, o)
+		return .None
+	}
+	if _space_cut_off(e, h.sp) {
+		return .Offline
+	}
+	return _pending_result(e, h, .Missing, ready)
+}
+
+convo_cold :: proc(e: ^Engine, o: Object) -> bool {
+	context = context_for(e)
+	h, herr := _handle_get(e, o, .Conversation)
+	if herr != .None || !_handle_waiting(h) {
+		return false
+	}
+	st, serr := convo_status(e, o)
+	return serr == .Missing || serr == .None && obj.rid_none(st.head)
+}
+
+@(private)
+_space_cut_off :: proc(e: ^Engine, sp: ^Space) -> bool {
+	return sp.repl_on && !sp.connected && (sp.offline || !_link_possible(e, sp))
+}
+
+@(private)
+_cu_warm :: proc(e: ^Engine, o: Object, h: ^Handle) -> Error {
+	_cu_position(e, o) or_return
+	convo_undos(e, o, context.temp_allocator) or_return
+	_, uerr := convo.undones(&h.view, context.temp_allocator)
+	return _oerr(uerr)
+}
+
 convo_undo :: proc(e: ^Engine, o: Object, msg: Rid) -> (undo: prim.Id, err: Error) {
 	context = context_for(e)
 	from := _cu_position(e, o) or_return

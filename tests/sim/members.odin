@@ -1286,7 +1286,7 @@ _short_id_wait :: proc(w: ^World, sid: prim.Id) {
 		return
 	}
 	free(fp, w.allocator)
-	if r, ok := _send(w, M_B, eng.Object{sid, got}, "via-short-id"); !ok || !_wait_read(w, M_A, o, r, "via-short-id", 20_000) {
+	if r, ok := _send_wait(w, M_B, eng.Object{sid, got}, "via-short-id", 20_000); !ok || !_wait_read(w, M_A, o, r, "via-short-id", 20_000) {
 		_fail(w, "short id: n0 cannot read what n1 sent through the resolved short id")
 	}
 }
@@ -1369,7 +1369,7 @@ _short_id_instant :: proc(w: ^World, sid: prim.Id) {
 		return
 	}
 	free(fp, w.allocator)
-	if r, ok := _send(w, M_B, eng.Object{sid, o.id}, "instant-via-short-id"); !ok || !_wait_read(w, M_A, o, r, "instant-via-short-id", 20_000) {
+	if r, ok := _send_wait(w, M_B, eng.Object{sid, o.id}, "instant-via-short-id", 20_000); !ok || !_wait_read(w, M_A, o, r, "instant-via-short-id", 20_000) {
 		_fail(w, "instant: n0 cannot read what n1 sent through the short id")
 	}
 	world_note(w, "instant short id: %d lookups before n1 knew of it, %d waits", unknown, waited)
