@@ -22,11 +22,17 @@ Pend_Kind :: enum u8 {
 	Truncate,
 }
 
+Fence :: struct {
+	seq: u64,
+	ino: u64,
+}
+
 Pend :: struct {
 	kind:  Pend_Kind,
 	off:   i64,
 	size:  i64,
 	bytes: []u8,
+	seq:   u64,
 }
 
 Inode :: struct {
@@ -102,6 +108,12 @@ Disk_Stats :: struct {
 }
 
 Disk :: struct {
+	wseq:      u64,
+	fences:    [dynamic]Fence,
+	fence_crash:   u64,
+	fence_crash_n: u64,
+	fence_crashes: u64,
+	fence_cuts:    u64,
 	quiet:     bool,
 	probe:     int,
 	freed_prefix: string,
@@ -168,6 +180,7 @@ DISK_PROCS := prim.Vfs_Procs {
 	write_at   = _d_write_at,
 	datasync   = _d_sync,
 	fullsync   = _d_sync,
+	barrier    = _d_barrier,
 	truncate   = _d_truncate,
 	punch_hole = _d_punch,
 	lock       = _d_lock,
@@ -231,6 +244,7 @@ disk_init :: proc(d: ^Disk, name: string, allocator: runtime.Allocator) {
 	d.meta = make([dynamic]Meta_Op, allocator)
 	d.events = make([dynamic]Watch_Ev, allocator)
 	d.grains = make([dynamic]Grain, allocator)
+	d.fences = make([dynamic]Fence, allocator)
 	d.next_ino = ROOT_INO
 	d.next_fd = 16
 	root := _inode_new(d, .Dir, 0o755)
@@ -256,6 +270,7 @@ disk_destroy :: proc(d: ^Disk) {
 		_meta_free(d, m)
 	}
 	delete(d.meta)
+	delete(d.fences)
 	for b in d.freed {
 		delete(b, d.allocator)
 	}
@@ -667,7 +682,8 @@ _d_open :: proc(data: rawptr, path: string, flags: prim.Open_Flags, mode: u32) -
 		if n.kind == .File && .Truncate in flags && .Write in flags && len(n.data) > 0 {
 			_event(d, path)
 			resize(&n.data, 0)
-			append(&n.pend, Pend{kind = .Truncate, size = 0})
+			d.wseq += 1
+			append(&n.pend, Pend{kind = .Truncate, size = 0, seq = d.wseq})
 			n.mtime_ns = _now(d)
 		}
 	}
@@ -750,7 +766,8 @@ _write :: proc(d: ^Disk, n: ^Inode, src: []u8, off: i64) -> prim.Error {
 	copy(n.data[off:end], src)
 	b := make([]u8, len(src), d.allocator)
 	copy(b, src)
-	append(&n.pend, Pend{kind = .Write, off = off, bytes = b})
+	d.wseq += 1
+	append(&n.pend, Pend{kind = .Write, off = off, bytes = b, seq = d.wseq})
 	d.pend_bytes += i64(len(src))
 	if d.pend_bytes > DISK_FILE_MAX && d.runaway_size == 0 {
 		d.runaway_size = d.pend_bytes
@@ -821,6 +838,16 @@ _d_write_at :: proc(data: rawptr, fd: prim.Fd, src: []u8, off: i64) -> prim.Erro
 
 @(private = "file")
 _d_sync :: proc(data: rawptr, fd: prim.Fd) -> prim.Error {
+	return _sync_fd(data, fd, false)
+}
+
+@(private = "file")
+_d_barrier :: proc(data: rawptr, fd: prim.Fd) -> prim.Error {
+	return _sync_fd(data, fd, true)
+}
+
+@(private = "file")
+_sync_fd :: proc(data: rawptr, fd: prim.Fd, barrier: bool) -> prim.Error {
 	d := (^Disk)(data)
 	if !_enter(d, 4) {
 		return .Io
@@ -850,6 +877,21 @@ _d_sync :: proc(data: rawptr, fd: prim.Fd) -> prim.Error {
 		_commit_dir(d, n.ino)
 		return .None
 	}
+	if barrier {
+		if len(n.pend) > 0 {
+			append(&d.fences, Fence{seq = d.wseq, ino = n.ino})
+			if d.fence_crash > 0 && d.crash_at == 0 && d.probe == 0 {
+				d.fence_crash_n += 1
+				if d.fence_crash_n % d.fence_crash == 0 {
+					d.fence_crash = 0
+					d.crash_at = d.stats.ops + 1
+					d.fence_crashes += 1
+				}
+			}
+		}
+		return .None
+	}
+	_fences_flush(d)
 	if d.probe == 0 {
 		d.stats.syncs += 1
 		if d.reg_crash > 0 && d.crash_at == 0 && strings.contains(of.path, "/pack/c") {
@@ -865,7 +907,28 @@ _d_sync :: proc(data: rawptr, fd: prim.Fd) -> prim.Error {
 			d.blob_crashes += 1
 		}
 	}
+	_pend_commit(d, n, max(u64), owned)
+	return .None
+}
+
+@(private = "file")
+_fences_flush :: proc(d: ^Disk) {
+	for f in d.fences {
+		if n, ok := d.inodes[f.ino]; ok && n.kind == .File {
+			_pend_commit(d, n, f.seq, false)
+		}
+	}
+	clear(&d.fences)
+}
+
+@(private = "file")
+_pend_commit :: proc(d: ^Disk, n: ^Inode, upto: u64, owned: bool) {
+	done := 0
 	for p in n.pend {
+		if p.seq > upto {
+			break
+		}
+		done += 1
 		switch p.kind {
 		case .Write:
 			end := int(p.off) + len(p.bytes)
@@ -877,6 +940,7 @@ _d_sync :: proc(data: rawptr, fd: prim.Fd) -> prim.Error {
 				}
 			}
 			copy(n.durable[p.off:end], p.bytes)
+			d.pend_bytes -= i64(len(p.bytes))
 		case .Truncate:
 			old := len(n.durable)
 			if d.lose_shrinks && int(p.size) < old {
@@ -899,9 +963,7 @@ _d_sync :: proc(data: rawptr, fd: prim.Fd) -> prim.Error {
 		}
 		delete(p.bytes, d.allocator)
 	}
-	_pend_drop(d, n)
-	clear(&n.pend)
-	return .None
+	remove_range(&n.pend, 0, done)
 }
 
 @(private = "file")
@@ -1007,7 +1069,8 @@ _d_truncate :: proc(data: rawptr, fd: prim.Fd, size: i64) -> prim.Error {
 	for i in old ..< int(size) {
 		n.data[i] = 0
 	}
-	append(&n.pend, Pend{kind = .Truncate, size = size})
+	d.wseq += 1
+	append(&n.pend, Pend{kind = .Truncate, size = size, seq = d.wseq})
 	n.mtime_ns = _now(d)
 	of.wrote = true
 	_event(d, of.path)
@@ -1487,6 +1550,7 @@ disk_crash :: proc(d: ^Disk, mode: Crash_Mode, r: ^Rng) {
 	disk_events_clear(d)
 	d.watching = false
 	if mode == .Process {
+		clear(&d.fences)
 		_collect(d)
 		return
 	}
@@ -1510,12 +1574,24 @@ disk_crash :: proc(d: ^Disk, mode: Crash_Mode, r: ^Rng) {
 		append(&ids, k)
 	}
 	slice.sort(ids[:])
+	cut := rng_int(r, len(d.fences) + 1) if len(d.fences) > 0 else 0
+	lost := d.fences[cut].seq if cut < len(d.fences) else max(u64)
+	if cut < len(d.fences) {
+		d.fence_cuts += 1
+	}
 	for k in ids {
 		n := d.inodes[k]
 		if n.kind == .File {
-			_recover_file(d, n, keep, r)
+			whole: u64
+			for f in d.fences[:cut] {
+				if f.ino == n.ino {
+					whole = max(whole, f.seq)
+				}
+			}
+			_recover_file(d, n, keep, r, whole, lost)
 		}
 	}
+	clear(&d.fences)
 	for k in ids {
 		n := d.inodes[k]
 		if n.kind == .Dir {
@@ -1532,10 +1608,16 @@ disk_crash :: proc(d: ^Disk, mode: Crash_Mode, r: ^Rng) {
 }
 
 @(private = "file")
-_recover_file :: proc(d: ^Disk, n: ^Inode, keep: u64, r: ^Rng) {
+_recover_file :: proc(d: ^Disk, n: ^Inode, keep_all: u64, r: ^Rng, whole, lost: u64) {
 	content := make([dynamic]u8, len(n.durable), d.allocator)
 	copy(content[:], n.durable[:])
 	for p in n.pend {
+		keep := keep_all
+		if p.seq <= whole {
+			keep = 4
+		} else if p.seq > lost {
+			keep = 0
+		}
 		switch p.kind {
 		case .Truncate:
 			if d.lose_shrinks && int(p.size) < len(content) {
