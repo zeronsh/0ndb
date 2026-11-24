@@ -4,7 +4,6 @@ import "core:fmt"
 import "core:os"
 import "core:strings"
 import "core:testing"
-import "../../src/crdt"
 import eng "../../src/engine"
 import "../../src/fs"
 import "../../src/prim"
@@ -107,7 +106,7 @@ _rt_run :: proc(w: ^World, cut: u64) -> (cuts: int) {
 		world_fail(w, "replay twice: mount missing")
 		return
 	}
-	{
+	setup: {
 		context = instance_context(&n.inst)
 		defer node_after(n)
 		hold := _rt_scope(w, n, sm, prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng)))
@@ -166,7 +165,7 @@ _rt_run :: proc(w: ^World, cut: u64) -> (cuts: int) {
 		}
 	}
 	n.disk.crash_at = 0
-	cuts = w.stats.crashes - crashes
+	cuts = int(w.stats.crashes - crashes)
 	_rt_settle(w, 30)
 	if !n.alive || _rt_mount(n) == nil {
 		world_fail(w, "replay twice: n0 is not mounted after the cuts")
@@ -230,7 +229,7 @@ replay_twice :: proc(t: ^testing.T) {
 			cuts, failures := _rt_case(seed, cut)
 			second += int(cuts > 0)
 			for f in failures {
-				if bad < 20 {
+				if bad < int(env_u64("RT_PRINT", 20)) {
 					fmt.eprintf("replay_twice seed %d cut %d: %s\n", seed, cut, f)
 				}
 				delete(f)
@@ -242,10 +241,8 @@ replay_twice :: proc(t: ^testing.T) {
 			}
 		}
 	}
+	fmt.eprintf("replay_twice: %d runs cut twice, %d failed\n", second, bad)
 	testing.expectf(t, bad == 0, "replay_twice: %d failures", bad)
 	testing.expectf(t, second > 0, "replay_twice never cut twice")
 	free_all(context.temp_allocator)
 }
-
-@(private = "file")
-_ :: crdt.Op_Id
