@@ -1231,6 +1231,8 @@ Change :: struct {
 	scope:   ^Scope,
 	actor:   prim.Id,
 	scope_id: prim.Id,
+	step: prim.Id,
+	base: Step_Base,
 	moved:   string,
 	carried: bool,
 	copy_src: fstree.Inode_Id,
@@ -1332,6 +1334,7 @@ commit_group :: proc(p: ^Pass, b: ^Builder, indices: []int) -> Error {
 		if err = emit_change(p, b, &p.changes[i]); err != .None {
 			break
 		}
+		step_mark(b, p.changes[i].step)
 	}
 	if err == .None {
 		err = builder_commit(m, b)
@@ -1357,8 +1360,8 @@ attribute_consumed :: proc(p: ^Pass, actor: prim.Id, idx: []int, scope := prim.I
 		if serr != .None || !found || e.oid == {} {
 			continue
 		}
-		attrib_set(m, c.path, actor, true, e.oid, scope)
-		attrib_log_append(m, c.path, actor, e.oid, scope) or_return
+		attrib_set(m, c.path, actor, true, e.oid, scope, c.base, c.step)
+		attrib_log_append(m, c.path, actor, e.oid, scope, c.base, c.step) or_return
 		logged = true
 	}
 	if logged {
@@ -1401,8 +1404,8 @@ attribute_changes :: proc(p: ^Pass) -> Error {
 			append(&steps, ..chain[:])
 			attrib_chain_drop(m, c.path)
 		}
-		if has && a.oid != {} && (len(steps) == 0 || steps[len(steps) - 1] != Attrib_Step{a.actor, a.oid, a.scope, a.base}) {
-			append(&steps, Attrib_Step{a.actor, a.oid, a.scope, a.base})
+		if has && a.oid != {} && (len(steps) == 0 || steps[len(steps) - 1] != Attrib_Step{a.actor, a.oid, a.scope, a.base, a.step}) {
+			append(&steps, Attrib_Step{a.actor, a.oid, a.scope, a.base, a.step})
 		}
 		if !m.lost {
 			kept := 0
@@ -1436,8 +1439,8 @@ attribute_changes :: proc(p: ^Pass) -> Error {
 		matched, broken, gone := false, false, false
 		replayed := false
 		cur := c.old.oid if c.kind == .Modify else odb.Oid{}
-		for st in steps_pending(m, steps[:], cur, c.old.inode) or_return {
-			if st.oid == cur {
+		for st in steps_pending(m, steps[:], cur) or_return {
+			if st.step == {} && st.oid == cur {
 				continue
 			}
 			if !odb.exists(m.db, st.oid) {
@@ -1509,9 +1512,10 @@ attrib_chain_settle :: proc(p: ^Pass) {
 }
 
 @(private)
-steps_pending :: proc(m: ^Mount, steps: []Attrib_Step, shown: odb.Oid, inode: fstree.Inode_Id) -> (pending: []Attrib_Step, err: Error) {
+steps_pending :: proc(m: ^Mount, steps: []Attrib_Step, shown: odb.Oid) -> (pending: []Attrib_Step, err: Error) {
 	#reverse for st, i in steps {
-		if (shown != {} && st.oid == shown) || (step_landed(m, st, inode) or_return) {
+		landed := history_step_landed(m.history, st.step) or_return
+		if landed || (st.step == {} && shown != {} && st.oid == shown) {
 			return steps[i + 1:], .None
 		}
 	}
@@ -1519,71 +1523,13 @@ steps_pending :: proc(m: ^Mount, steps: []Attrib_Step, shown: odb.Oid, inode: fs
 }
 
 @(private)
-STEP_WALK :: 4096
-
-@(private)
-step_landed :: proc(m: ^Mount, st: Attrib_Step, inode: fstree.Inode_Id) -> (landed: bool, err: Error) {
-	h := m.history
-	if st.scope == {} || st.oid == {} {
-		return false, .None
+step_mark :: proc(b: ^Builder, step: prim.Id) {
+	if step == {} {
+		return
 	}
-	t, data, rerr := odb.read(m.db, st.oid, context.temp_allocator)
-	if rerr != .None || t != .Blob {
-		return false, .None
-	}
-	hash := _content_hash(data)
-	target := inode_op(h, inode)
-	actors := make([dynamic]prim.Id, context.temp_allocator)
-	append(&actors, st.actor)
-	owned := history_owned_actors(h, []prim.Id{st.actor}, context.temp_allocator) or_return
-	append(&actors, ..owned)
-	for actor in actors {
-		seq := crdt.graph_known(&h.g, actor)
-		for n := 0; seq > 0 && n < STEP_WALK; n += 1 {
-			lv, ok := crdt.graph_lv(&h.g, crdt.Op_Id{actor, seq - 1})
-			if !ok {
-				break
-			}
-			first, _, stream, off, bok := history_batch_at(h, lv)
-			if !bok {
-				break
-			}
-			b, berr := history_read_batch(h, stream, off, context.temp_allocator)
-			if berr == .None {
-				mine, touches, merged := st.scope == actor, false, false
-				for op in b.ops {
-					if op.kind != .Opaque {
-						touches ||= op.target == target
-						continue
-					}
-					if len(op.content) == 0 {
-						continue
-					}
-					if sc, sok := fshist.decode_scope(op.content); sok {
-						mine ||= sc == st.scope
-					}
-					if op.content[0] == fshist.TOP_OBSERVE {
-						if o, dok := fshist.decode_observe(op.content); dok && o.kind == .Step && o.inode == target && o.hash == hash {
-							merged = true
-						}
-					}
-				}
-				if mine && merged {
-					return true, .None
-				}
-				if mine && touches {
-					end := [1]crdt.Op_Id{{actor, b.seq + u64(crdt.batch_len(&b)) - 1}}
-					text, terr := history_text_at(h, inode, end[:], context.temp_allocator)
-					if terr == .None && string(text) == string(data) {
-						return true, .None
-					}
-				}
-			}
-			back := u64(lv - first) + 1
-			seq = seq - min(seq, back)
-		}
-	}
-	return false, .None
+	buf := make([dynamic]u8, context.temp_allocator)
+	fshist.encode_step(&buf, step)
+	builder_opaque(b, buf[:])
 }
 
 @(private)
@@ -1614,8 +1560,8 @@ replay_departing :: proc(m: ^Mount, long: runtime.Allocator, replayed: ^map[fstr
 		}
 		c := Change{kind = .Modify, path = path, disk = .File, old = e}
 		cur := e.oid
-		for st in steps_pending(m, steps, e.oid, e.inode) or_return {
-			if st.oid == cur {
+		for st in steps_pending(m, steps, e.oid) or_return {
+			if st.step == {} && st.oid == cur {
 				continue
 			}
 			if !odb.exists(m.db, st.oid) {
@@ -1642,6 +1588,14 @@ replay_step :: proc(p: ^Pass, c: ^Change, st: Attrib_Step) -> (committed: bool, 
 		return attribute_step(p, c, st)
 	}
 	inode := c.old.inode
+	if st.step == {} && st.scope == {} {
+		if version_reads(m, inode, m.synced[:], st.oid) {
+			return true, .None
+		}
+		if head, found := history_line(h, m.line, context.temp_allocator) or_return; found && version_reads(m, inode, head, st.oid) {
+			return true, .None
+		}
+	}
 	if .Opaque in tree_flags(h, inode) {
 		return attribute_step(p, c, st)
 	}
@@ -1665,6 +1619,7 @@ replay_step :: proc(p: ^Pass, c: ^Change, st: Attrib_Step) -> (committed: bool, 
 		first.stat = {}
 		first.scope = nil
 		first.scope_id = st.scope
+		first.step = st.step
 		done, rerr := rebase_commit(p, &first, v, inode, actor, event)
 		key, _ := delete_key(&m.override, k)
 		delete(key, m.allocator)
@@ -1792,9 +1747,7 @@ replay_merge :: proc(p: ^Pass, c: ^Change, st: Attrib_Step, actor: prim.Id, inod
 				b.scope = scope_marker(actor, st.scope)
 			}
 			emit_text_edits(m, &b, inode, c.path, line_text, merged) or_return
-			buf := make([dynamic]u8, context.temp_allocator)
-			fshist.encode_observe(&buf, fshist.Observe_Op{kind = .Step, inode = inode_op(h, inode), path = c.path, version = head, hash = _content_hash(data)})
-			builder_opaque(&b, buf[:])
+			step_mark(&b, st.step)
 			if b.scope != nil {
 				builder_opaque(&b, b.scope)
 				b.scope = nil
@@ -1865,6 +1818,7 @@ attribute_step :: proc(p: ^Pass, c: ^Change, st: Attrib_Step) -> (committed: boo
 	b: Builder
 	builder_init(&b, m.history, actor)
 	b.scope = scope_marker(actor, st.scope)
+	step_mark(&b, st.step)
 	attrib_set(m, c.path, st.actor, true, st.oid, st.scope)
 	shadow_txn_begin(&m.shadow)
 	eerr := emit_change(p, &b, &first)
@@ -2650,7 +2604,15 @@ pass_flush :: proc(p: ^Pass, final := true) -> Error {
 			emit_order(p, idx)
 			if actor != m.actor {
 				for i in idx {
-					attrib_set(m, p.changes[i].path, actor, true, {}, group_scope[key])
+					c := &p.changes[i]
+					if a, has := m.attrib[c.path]; has && !a.used {
+						c.step = a.step
+						c.base = a.base
+					}
+					if c.step == {} && (c.kind == .Modify || c.kind == .Create) && c.disk == .File {
+						c.step = step_new(m)
+					}
+					attrib_set(m, c.path, actor, true, {}, group_scope[key])
 				}
 			}
 			for lo := 0; lo < len(idx); lo += PASS_CHUNK {
