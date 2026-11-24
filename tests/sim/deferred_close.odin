@@ -2,13 +2,15 @@ package sim
 
 import "core:strings"
 import "../../src/fs"
+import "../../src/prim"
 
 @(private = "file")
 Deferred_Close :: struct {
-	node: int,
-	inc:  int,
-	root: string,
-	path: string,
+	node:  int,
+	inc:   int,
+	root:  string,
+	path:  string,
+	actor: prim.Id,
 }
 
 @(private = "file")
@@ -43,15 +45,15 @@ _closes_destroy :: proc(w: ^World) {
 	_closes = nil
 }
 
-deferred_close_note :: proc(w: ^World, n: ^Node, root: string, path: string) {
+deferred_close_note :: proc(w: ^World, n: ^Node, root: string, path: string, actor: prim.Id) {
 	stat_add(w, STAT_CLOSE_DEFERRED)
 	world_note(w, "%s a scope close on %s/%s is deferred; its base outcome is owed", n.name, root, path)
-	append(&_closes, Deferred_Close{n.idx, int(n.incarnation), strings.clone(root, w.allocator), strings.clone(path, w.allocator)})
+	append(&_closes, Deferred_Close{n.idx, int(n.incarnation), strings.clone(root, w.allocator), strings.clone(path, w.allocator), actor})
 }
 
-deferred_close_outcome :: proc(w: ^World, n: ^Node, root: string, path: string, note: fs.Base_Note) {
+deferred_close_outcome :: proc(w: ^World, n: ^Node, root: string, path: string, note: fs.Base_Note, actor: prim.Id) {
 	for c, i in _closes {
-		if c.node != n.idx || c.inc != int(n.incarnation) || c.root != root || c.path != path {
+		if c.node != n.idx || c.inc != int(n.incarnation) || c.root != root || c.path != path || c.actor != actor {
 			continue
 		}
 		if note != .Merged && note != .Current {

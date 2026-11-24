@@ -410,7 +410,7 @@ _on_base :: proc(m: ^fs.Mount, rel: string, note: fs.Base_Note, actor: prim.Id, 
 		stat_add(w, STAT_BASE_OTHER)
 	}
 	world_note(w, "%s agent base for %s: %v", n.name, rel, note)
-	deferred_close_outcome(w, n, m.root, rel, note)
+	deferred_close_outcome(w, n, m.root, rel, note, actor)
 }
 
 @(private = "file")
@@ -1680,7 +1680,7 @@ op_agent_chain :: proc(w: ^World, n: ^Node) {
 	gained := stat_get(&w.stats, STAT_BASE_MERGED) + stat_get(&w.stats, STAT_BASE_CURRENT) - good
 	lost := stat_get(&w.stats, STAT_BASE_MISMATCH) + stat_get(&w.stats, STAT_BASE_OTHER) - bad
 	if gained == 0 && lost == 0 {
-		deferred_close_note(w, n, sm.root, name)
+		deferred_close_note(w, n, sm.root, name, actor)
 		return
 	}
 	if gained != 1 || lost != 0 {
