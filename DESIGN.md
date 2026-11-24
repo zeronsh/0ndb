@@ -851,7 +851,11 @@ equal in both directions.
   `Deferred` stays where it is: a pass whose catch-up defers stops before it
   ingests, the switch stays in its phase, `mount_materialize` returns as it
   does when the line is not yet durable, and `mount_sync` reports `Deferred`
-  so a closing scope records its attribution for the pass that resumes.
+  so a closing scope records its attribution for the pass that resumes, and
+  a rewind whose sync defers is queued on the mount and run by the next pass
+  that settles, before it materializes, instead of failing (the mount does
+  not hibernate while one is queued; a queue lost to a crash leaves the
+  rewind to its caller, like a lost Busy).
   While a materialization is held, the image keeps its journal position, so
   recovery replays an own batch the held `synced` does not contain. Disk
   only ever holds content history can name after any crash. Ingest never reads an owed path that is missing on disk

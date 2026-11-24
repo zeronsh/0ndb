@@ -1180,7 +1180,16 @@ _bs_run :: proc(w: ^World, arena: ^virtual.Arena) {
 			}
 			slice.sort_by(keys[:], proc(a, b: obj.Rid) -> bool {return a.off < b.off})
 			target := keys[rng_int(&w.rng, len(keys))]
-			world_note(w, "branch seeds: %s switch to %v", label, target)
+			young := rng_chance(&w.rng, 1, 2)
+			world_note(w, "branch seeds: %s switch to %v (person's file young %v)", label, target, young)
+			if young {
+				b.tok += 1
+				b.person = fmt.aprintf("%s<y%d>\n", b.person, b.tok, allocator = alloc)
+				if !_br_write(c, false, "p.txt", b.person) {
+					world_fail(w, "branch seeds: %s: the person's young edit failed", label)
+					return
+				}
+			}
 			leaf: obj.Rid
 			{
 				context = instance_context(&n.inst)
