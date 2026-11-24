@@ -29,8 +29,14 @@ empty_dir_moved | e/=                     | mv e f                              
 create          | a.txt=x                 | write b.txt hello
 delete          | a.txt=x b.txt=y         | rm b.txt
 recreate        | a.txt=x                 | rm a.txt; write a.txt again
-recreate_other  | a.txt=x                 | rm a.txt; mkdir a.txt; write a.txt/in.txt z     | file replaced by a directory known:revert
-dir_to_file     | d/=  d/f.txt=x          | rmtree d; write d dfile                          | directory replaced by a file known:revert
+recreate_other  | a.txt=x                 | rm a.txt; mkdir a.txt; write a.txt/in.txt z     | file replaced by a directory
+dir_to_file     | d/=  d/f.txt=x          | rmtree d; write d dfile                          | directory replaced by a file
+dir_to_link     | k.txt=y d/=  d/f.txt=x  | rmtree d; ln_s k.txt d                            | directory replaced by a symlink to a file
+dir_to_dir_link | k/=  k/g.txt=y d/=  d/f.txt=x | rmtree d; ln_s k d                          | directory replaced by a symlink to a directory
+link_to_dir     | k.txt=y d->k.txt        | rm d; mkdir d; write d/f.txt z                    | symlink replaced by a directory | known:crash
+dir_to_loop     | d/=  d/f.txt=x          | rmtree d; ln_s d d                                | directory replaced by a symlink to itself
+tree_to_loop    | d/f.txt=x d/g/h.txt=y   | rmtree d; ln_s d d                                | the removed subdirectory's path runs through the loop
+tree_to_link    | k/g/z.txt=y d/g/h.txt=x | rmtree d; ln_s k d                                | the removed subdirectory's path runs into another tree
 rename          | a.txt=x                 | mv a.txt b.txt
 case_rename     | a.txt=x                 | mv a.txt A.txt                                    | case-only
 binary          | a.txt=x                 | write_bin b.bin 4096                              | bytes 0..255 incl. NUL
@@ -56,4 +62,4 @@ person_new_edit | k.txt=x               | write n.txt A\nB\nC; person n.txt A\nP
 person_new_add  | k.txt=x               | write n.txt A\nB; person n.txt A\nP\nB                  | undo:n.txt=P known:revert
 person_new_del  | k.txt=x               | write n.txt A\nB\nC; person n.txt A\nC                  | undo:n.txt=-
 move_deep_dir   | a.txt=x                 | mkdir b; mkdir b/c; mv a.txt b/c/a.txt
-dir_swap_child  | d/f.txt=x               | mv d/f.txt f.txt; rmdir d; write d dfile | the path of an emptied directory reused by a file known:revert
+dir_swap_child  | d/f.txt=x               | mv d/f.txt f.txt; rmdir d; write d dfile | the path of an emptied directory reused by a file | known:crash
