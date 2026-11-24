@@ -1361,6 +1361,12 @@ attribute_consumed :: proc(p: ^Pass, actor: prim.Id, idx: []int, scope := prim.I
 		if serr != .None || !found || e.oid == {} {
 			continue
 		}
+		if m.db != nil && !odb.exists(m.db, e.oid) {
+			data, oid, _, ok := read_content(m, c.path, c.stat, e.inode, true) or_return
+			if ok && oid == e.oid {
+				odb.write(m.db, .Blob, data)
+			}
+		}
 		attrib_set(m, c.path, actor, true, e.oid, scope, c.base, c.step, c.at)
 		attrib_log_append(m, c.path, actor, e.oid, scope, c.base, c.step, c.at) or_return
 		logged = true
@@ -1429,7 +1435,7 @@ attribute_changes :: proc(p: ^Pass) -> Error {
 			}
 			continue
 		}
-		_, disk_oid, _, ok := read_content(m, c.path, c.stat, c.old.inode, c.kind == .Modify) or_return
+		disk_data, disk_oid, _, ok := read_content(m, c.path, c.stat, c.old.inode, c.kind == .Modify) or_return
 		if !ok {
 			if has {
 				c.actor = a.actor
@@ -1446,8 +1452,14 @@ attribute_changes :: proc(p: ^Pass) -> Error {
 				continue
 			}
 			if !odb.exists(m.db, st.oid) {
-				broken = true
-				break
+				stored: odb.Oid
+				if st.oid == disk_oid {
+					stored, _ = odb.write(m.db, .Blob, disk_data)
+				}
+				if stored != st.oid {
+					broken = true
+					break
+				}
 			}
 			committed := replay_step(p, &c, st) or_return
 			if !committed {
