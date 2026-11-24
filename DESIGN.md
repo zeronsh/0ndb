@@ -737,7 +737,11 @@ equal in both directions.
   generation bumped, only when the saved image covers every live entry (a
   scope whose close fails syncs the log after appending its pending
   attributions, so they survive a power loss); on
-  open the records past the image's offset are replayed over it. A crash
+  open the records past the image's offset are replayed over it. A closed
+  scope whose write replaced stored content appends two records, the base the
+  write is diffed from and then the writer's content. Replay adds the base
+  record to the path's steps without replacing a pending observation, so a
+  crash between the two still credits the writer. A crash
   that loses a history commit therefore reopens with the attributions that
   commit consumed still pending, and the re-detected change is credited to
   its writer, not to the device. An observation record is synced before the
