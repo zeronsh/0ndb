@@ -746,3 +746,19 @@ _index_tree :: proc(e: ^Engine, h: ^Handle, budget: int) -> (used: int, more: bo
 	}
 	return max(used, 1), to < end
 }
+
+@(private)
+_index_reindex :: proc(e: ^Engine, h: ^Handle) {
+	if !e.cfg.search {
+		return
+	}
+	if _index_open(e) != .None {
+		return
+	}
+	search.delete_content(&e.index, _source_id(h.id, e.self), 0, h.id)
+	for s in h.segs {
+		search.advance(&e.index, _source_id(h.id, s.device), 0)
+	}
+	search.erase(&e.index)
+	_index_item_add(e, h.sp.id, h.id, h.kind)
+}
