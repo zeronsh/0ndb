@@ -113,7 +113,7 @@ OPS := []Op {
 	{92, "tree.remove", {OBJ, {"path", .Str, nil}, LINE}, "line:str", op_tree_remove},
 	{93, "tree.mount", {OBJ, {"root", .Str, nil}}, "", op_tree_mount},
 	{94, "tree.unmount", {OBJ, {"root", .Str, nil}}, "", op_tree_unmount},
-	{95, "tree.mounts", {}, "mounts:[Mounted]", op_tree_mounts},
+	{95, "tree.mounts", {}, "mounts:[Mounted], refused:[Refused]", op_tree_mounts},
 	{96, "tree.blame", {OBJ, {"path", .Str, nil}, LINE}, "line:str text:str spans:[Span]", op_tree_blame},
 	{97, "tree.sync", {OBJ, {"root", .Str, nil}}, "", op_tree_sync},
 	{98, "tree.find", {{"path", .Str, nil}}, "object:object root:str rel:str", op_tree_find},

@@ -241,7 +241,7 @@ daemon_main :: proc(args: ^Args) -> int {
 	d.started = prim.now_ms()
 	for m in d.state.mounts {
 		if _, st := api.mount_open(&d.s.a, m.object, m.root); st != .Ok {
-			fmt.eprintfln("0ndb: cannot remount %s: %s", m.root, api.STATUS_NAMES[int(st)])
+			fmt.eprintfln("0ndb: cannot remount %s: %s%s", m.root, api.STATUS_NAMES[int(st)], status_hint(st))
 		}
 	}
 	acct_started(d, args)
@@ -1284,6 +1284,9 @@ op_mount_remove :: proc(c: ^api.Call, o: ^api.Out) -> api.Status {
 			found = true
 			break
 		}
+	}
+	if eng.tree_refused_clear(c.api.e, root) {
+		found = true
 	}
 	_state_save(d)
 	return .Ok if found else .Not_Found

@@ -144,6 +144,7 @@ Status codes (the same in Result frames, plug replies and error payloads):
 | 6 | closed | 15 | unsupported | 24 | budget |
 | 7 | offline | 16 | not_assigned | 25 | spawn |
 | 8 | permission | 17 | no_space | 26 | timeout |
+| | | | | 27 | newer |
 
 `pending` never appears on the wire. `bad_request` is a malformed request,
 `unknown_op` an op the daemon does not have (check `describe`).
@@ -785,7 +786,7 @@ up exist only over the socket.
 | 92 | `tree.remove` | object: object, path: str, line: str | line:str |
 | 93 | `tree.mount` | object: object, root: str | {} |
 | 94 | `tree.unmount` | object: object, root: str | {} |
-| 95 | `tree.mounts` | – | mounts:[Mounted] |
+| 95 | `tree.mounts` | – | mounts:[Mounted], refused:[Refused] |
 | 96 | `tree.blame` | object: object, path: str, line: str | line:str text:str spans:[Span] |
 | 97 | `tree.sync` | object: object, root: str | {} |
 | 98 | `tree.find` | path: str | object:object root:str rel:str |
