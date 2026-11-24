@@ -33,6 +33,7 @@ Win_Watch :: struct {
 	git:     bool,
 	pending: int,
 	dead:    bool,
+	dir_id:  int,
 }
 
 _Registry_Os :: struct {
@@ -109,7 +110,7 @@ open_watch_handle :: proc(vfs: prim.Vfs, dir: string) -> (win.HANDLE, Error) {
 }
 
 @(private)
-add_watch :: proc(reg: ^Registry, m: ^Mount, dir: string, git: bool) -> Error {
+add_watch :: proc(reg: ^Registry, m: ^Mount, dir: string, git: bool, dir_id := -1) -> Error {
 	h, err := open_watch_handle(reg.vfs, dir)
 	if err != .None {
 		return err
@@ -123,6 +124,7 @@ add_watch :: proc(reg: ^Registry, m: ^Mount, dir: string, git: bool) -> Error {
 	w.m = m
 	w.handle = h
 	w.git = git
+	w.dir_id = dir_id
 	w.dir, _ = clone_string(dir, reg.allocator)
 	append(&reg.os.watches, w)
 	if reg.loop != nil {
@@ -154,7 +156,7 @@ watch_arm :: proc(w: ^Win_Watch) -> bool {
 		watch_fail(w)
 		return false
 	}
-	ok := win.ReadDirectoryChangesExW(w.handle, raw_data(op.buf), u32(len(op.buf)), win.BOOL(!w.git), GIT_FILTER if w.git else WATCH_FILTER, nil, (^win.OVERLAPPED)(prim.overlapped_ptr(op)), nil, .ReadDirectoryNotifyExtendedInformation)
+	ok := win.ReadDirectoryChangesExW(w.handle, raw_data(op.buf), u32(len(op.buf)), win.BOOL(!w.git && w.dir_id < 0), GIT_FILTER if w.git else WATCH_FILTER, nil, (^win.OVERLAPPED)(prim.overlapped_ptr(op)), nil, .ReadDirectoryNotifyExtendedInformation)
 	if prim.overlapped_submit(l, op, bool(ok)) != .None {
 		watch_fail(w)
 		return false
@@ -171,7 +173,9 @@ watch_fail :: proc(w: ^Win_Watch) {
 	w.dead = true
 	w.reg.os.full = true
 	w.reg.os.got = true
-	if w.git {
+	if w.dir_id >= 0 {
+		registry_dir_event(w.reg, w.dir_id, "")
+	} else if w.git {
 		mount_mark_git(w.m)
 	} else {
 		note_unwatched(w.m, "")
@@ -209,7 +213,9 @@ watch_done :: proc(l: ^prim.Loop, wt: prim.Watch, op: ^prim.Overlapped_Op, bytes
 		watch_arm(w)
 	}
 	if bytes == 0 || op.status == STATUS_NOTIFY_ENUM_DIR || bytes > len(op.buf) {
-		if w.git {
+		if w.dir_id >= 0 {
+			registry_dir_event(reg, w.dir_id, "")
+		} else if w.git {
 			mount_mark_git(w.m)
 		} else {
 			watch_lost(w.m)
@@ -247,6 +253,10 @@ watch_parse :: proc(w: ^Win_Watch, buf: []u8) {
 		if action == win.FILE_ACTION_MODIFIED && attrs & ATTR_DIRECTORY != 0 && attrs & ATTR_REPARSE == 0 {
 			continue
 		}
+		if w.dir_id >= 0 {
+			registry_dir_event(reg, w.dir_id, string(pbuf[base + 1:base + 1 + n]))
+			continue
+		}
 		abs := string(pbuf[:base + 1 + n])
 		registry_notify(reg, abs, .Gone if action == win.FILE_ACTION_REMOVED || action == win.FILE_ACTION_RENAMED_OLD_NAME else .Changed)
 	}
@@ -282,6 +292,22 @@ _unwatch_mount :: proc(reg: ^Registry, m: ^Mount) {
 @(private)
 _os_watch_dir :: proc(reg: ^Registry, m: ^Mount, rel: string, parent_wd: i32) -> (wd: i32, err: Error) {
 	return -1, .None
+}
+
+@(private)
+_os_watch_path :: proc(reg: ^Registry, id: int, path: string) -> Error {
+	return add_watch(reg, nil, path, false, id)
+}
+
+@(private)
+_os_unwatch_path :: proc(reg: ^Registry, id: int) {
+	for w, i in reg.os.watches {
+		if w.dir_id == id {
+			watch_close(reg, w)
+			ordered_remove(&reg.os.watches, i)
+			return
+		}
+	}
 }
 
 @(private)

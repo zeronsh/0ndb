@@ -77,6 +77,7 @@ Registry :: struct {
 	run_dir:   string,
 	mounts:    [dynamic]^Mount,
 	scopes:    [dynamic]^Scope,
+	dirs:      [dynamic]^Dir_Watch,
 	loop:      ^prim.Loop,
 	os:        _Registry_Os,
 	on_ready:  proc(m: ^Mount, data: rawptr),
@@ -211,6 +212,8 @@ Watcher :: struct {
 	watch:     proc(data: rawptr, reg: ^Registry, m: ^Mount) -> Error,
 	unwatch:   proc(data: rawptr, reg: ^Registry, m: ^Mount),
 	watch_dir: proc(data: rawptr, reg: ^Registry, m: ^Mount, rel: string, parent: i32) -> (i32, Error),
+	watch_path:   proc(data: rawptr, reg: ^Registry, id: int, path: string) -> Error,
+	unwatch_path: proc(data: rawptr, reg: ^Registry, id: int),
 	poll:      proc(data: rawptr, reg: ^Registry) -> Error,
 	wait:      proc(data: rawptr, reg: ^Registry, ms: i32) -> bool,
 	exhausted: proc(data: rawptr, reg: ^Registry) -> bool,
@@ -243,6 +246,12 @@ os_watcher :: proc() -> Watcher {
 		watch_dir = proc(data: rawptr, reg: ^Registry, m: ^Mount, rel: string, parent: i32) -> (i32, Error) {
 			return _os_watch_dir(reg, m, rel, parent)
 		},
+		watch_path = proc(data: rawptr, reg: ^Registry, id: int, path: string) -> Error {
+			return _os_watch_path(reg, id, path)
+		},
+		unwatch_path = proc(data: rawptr, reg: ^Registry, id: int) {
+			_os_unwatch_path(reg, id)
+		},
 		poll = proc(data: rawptr, reg: ^Registry) -> Error {
 			return _registry_os_read(reg)
 		},
@@ -253,6 +262,73 @@ os_watcher :: proc() -> Watcher {
 			return reg.os.full
 		},
 	}
+}
+
+Dir_Watch_Proc :: #type proc(data: rawptr, name: string)
+
+@(private)
+Dir_Watch :: struct {
+	path: string,
+	cb:   Dir_Watch_Proc,
+	data: rawptr,
+	wd:   i32,
+}
+
+@(private)
+DIR_WATCH_SLOT :: 1 << 24
+
+registry_watch_dir :: proc(reg: ^Registry, path: string, cb: Dir_Watch_Proc, data: rawptr) -> (id: int, err: Error) {
+	w := reg.watcher
+	if w.watch_path == nil || w.unwatch_path == nil {
+		return -1, .Unsupported
+	}
+	registry_ready(reg) or_return
+	id = -1
+	for d, i in reg.dirs {
+		if d == nil {
+			id = i
+			break
+		}
+	}
+	if id < 0 {
+		append(&reg.dirs, nil)
+		id = len(reg.dirs) - 1
+	}
+	dw := new(Dir_Watch, reg.allocator)
+	dw.path, _ = clone_string(path, reg.allocator)
+	dw.cb = cb
+	dw.data = data
+	dw.wd = -1
+	reg.dirs[id] = dw
+	if werr := w.watch_path(w.data, reg, id, dw.path); werr != .None {
+		delete(dw.path, reg.allocator)
+		free(dw, reg.allocator)
+		reg.dirs[id] = nil
+		return -1, werr
+	}
+	return id, .None
+}
+
+registry_unwatch_dir :: proc(reg: ^Registry, id: int) {
+	if id < 0 || id >= len(reg.dirs) || reg.dirs[id] == nil {
+		return
+	}
+	if reg.watcher.unwatch_path != nil {
+		reg.watcher.unwatch_path(reg.watcher.data, reg, id)
+	}
+	dw := reg.dirs[id]
+	reg.dirs[id] = nil
+	delete(dw.path, reg.allocator)
+	free(dw, reg.allocator)
+}
+
+@(private)
+registry_dir_event :: proc(reg: ^Registry, id: int, name: string) {
+	if id < 0 || id >= len(reg.dirs) || reg.dirs[id] == nil {
+		return
+	}
+	dw := reg.dirs[id]
+	dw.cb(dw.data, name)
 }
 
 registry_set_watcher :: proc(reg: ^Registry, w: Watcher) -> Error {
@@ -478,6 +554,7 @@ registry_init :: proc(reg: ^Registry, vfs: prim.Vfs, run_dir: string, allocator 
 	reg.run_dir = d
 	reg.mounts = make([dynamic]^Mount, allocator)
 	reg.scopes = make([dynamic]^Scope, allocator)
+	reg.dirs = make([dynamic]^Dir_Watch, allocator)
 	return .None
 }
 
@@ -502,6 +579,10 @@ registry_destroy :: proc(reg: ^Registry) {
 	if reg.observer.stop != nil {
 		reg.observer.stop(reg.observer.data, reg)
 	}
+	for _, i in reg.dirs {
+		registry_unwatch_dir(reg, i)
+	}
+	delete(reg.dirs)
 	if reg.os_ready && reg.watcher.stop != nil {
 		reg.watcher.stop(reg.watcher.data, reg)
 	}
