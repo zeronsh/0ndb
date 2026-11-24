@@ -2,6 +2,7 @@ package fs
 
 import "core:mem/virtual"
 import "core:slice"
+import "core:strings"
 import "../crdt"
 import "../fshist"
 import "../fstree"
@@ -43,16 +44,48 @@ Set_Ctx :: struct {
 }
 
 @(private)
-Revert_Unit :: struct {
-	src:     crdt.Op_Id,
+Kept_Piece :: struct {
+	src:    crdt.Op_Id,
+	len:    int,
+	pos:    int,
+	vis:    bool,
+	nl:     bool,
+	in_b:   bool,
+	in_t:   bool,
+	out:    bool,
+	outdel: bool,
+	out_lv: crdt.Lv,
+	b:      int,
+	t:      int,
+	text:   []u8,
+}
+
+@(private)
+Kept_Line :: struct {
+	first:   int,
+	last:    int,
 	len:     int,
-	pos:     int,
-	visible: bool,
-	ins:     crdt.Revert_Class,
-	del:     crdt.Revert_Classes,
-	out_lv:  crdt.Lv,
-	line:    int,
-	after:   bool,
+	pair:    int,
+	hunk:    int,
+	anchor:  bool,
+	shared:  bool,
+	touched: bool,
+	outdel:  bool,
+}
+
+@(private)
+Kept_Hunk :: struct {
+	t0, t1: int,
+	b0, b1: int,
+	frozen: bool,
+}
+
+@(private)
+Kept_Edit :: struct {
+	pos:  int,
+	del:  int,
+	ins:  int,
+	hunk: int,
 }
 
 @(private)
@@ -188,9 +221,11 @@ history_revert_set :: proc(h: ^History, line: string, base: Version, current: Ve
 	b: Builder
 	builder_init(&b, h, revert)
 	conflicts := make([dynamic]fshist.Revert_Conflict, context.temp_allocator)
+	drops := make(map[fstree.Inode_Id]bool, context.temp_allocator)
+	revert_drops(h, touched, events, &snap_b, &snap_c, bl[:], cl[:], &ctx, &drops) or_return
 	for ino in sorted_inodes(touched) {
 		ev := events[ino]
-		revert_inode(h, &b, ino, ev, &snap_b, &snap_c, bl[:], cl[:], &ctx, &conflicts) or_return
+		revert_inode(h, &b, ino, ev, &snap_b, &snap_c, bl[:], cl[:], &ctx, &conflicts, drops) or_return
 		history_unload_files(h)
 	}
 	if b.n == 0 {
@@ -331,7 +366,54 @@ collect_revert_events :: proc(h: ^History, ctx: ^Set_Ctx, events: ^map[fstree.In
 }
 
 @(private)
-revert_inode :: proc(h: ^History, b: ^Builder, ino: fstree.Inode_Id, ev: ^Inode_Events, snap_b, snap_c: ^fstree.Snapshot, bl, cl: []crdt.Lv, ctx: ^Set_Ctx, conflicts: ^[dynamic]fshist.Revert_Conflict) -> Error {
+revert_drops :: proc(h: ^History, touched: map[fstree.Inode_Id]bool, events: map[fstree.Inode_Id]^Inode_Events, snap_b, snap_c: ^fstree.Snapshot, bl, cl: []crdt.Lv, ctx: ^Set_Ctx, drops: ^map[fstree.Inode_Id]bool) -> Error {
+	dirs := make([dynamic]fstree.Inode_Id, context.temp_allocator)
+	for ino in sorted_inodes(touched) {
+		ev := events[ino]
+		ib, okb, e1 := fstree.info(snap_b, ino, context.temp_allocator)
+		ic, okc, e2 := fstree.info(snap_c, ino, context.temp_allocator)
+		if e1 != nil || e2 != nil {
+			return .Corrupt
+		}
+		if okb && ib.present || !okc || !ic.present || !ev.last[.Exist].set || ev.last[.Exist].class != .In {
+			continue
+		}
+		if ic.kind == .File && ev.out_body {
+			stays := revert_stays(h, ino, ev, &ic, bl, cl, ctx) or_return
+			history_unload_files(h)
+			if stays {
+				continue
+			}
+		}
+		drops[ino] = true
+		if ic.kind == .Dir {
+			append(&dirs, ino)
+		}
+	}
+	for again := true; again; {
+		again = false
+		for d in dirs {
+			if d not_in drops {
+				continue
+			}
+			kids, kerr := fstree.children(snap_c, d, allocator = context.temp_allocator)
+			if kerr != nil {
+				return .Corrupt
+			}
+			for k in kids {
+				if k.inode not_in drops {
+					delete_key(drops, d)
+					again = true
+					break
+				}
+			}
+		}
+	}
+	return .None
+}
+
+@(private)
+revert_inode :: proc(h: ^History, b: ^Builder, ino: fstree.Inode_Id, ev: ^Inode_Events, snap_b, snap_c: ^fstree.Snapshot, bl, cl: []crdt.Lv, ctx: ^Set_Ctx, conflicts: ^[dynamic]fshist.Revert_Conflict, drops: map[fstree.Inode_Id]bool) -> Error {
 	ib, okb, e1 := fstree.info(snap_b, ino, context.temp_allocator)
 	ic, okc, e2 := fstree.info(snap_c, ino, context.temp_allocator)
 	if e1 != nil || e2 != nil {
@@ -342,10 +424,7 @@ revert_inode :: proc(h: ^History, b: ^Builder, ino: fstree.Inode_Id, ev: ^Inode_
 	last_in :: proc(ev: ^Inode_Events, f: Revert_Field) -> bool {
 		return ev.last[f].set && ev.last[f].class == .In
 	}
-	if !pb && pc && last_in(ev, .Exist) {
-		if ev.out_body && ic.kind == .File {
-			file_conflict(h, ino, &ic, cl, conflicts) or_return
-		}
+	if !pb && pc && last_in(ev, .Exist) && ino in drops {
 		builder_tree(b, fstree.Op_Remove{inode = ino})
 		return .None
 	}
@@ -378,18 +457,9 @@ revert_inode :: proc(h: ^History, b: ^Builder, ino: fstree.Inode_Id, ev: ^Inode_
 		return revert_blob(h, b, ino, ev, cl, conflicts)
 	}
 	if .Text in ev.has_in {
-		return revert_text(h, b, ino, bl, cl, ctx, conflicts)
+		revert_text(h, b, ino, bl, cl, ctx, conflicts) or_return
 	}
 	return .None
-}
-
-@(private)
-op_spans_of :: proc(spans: []crdt.Author_Span) -> []crdt.Op_Span {
-	out := make([dynamic]crdt.Op_Span, context.temp_allocator)
-	for s in spans {
-		push_op_span(&out, s.op, s.len)
-	}
-	return out[:]
 }
 
 @(private)
@@ -405,30 +475,6 @@ push_op_span :: proc(out: ^[dynamic]crdt.Op_Span, id: crdt.Op_Id, n: int) {
 		}
 	}
 	append(out, crdt.Op_Span{id, n})
-}
-
-@(private)
-file_conflict :: proc(h: ^History, ino: fstree.Inode_Id, ic: ^fstree.Info, cl: []crdt.Lv, conflicts: ^[dynamic]fshist.Revert_Conflict) -> Error {
-	c := fshist.Revert_Conflict {
-		inode = inode_op(h, ino),
-	}
-	if .Opaque in ic.flags {
-		reg, has := history_blob_at(h, ino, cl) or_return
-		if !has {
-			return .None
-		}
-		c.kind = .Blob
-		c.oid = reg.oid
-		c.oid_len = u8(len(reg.oid))
-		c.size = reg.size
-	} else {
-		data, spans := history_text_spans_at(h, ino, cl, context.temp_allocator) or_return
-		c.kind = .File
-		c.end = len(data)
-		c.theirs = op_spans_of(spans)
-	}
-	append(conflicts, c)
-	return .None
 }
 
 @(private)
@@ -470,7 +516,7 @@ blob_before :: proc(h: ^History, ino: fstree.Inode_Id, lamport: u64) -> (out: Bl
 }
 
 @(private)
-revert_text :: proc(h: ^History, b: ^Builder, ino: fstree.Inode_Id, bl, cl: []crdt.Lv, ctx: ^Set_Ctx, conflicts: ^[dynamic]fshist.Revert_Conflict) -> Error {
+revert_text :: proc(h: ^History, b: ^Builder, ino: fstree.Inode_Id, bl, cl: []crdt.Lv, ctx: ^Set_Ctx, conflicts: ^[dynamic]fshist.Revert_Conflict, created := false) -> (empty: bool, err: Error) {
 	tmp: File_State
 	tmp.inode = ino
 	defer {
@@ -483,66 +529,97 @@ revert_text :: proc(h: ^History, b: ^Builder, ino: fstree.Inode_Id, bl, cl: []cr
 	common := make([dynamic]crdt.Lv, context.temp_allocator)
 	items := make([dynamic]crdt.Revert_Item, context.temp_allocator)
 	if crdt.text_revert_items(&tmp.text, &h.g, &tmp.log, cl, set_classify, ctx, &common, &items) != .None {
-		return .Corrupt
+		return false, .Corrupt
 	}
 	cspans: []crdt.Author_Span
 	if len(common) > 0 {
 		_, cspans = history_text_spans_at(h, ino, common[:], context.temp_allocator) or_return
 	}
 	cur, _ := history_text_spans_at(h, ino, cl, context.temp_allocator) or_return
-	units := revert_units(h, items[:], cspans, cur)
-	revert_regions(units, cur, ino, h, conflicts)
-	edits := make([dynamic]Revert_Unit, context.temp_allocator)
-	for u in units {
-		if u.visible != u.after {
-			append(&edits, u)
+	ps := kept_pieces(h, items[:], cspans, cur)
+	tl, blines, hunks := kept_lines(ps[:])
+	edits := make([dynamic]Kept_Edit, context.temp_allocator)
+	for round := 0; ; round += 1 {
+		clear(&edits)
+		kept_edits(ps[:], tl, blines, hunks, &edits)
+		slice.stable_sort_by(edits[:], proc(x, y: Kept_Edit) -> bool {
+			if x.pos != y.pos {
+				return x.pos < y.pos
+			}
+			return x.del == 0 && y.del > 0
+		})
+		bad := kept_check(ps[:], cur, blines, edits[:])
+		if bad < 0 || round > len(hunks) {
+			break
 		}
+		hunks[bad].frozen = true
 	}
+	size := len(cur)
+	for e in edits {
+		size += ps[e.ins].len if e.ins >= 0 else -e.del
+	}
+	if size == 0 && created {
+		return true, .None
+	}
+	kept_conflicts(h, ps[:], tl, blines, hunks, edits[:], ino, conflicts)
 	#reverse for e in edits {
-		if e.visible {
-			builder_delete(b, ino, e.pos, e.len)
+		if e.ins >= 0 {
+			builder_copy_root(b, ino, e.pos, ps[e.ins].src, ps[e.ins].len)
 		} else {
-			builder_copy_root(b, ino, e.pos, e.src, e.len)
+			builder_delete(b, ino, e.pos, e.del)
 		}
 	}
-	return .None
+	return false, .None
 }
 
 @(private)
-revert_units :: proc(h: ^History, items: []crdt.Revert_Item, cspans: []crdt.Author_Span, cur: []u8) -> [dynamic]Revert_Unit {
-	units := make([dynamic]Revert_Unit, context.temp_allocator)
+kept_pieces :: proc(h: ^History, items: []crdt.Revert_Item, cspans: []crdt.Author_Span, cur: []u8) -> [dynamic]Kept_Piece {
+	out := make([dynamic]Kept_Piece, context.temp_allocator)
 	total := 0
 	for s in cspans {
 		total += s.len
 	}
 	pos := 0
-	push :: proc(units: ^[dynamic]Revert_Unit, it: crdt.Revert_Item, src: crdt.Op_Id, n: int, pos: ^int, cur: []u8) {
-		u := Revert_Unit{src = src, len = n, pos = pos^, visible = it.visible, ins = it.ins, del = it.del, out_lv = it.out_lv}
-		if !u.visible {
-			append(units, u)
+	push :: proc(h: ^History, out: ^[dynamic]Kept_Piece, it: crdt.Revert_Item, src: crdt.Op_Id, n: int, pos: ^int, cur: []u8) {
+		p := Kept_Piece {
+			vis    = it.visible,
+			in_b   = it.ins == .Base && .Base not_in it.del,
+			in_t   = it.ins == .Base && it.del & {.Base, .In} == {} || it.ins == .In && .In not_in it.del,
+			out    = it.ins == .Out,
+			outdel = .Out in it.del,
+			out_lv = it.out_lv,
+			b      = -1,
+			t      = -1,
+		}
+		text: []u8
+		if p.vis {
+			text = cur[min(pos^, len(cur)):min(pos^ + n, len(cur))]
+		} else if p.in_b || p.in_t {
+			buf := make([]u8, n, context.temp_allocator)
+			authors := make([dynamic]crdt.Author_Span, context.temp_allocator)
+			got := copy_read_depth(h, src, buf, &authors, 0)
+			text = buf[:got]
+		} else {
 			return
 		}
-		lo := pos^
-		hi := lo + n
-		start := lo
-		for k in lo ..< hi {
-			if k < len(cur) && cur[k] == '\n' {
-				x := u
-				x.pos = start
-				x.len = k + 1 - start
-				x.src = crdt.Op_Id{src.actor, src.seq + u64(start - lo)}
-				append(units, x)
-				start = k + 1
+		at := 0
+		for at < n {
+			e := at
+			for e < n && !(e < len(text) && text[e] == '\n') {
+				e += 1
 			}
+			p.nl = e < n
+			e = min(e + 1, n)
+			p.src = crdt.Op_Id{src.actor, src.seq + u64(at)}
+			p.len = e - at
+			p.pos = pos^ + (at if p.vis else 0)
+			p.text = text[min(at, len(text)):min(e, len(text))]
+			append(out, p)
+			at = e
 		}
-		if start < hi {
-			x := u
-			x.pos = start
-			x.len = hi - start
-			x.src = crdt.Op_Id{src.actor, src.seq + u64(start - lo)}
-			append(units, x)
+		if p.vis {
+			pos^ += n
 		}
-		pos^ = hi
 	}
 	for it in items {
 		if it.lv < 0 {
@@ -553,7 +630,7 @@ revert_units :: proc(h: ^History, items: []crdt.Revert_Item, cspans: []crdt.Auth
 				slo := max(lo, at)
 				shi := min(hi, at + s.len)
 				if shi > slo {
-					push(&units, it, crdt.Op_Id{s.op.actor, s.op.seq + u64(slo - at)}, shi - slo, &pos, cur)
+					push(h, &out, it, crdt.Op_Id{s.op.actor, s.op.seq + u64(slo - at)}, shi - slo, &pos, cur)
 				}
 				at += s.len
 				if at >= hi {
@@ -573,121 +650,371 @@ revert_units :: proc(h: ^History, items: []crdt.Revert_Item, cspans: []crdt.Auth
 				}
 				j += 1
 			}
-			push(&units, it, id, j - k, &pos, cur)
+			push(h, &out, it, id, j - k, &pos, cur)
 			k = j
 		}
 	}
-	return units
+	return out
 }
 
 @(private)
-revert_regions :: proc(units: [dynamic]Revert_Unit, cur: []u8, ino: fstree.Inode_Id, h: ^History, conflicts: ^[dynamic]fshist.Revert_Conflict) {
-	line := 0
-	pending := false
-	for &u in units {
-		if u.visible {
-			if pending {
-				line += 1
-				pending = false
+kept_lines :: proc(ps: []Kept_Piece) -> (tl: []Kept_Line, bl: []Kept_Line, hunks: []Kept_Hunk) {
+	ts := make([dynamic]Kept_Line, context.temp_allocator)
+	bs := make([dynamic]Kept_Line, context.temp_allocator)
+	add :: proc(lines: ^[dynamic]Kept_Line, open: ^bool, i: int, p: Kept_Piece) -> int {
+		if !open^ {
+			append(lines, Kept_Line{first = i, pair = -1, hunk = -1})
+			open^ = true
+		}
+		l := &lines[len(lines) - 1]
+		l.last = i
+		l.len += p.len
+		if p.nl {
+			open^ = false
+		}
+		return len(lines) - 1
+	}
+	topen, bopen := false, false
+	for &p, i in ps {
+		if p.in_t {
+			p.t = add(&ts, &topen, i, p)
+		}
+		if p.in_b {
+			p.b = add(&bs, &bopen, i, p)
+			bs[p.b].outdel ||= !p.in_t && p.outdel
+		}
+	}
+	for &l, t in ts {
+		anchor := true
+		bi := -1
+		n := 0
+		for i in l.first ..= l.last {
+			p := ps[i]
+			if p.t != t {
+				if p.out && p.vis {
+					l.touched = true
+				}
+				continue
 			}
-			if u.len > 0 && u.pos + u.len - 1 < len(cur) && cur[u.pos + u.len - 1] == '\n' {
-				pending = true
+			if !p.vis {
+				l.touched = true
+			}
+			if !p.in_b || bi >= 0 && p.b != bi {
+				anchor = false
+			} else {
+				bi = p.b
+				n += p.len
 			}
 		}
-		u.line = line
-	}
-	nl := line + 1
-	region := make([]bool, nl, context.temp_allocator)
-	out_vis := make([]bool, nl, context.temp_allocator)
-	in_vis := make([]bool, nl, context.temp_allocator)
-	batch_of := make([]crdt.Lv, len(units), context.temp_allocator)
-	for u, i in units {
-		batch_of[i] = -1
-		if u.visible && u.ins == .Out {
-			out_vis[u.line] = true
-			if ulv, ok := crdt.graph_lv(&h.g, u.src); ok {
-				if first, _, _, _, bok := history_batch_at(h, ulv); bok {
-					batch_of[i] = first
+		if anchor && bi >= 0 && bs[bi].len == n && bs[bi].pair < 0 {
+			l.anchor = true
+			l.pair = bi
+			bs[bi].anchor = true
+			bs[bi].pair = t
+		}
+		for i := l.first - 1; i >= 0; i -= 1 {
+			if ps[i].vis {
+				l.touched ||= ps[i].out && !ps[i].nl
+				break
+			}
+		}
+		if !ps[l.last].nl {
+			for i := l.last + 1; i < len(ps); i += 1 {
+				if ps[i].vis {
+					l.touched ||= ps[i].out
+					break
 				}
 			}
 		}
-		if u.visible && u.ins == .In {
-			in_vis[u.line] = true
-		}
 	}
-	for l in 0 ..< nl {
-		region[l] = out_vis[l] && in_vis[l]
-	}
-	del_batch :: proc(h: ^History, u: Revert_Unit) -> crdt.Lv {
-		if u.out_lv < 0 {
-			return -1
-		}
-		first, _, _, _, ok := history_batch_at(h, u.out_lv)
-		return first if ok else -1
-	}
-	rewrote := make(map[crdt.Lv]bool, context.temp_allocator)
-	for t in units {
-		if !t.visible && t.ins == .In && .Out in t.del {
-			if b := del_batch(h, t); b >= 0 {
-				rewrote[b] = true
-			}
-		}
-	}
-	for u, i in units {
-		if batch_of[i] >= 0 && batch_of[i] in rewrote {
-			region[u.line] = true
-		}
-	}
-	rewrites := make(map[crdt.Lv]bool, context.temp_allocator)
-	for u, i in units {
-		if batch_of[i] >= 0 && region[u.line] {
-			rewrites[batch_of[i]] = true
-		}
-	}
-	for &u in units {
-		normal := u.ins != .In && .In in u.del && .Out not_in u.del && .Base not_in u.del
-		if u.visible {
-			u.after = u.ins == .Base if region[u.line] else u.ins != .In
-		} else {
-			u.after = normal || (u.ins == .Base && .Base not_in u.del && .Out in u.del && del_batch(h, u) in rewrites)
-		}
-	}
-	result := 0
-	i := 0
-	for i < len(units) {
-		u := units[i]
-		if !region[u.line] {
-			if u.after {
-				result += u.len
-			}
-			i += 1
+	hs := make([dynamic]Kept_Hunk, context.temp_allocator)
+	t0, b0 := 0, 0
+	for t in 0 ..= len(ts) {
+		if t < len(ts) && !ts[t].anchor {
 			continue
 		}
-		c := fshist.Revert_Conflict {
-			kind  = .Region,
-			inode = inode_op(h, ino),
-			start = result,
+		b1 := ts[t].pair if t < len(ts) else len(bs)
+		if t > t0 || b1 > b0 {
+			append(&hs, Kept_Hunk{t0 = t0, t1 = t, b0 = b0, b1 = b1})
 		}
-		ours := make([dynamic]crdt.Op_Span, context.temp_allocator)
-		theirs := make([dynamic]crdt.Op_Span, context.temp_allocator)
-		j := i
-		for j < len(units) && units[j].line == u.line {
-			x := units[j]
-			if x.after {
-				push_op_span(&ours, x.src, x.len)
-				result += x.len
-			}
-			if x.visible {
-				push_op_span(&theirs, x.src, x.len)
-			}
-			j += 1
-		}
-		c.end = result
-		c.ours = ours[:]
-		c.theirs = theirs[:]
-		append(conflicts, c)
-		i = j
+		t0, b0 = t + 1, b1 + 1
 	}
+	for hk, k in hs {
+		for t in hk.t0 ..< hk.t1 {
+			ts[t].hunk = k
+			l := &ts[t]
+			for i in l.first ..= l.last {
+				p := ps[i]
+				if p.t == t && p.in_b && l.pair < 0 && bs[p.b].pair < 0 {
+					l.pair, l.shared = p.b, true
+					bs[p.b].pair, bs[p.b].shared = t, true
+				}
+			}
+		}
+		bi := hk.b0
+		for t in hk.t0 ..< hk.t1 {
+			if ts[t].pair >= 0 {
+				bi = max(bi, ts[t].pair + 1)
+				continue
+			}
+			limit := hk.b1
+			for u in t + 1 ..< hk.t1 {
+				if ts[u].pair >= 0 {
+					limit = ts[u].pair
+					break
+				}
+			}
+			if bi < limit && bs[bi].pair < 0 {
+				ts[t].pair = bi
+				bs[bi].pair = t
+				bi += 1
+			}
+		}
+		for b in hk.b0 ..< hk.b1 {
+			bs[b].hunk = k
+		}
+	}
+	return ts[:], bs[:], hs[:]
+}
+
+@(private)
+kept_owner :: proc(hk: Kept_Hunk, bl: []Kept_Line, b: int) -> int {
+	for x := b; x >= hk.b0; x -= 1 {
+		if bl[x].pair >= 0 {
+			return bl[x].pair
+		}
+	}
+	return hk.t0 if hk.t1 > hk.t0 else -1
+}
+
+@(private)
+kept_restores :: proc(hk: Kept_Hunk, tl, bl: []Kept_Line, b: int) -> bool {
+	if hk.frozen || bl[b].outdel {
+		return false
+	}
+	t := kept_owner(hk, bl, b)
+	return t < 0 || !tl[t].touched
+}
+
+@(private)
+kept_end :: proc(p: Kept_Piece) -> int {
+	return p.pos + (p.len if p.vis else 0)
+}
+
+@(private)
+kept_edits :: proc(ps: []Kept_Piece, tl, bl: []Kept_Line, hunks: []Kept_Hunk, out: ^[dynamic]Kept_Edit) {
+	for hk, k in hunks {
+		if hk.frozen {
+			continue
+		}
+		for t in hk.t0 ..< hk.t1 {
+			l := tl[t]
+			if l.touched {
+				continue
+			}
+			keep := l.shared && kept_restores(hk, tl, bl, l.pair)
+			for i in l.first ..= l.last {
+				p := ps[i]
+				if p.t == t && p.vis && !(keep && p.in_b && p.b == l.pair) {
+					append(out, Kept_Edit{p.pos, p.len, -1, k})
+				}
+			}
+		}
+		for b in hk.b0 ..< hk.b1 {
+			if !kept_restores(hk, tl, bl, b) {
+				continue
+			}
+			l := bl[b]
+			for i in l.first ..= l.last {
+				p := ps[i]
+				if p.b != b {
+					continue
+				}
+				t := l.pair
+				if t >= 0 && l.shared && p.in_t && p.t == t {
+					continue
+				}
+				pos := p.pos
+				switch {
+				case t >= 0 && l.shared:
+					if i < tl[t].first {
+						pos = ps[tl[t].first].pos
+					} else if i > tl[t].last {
+						pos = kept_end(ps[tl[t].last])
+					}
+				case t >= 0:
+					pos = ps[tl[t].first].pos
+				case:
+					if o := kept_owner(hk, bl, b); o >= 0 {
+						pos = kept_end(ps[tl[o].last]) if b > hk.b0 && bl[b].pair < 0 && kept_has_pair(hk, bl, b) else ps[tl[o].first].pos
+					}
+				}
+				append(out, Kept_Edit{pos, 0, i, k})
+			}
+		}
+	}
+}
+
+@(private)
+kept_has_pair :: proc(hk: Kept_Hunk, bl: []Kept_Line, b: int) -> bool {
+	for x := b - 1; x >= hk.b0; x -= 1 {
+		if bl[x].pair >= 0 {
+			return true
+		}
+	}
+	return false
+}
+
+@(private)
+kept_check :: proc(ps: []Kept_Piece, cur: []u8, bl: []Kept_Line, edits: []Kept_Edit) -> int {
+	known := make(map[string]bool, context.temp_allocator)
+	rest := string(cur)
+	for line in strings.split_lines_iterator(&rest) {
+		known[line] = true
+	}
+	sb := make([dynamic]u8, context.temp_allocator)
+	cb := -1
+	for p in ps {
+		if !p.in_b {
+			continue
+		}
+		if p.b != cb {
+			clear(&sb)
+			cb = p.b
+		}
+		append(&sb, ..p.text)
+		if len(sb) == bl[p.b].len {
+			known[strings.clone(strings.trim_suffix(string(sb[:]), "\n"), context.temp_allocator)] = true
+		}
+	}
+	line := make([dynamic]u8, context.temp_allocator)
+	hunk := -1
+	bad := -1
+	feed :: proc(data: []u8, k: int, line: ^[dynamic]u8, hunk: ^int, bad: ^int, known: map[string]bool) {
+		for c in data {
+			if k >= 0 {
+				hunk^ = k
+			}
+			if c != '\n' {
+				append(line, c)
+				continue
+			}
+			if string(line[:]) not_in known && hunk^ >= 0 && bad^ < 0 {
+				bad^ = hunk^
+			}
+			clear(line)
+			hunk^ = -1
+		}
+	}
+	at := 0
+	for e in edits {
+		if e.pos > at {
+			feed(cur[at:e.pos], -1, &line, &hunk, &bad, known)
+			at = e.pos
+		}
+		if e.ins >= 0 {
+			feed(ps[e.ins].text, e.hunk, &line, &hunk, &bad, known)
+		} else {
+			hunk = e.hunk
+			at = max(at, e.pos + e.del)
+		}
+	}
+	feed(cur[min(at, len(cur)):], -1, &line, &hunk, &bad, known)
+	if len(line) > 0 && string(line[:]) not_in known && hunk >= 0 && bad < 0 {
+		bad = hunk
+	}
+	return bad
+}
+
+@(private)
+kept_conflicts :: proc(h: ^History, ps: []Kept_Piece, tl, bl: []Kept_Line, hunks: []Kept_Hunk, edits: []Kept_Edit, ino: fstree.Inode_Id, conflicts: ^[dynamic]fshist.Revert_Conflict) {
+	shift :: proc(ps: []Kept_Piece, edits: []Kept_Edit, pos: int) -> int {
+		d := 0
+		for e in edits {
+			if e.pos >= pos {
+				break
+			}
+			d += ps[e.ins].len if e.ins >= 0 else -e.del
+		}
+		return pos + d
+	}
+	batch :: proc(h: ^History, lv: crdt.Lv) -> crdt.Lv {
+		first, _, _, _, ok := history_batch_at(h, lv)
+		return first if lv >= 0 && ok else -1
+	}
+	for hk in hunks {
+		for t in hk.t0 ..< hk.t1 {
+			l := tl[t]
+			if !l.touched && !hk.frozen {
+				continue
+			}
+			c := fshist.Revert_Conflict {
+				kind  = .Region,
+				inode = inode_op(h, ino),
+			}
+			ours := make([dynamic]crdt.Op_Span, context.temp_allocator)
+			theirs := make([dynamic]crdt.Op_Span, context.temp_allocator)
+			gone := make(map[crdt.Lv]bool, context.temp_allocator)
+			for i in l.first ..= l.last {
+				if ps[i].t == t && !ps[i].vis {
+					if x := batch(h, ps[i].out_lv); x >= 0 {
+						gone[x] = true
+					}
+				}
+			}
+			lo, hi := -1, -1
+			for i in 0 ..< len(ps) {
+				p := ps[i]
+				if !p.vis {
+					continue
+				}
+				mine := p.t == t
+				if !mine && p.out {
+					mine = i > l.first && i < l.last
+					if !mine && len(gone) > 0 {
+						if lv, ok := crdt.graph_lv(&h.g, p.src); ok {
+							mine = batch(h, lv) in gone
+						}
+					}
+				}
+				if mine && (hi < 0 || p.pos == hi) {
+					if lo < 0 {
+						lo = p.pos
+					}
+					hi = p.pos + p.len
+					push_op_span(&ours, p.src, p.len)
+				}
+			}
+			if lo < 0 {
+				lo = ps[l.first].pos
+				hi = lo
+			}
+			c.start = shift(ps, edits, lo)
+			c.end = c.start + (hi - lo)
+			if l.pair >= 0 {
+				for i in bl[l.pair].first ..= bl[l.pair].last {
+					if ps[i].b == l.pair {
+						push_op_span(&theirs, ps[i].src, ps[i].len)
+					}
+				}
+			}
+			c.ours = ours[:]
+			c.theirs = theirs[:]
+			append(conflicts, c)
+		}
+	}
+}
+
+@(private)
+revert_stays :: proc(h: ^History, ino: fstree.Inode_Id, ev: ^Inode_Events, ic: ^fstree.Info, bl, cl: []crdt.Lv, ctx: ^Set_Ctx) -> (stays: bool, err: Error) {
+	if .Opaque in ic.flags {
+		return ev.last[.Blob].class != .In, .None
+	}
+	b: Builder
+	builder_init(&b, h, h.self)
+	conflicts := make([dynamic]fshist.Revert_Conflict, context.temp_allocator)
+	empty := revert_text(h, &b, ino, bl, cl, ctx, &conflicts, true) or_return
+	return !empty, .None
 }
 
 history_revert_op :: proc(h: ^History, revert: prim.Id, allocator := context.allocator) -> (op: fshist.Revert_Op, err: Error) {

@@ -100,11 +100,23 @@ text_revert_items :: proc(t: ^Text, g: ^Graph, log: ^Text_Log, target: []Lv, cla
 		l := &tr.items.leaves[leaf]
 		for i in 0 ..< int(l.n) {
 			it := l.items[i]
-			ins := Revert_Class.Base
-			if it.id >= PH {
-				ins = classify(data, Lv(it.id - PH))
+			if it.id < PH {
+				emit_split(out, it, .Base, segs[:])
+				continue
 			}
-			emit_split(out, it, ins, segs[:])
+			at: i64 = 0
+			for at < i64(it.len) {
+				ins := classify(data, Lv(it.id + at - PH))
+				end := at + 1
+				for end < i64(it.len) && classify(data, Lv(it.id + end - PH)) == ins {
+					end += 1
+				}
+				part := it
+				part.id = it.id + at
+				part.len = type_of(it.len)(end - at)
+				emit_split(out, part, ins, segs[:])
+				at = end
+			}
 		}
 	}
 	return m.err

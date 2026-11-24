@@ -1208,6 +1208,210 @@ branch_redo_leaf :: proc(t: ^testing.T) {
 	testing.expect(t, bad == 0, fmt.tprintf("branch_redo_leaf: %d failures", bad))
 }
 
+@(private = "file")
+Bk_Case :: struct {
+	name:    string,
+	path:    string,
+	base:    string,
+	turn:    string,
+	person:  string,
+	want:    string,
+}
+
+@(private = "file")
+_bk_cases := [?]Bk_Case {
+	{"same line", "k.txt", "x\n", "agent\n", "person\n", "person\n"},
+	{"same line among others", "k.txt", "1\n2\n3\n", "1\nA\n3\n", "1\nP\n3\n", "1\nP\n3\n"},
+	{"adjacent line", "k.txt", "1\n2\n3\n", "A\n2\n3\n", "A\nP\n3\n", "1\nP\n3\n"},
+	{"adjacent line above", "k.txt", "1\n2\n3\n", "1\nA\n3\n", "P\nA\n3\n", "P\n2\n3\n"},
+	{"far line", "k.txt", "1\n2\n3\n4\n5\n", "A\n2\n3\n4\n5\n", "A\n2\n3\n4\nP\n", "1\n2\n3\n4\nP\n"},
+	{"one of two lines", "k.txt", "1\n2\n3\n", "A\nB\n3\n", "A\nP\n3\n", "1\nP\n3\n"},
+	{"inside the line", "k.txt", "x\n", "agent\n", "agent bar\n", "agent bar\n"},
+	{"deletes the turn's line", "k.txt", "1\n2\n3\n", "1\nA\n3\n", "1\n3\n", "1\n3\n"},
+	{"deletes another line", "k.txt", "1\n2\n3\n", "A\n2\n3\n", "A\n3\n", "1\n3\n"},
+	{"inserts a line", "k.txt", "1\n2\n", "1\nA\n2\n", "1\nA\nP\n2\n", "1\nP\n2\n"},
+	{"the turn deleted a line", "k.txt", "1\n2\n3\n", "1\n3\n", "1\n3\nP\n", "1\n2\n3\nP\n"},
+	{"more lines than base", "k.txt", "x\n", "a\nb\nc\n", "a\nP\nc\n", "x\nP\n"},
+	{"created, edited", "n.txt", "", "a\nb\nc\n", "a\nP\nc\n", "P\n"},
+	{"created, a line deleted", "n.txt", "", "a\nb\nc\n", "a\nc\n", ""},
+	{"created, untouched", "n.txt", "", "a\nb\n", "", ""},
+	{"no newline at the end", "k.txt", "a\nb", "a\nb\nc", "a\nb\nP", "a\nb\nP"},
+}
+
+@(private = "file")
+_bk_put :: proc(c: ^Br_Ctx, path, data: string, api: bool) -> bool {
+	if !api {
+		return _br_write(c, false, path, data)
+	}
+	n := c.n
+	context = instance_context(&n.inst)
+	defer node_after(n)
+	v, verr := eng.tree_version(&n.e, c.tree, "main", context.temp_allocator)
+	if verr != .None {
+		world_fail(c.w, "branch kept: tree_version: %v", verr)
+		return false
+	}
+	if err := eng.tree_write(&n.e, c.tree, path, transmute([]u8)data, v); err != .None {
+		world_fail(c.w, "branch kept: tree_write %s: %v", path, err)
+		return false
+	}
+	return true
+}
+
+@(private = "file")
+_bk_run :: proc(w: ^World, arena: ^virtual.Arena, k: Bk_Case, api, between: bool) {
+	if virtual.arena_init_growing(arena, 1 << 20) != nil {
+		return
+	}
+	alloc := virtual.arena_allocator(arena)
+	c, ok := _br_setup(w, alloc)
+	if !ok {
+		return
+	}
+	n := c.n
+	if len(k.base) > 0 && !_br_write(c, false, k.path, k.base) {
+		return
+	}
+	run_until(w, w.now + 2_000_000_000, true)
+	u, reply, tok := _br_turn(c, true, {{k.path, k.turn}})
+	if !tok {
+		return
+	}
+	if len(k.person) > 0 && !_bk_put(c, k.path, k.person, api) {
+		return
+	}
+	run_until(w, w.now + 2_000_000_000, true)
+	check :: proc(c: ^Br_Ctx, k: Bk_Case, api: bool, what: string, want: string, pos: obj.Rid) {
+		disk := _br_disk(c)
+		got := disk[k.path] if k.path in disk else ""
+		if got != want {
+			world_fail(c.w, "branch kept, %s (%s): after %s %s holds %q, not %q", k.name, "api" if api else "disk", what, k.path, got, want)
+		}
+		if p, pok := _br_position(c, c.n); !pok || !obj.rid_none(pos) && p != pos {
+			world_fail(c.w, "branch kept, %s: after %s the position is off %d, not off %d", k.name, what, p.off, pos.off)
+		}
+	}
+	now := k.person if len(k.person) > 0 else k.turn
+	want := k.want
+	check(c, k, api, "the edit", now, reply)
+	for round in 0 ..< 3 {
+		undo: prim.Id
+		err: eng.Error
+		{
+			context = instance_context(&n.inst)
+			undo, err = eng.convo_undo(&n.e, c.conv, u)
+			node_after(n)
+		}
+		if err != .None && err != .Pending {
+			world_fail(w, "branch kept, %s: undo: %v", k.name, err)
+			return
+		}
+		run_until(w, w.now + 5_000_000_000, true)
+		check(c, k, api, fmt.aprintf("undo %d", round, allocator = alloc), want, {})
+		if between && len(want) > 0 && strings.has_suffix(want, "\n") {
+			z := fmt.aprintf("Z%d\n", round, allocator = alloc)
+			want = strings.concatenate({want, z}, alloc)
+			now = strings.concatenate({now, z}, alloc)
+			if !_bk_put(c, k.path, want, api) {
+				return
+			}
+			run_until(w, w.now + 2_000_000_000, true)
+		}
+		k1: {
+			context = instance_context(&n.inst)
+			_, err = eng.convo_redo(&n.e, c.conv, undo)
+			node_after(n)
+		}
+		if err != .None && err != .Pending {
+			world_fail(w, "branch kept, %s: redo: %v", k.name, err)
+			return
+		}
+		run_until(w, w.now + 5_000_000_000, true)
+		check(c, k, api, fmt.aprintf("redo %d", round, allocator = alloc), now, reply)
+	}
+	{
+		context = instance_context(&n.inst)
+		_, err := eng.convo_regenerate(&n.e, c.conv, u)
+		node_after(n)
+		if err != .None && err != .Pending {
+			world_fail(w, "branch kept, %s: regenerate: %v", k.name, err)
+			return
+		}
+	}
+	run_until(w, w.now + 5_000_000_000, true)
+	check(c, k, api, "a regenerate", want, u)
+	{
+		context = instance_context(&n.inst)
+		_, err := eng.convo_move(&n.e, c.conv, .Switch, reply)
+		node_after(n)
+		if err != .None && err != .Pending {
+			world_fail(w, "branch kept, %s: switch back: %v", k.name, err)
+			return
+		}
+	}
+	run_until(w, w.now + 5_000_000_000, true)
+	check(c, k, api, "a switch back", now, reply)
+	edited: obj.Rid
+	{
+		context = instance_context(&n.inst)
+		res, err := eng.exec(&n.e, eng.Cmd_Send{object = c.conv, text = "edited", root = true})
+		node_after(n)
+		if err != .None && err != .Pending {
+			world_fail(w, "branch kept, %s: an edit of the turn's message: %v", k.name, err)
+			return
+		}
+		edited = res.item
+	}
+	run_until(w, w.now + 5_000_000_000, true)
+	check(c, k, api, "an edit of the turn's message", want, edited)
+	{
+		context = instance_context(&n.inst)
+		_, err := eng.convo_move(&n.e, c.conv, .Switch, reply)
+		node_after(n)
+		if err != .None && err != .Pending {
+			world_fail(w, "branch kept, %s: switch back after the edit: %v", k.name, err)
+			return
+		}
+	}
+	run_until(w, w.now + 5_000_000_000, true)
+	check(c, k, api, "a switch back after the edit", now, reply)
+}
+
+@(test)
+branch_kept :: proc(t: ^testing.T) {
+	if s, ok := os.lookup_env("SIM_SEED", context.temp_allocator); ok && len(s) > 0 {
+		return
+	}
+	test_begin(t)
+	defer test_end(t)
+	bad, ran := 0, 0
+	only, has_only := os.lookup_env("BK_ONLY", context.temp_allocator)
+	for k in _bk_cases {
+		if has_only && only != k.name {
+			continue
+		}
+		for m in 0 ..< 4 {
+			w := _br_world(1)
+			a: virtual.Arena
+			_bk_run(w, &a, k, m & 1 != 0, m & 2 != 0)
+			ran += 1
+			for f in w.failures {
+				if bad < 40 {
+					fmt.eprintf("branch_kept: %s\n", f)
+				}
+			}
+			if len(w.failures) > 0 {
+				bad += 1
+			}
+			world_destroy(w)
+			free(w)
+			virtual.arena_destroy(&a)
+		}
+	}
+	fmt.eprintf("branch_kept: %d runs, %d failed\n", ran, bad)
+	testing.expect(t, bad == 0, fmt.tprintf("branch_kept: %d failures", bad))
+}
+
 @(test)
 branch_concurrent :: proc(t: ^testing.T) {
 	if s, ok := os.lookup_env("SIM_SEED", context.temp_allocator); ok && len(s) > 0 {
