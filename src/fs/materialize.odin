@@ -1677,7 +1677,7 @@ mat_snapshot_writer :: proc(m: ^Mount, it: ^Mat_Item, a: Attrib, st: Stat, data:
 	shadow_put(&m.shadow, it.path, e) or_return
 	it.entry = e
 	attrib_set(m, it.old, a.actor, true, {}, a.scope)
-	_base_note(m, it.old, .Current)
+	_base_note(m, it.old, .Current, a.actor)
 	return head, .None
 }
 
