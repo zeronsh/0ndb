@@ -627,7 +627,7 @@ mat_barrier :: proc(m: ^Mount, ms: ^Mat_Sync) -> Error {
 		keep(m, &last, fd)
 	}
 	if darwin_batch && last != prim.INVALID_FD {
-		from_prim(prim.datasync(m.vfs, last)) or_return
+		from_prim(prim.barrier(m.vfs, last)) or_return
 	}
 	return .None
 }
