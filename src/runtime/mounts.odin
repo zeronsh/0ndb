@@ -273,8 +273,8 @@ worktree_attach :: proc(r: ^Runtime, o: Object, agent_id: prim.Id, lines: []conv
 			path      = clone(m.path, ws.alloc),
 		}
 		home := ""
-		if single && r.cfg.homes.home != nil {
-			if h, ok := r.cfg.homes.home(r.cfg.homes.data, m.tree, context.temp_allocator); ok && !worktree_dir_busy(r, h, ws) && _home_on_line(r, h, m.line) {
+		if single {
+			if h, ok := _tree_home(r, m.tree); ok && !worktree_dir_busy(r, h, ws) && _home_on_line(r, h, m.line) {
 				home = h
 			}
 		}

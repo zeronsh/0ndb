@@ -172,7 +172,7 @@ _resolve_path :: proc(run: ^Run, path: string) -> (abs: string, ok: bool) {
 	}
 	root := run.ws.root
 	p := path
-	if len(p) > 0 && p[0] == '/' {
+	if fs.path_is_abs(fs.clean_path(p, context.temp_allocator)) {
 		if rel, in_root := observe_under(fs.clean_path(p, context.temp_allocator), root); in_root {
 			p = rel
 		} else {

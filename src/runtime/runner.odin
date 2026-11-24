@@ -1126,10 +1126,8 @@ _bound_lines :: proc(r: ^Runtime, o: Object, allocator: runtime.Allocator) -> []
 	out := make([]convo.Line_Bind, len(ms), allocator)
 	for m, i in ms {
 		key := line_name(m.line)
-		if r.cfg.homes.home != nil {
-			if h, ok := r.cfg.homes.home(r.cfg.homes.data, m.tree, context.temp_allocator); ok {
-				key = dir_line_key(eng.base_vfs(r.e), h, key)
-			}
+		if h, ok := _tree_home(r, m.tree); ok {
+			key = dir_line_key(eng.base_vfs(r.e), h, key)
 		}
 		out[i] = convo.Line_Bind{mount = clone(m.name, allocator), tree = m.tree, line = clone(key, allocator)}
 	}

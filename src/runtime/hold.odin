@@ -83,7 +83,8 @@ _tree_home :: proc(r: ^Runtime, tree: prim.Id) -> (dir: string, ok: bool) {
 	if r.cfg.homes.home == nil {
 		return "", false
 	}
-	return r.cfg.homes.home(r.cfg.homes.data, tree, context.temp_allocator)
+	dir, ok = r.cfg.homes.home(r.cfg.homes.data, tree, context.temp_allocator)
+	return fs.clean_path(dir, context.temp_allocator), ok
 }
 
 @(private)

@@ -6,6 +6,7 @@ import "core:mem/virtual"
 import "core:strings"
 import "../agent"
 import "../convo"
+import "../fs"
 import eng "../engine"
 import "../model"
 import "../obj"
@@ -316,7 +317,7 @@ open :: proc(r: ^Runtime, e: ^eng.Engine, cfg: Config, allocator := context.allo
 	if r.cfg.claim_wait_ms <= 0 {
 		r.cfg.claim_wait_ms = DEFAULT_CLAIM_WAIT_MS
 	}
-	r.cfg.work_root = clone(cfg.work_root, allocator)
+	r.cfg.work_root = fs.clean_path(cfg.work_root, allocator)
 	r.cfg.default_provider = clone(cfg.default_provider, allocator)
 	r.cfg.name = clone(cfg.name, allocator)
 	r.cfg.host_name = clone(cfg.host_name, allocator)
@@ -337,7 +338,7 @@ open :: proc(r: ^Runtime, e: ^eng.Engine, cfg: Config, allocator := context.allo
 		r.cfg.catalog_command = cc
 	}
 	if len(r.cfg.work_root) == 0 {
-		r.cfg.work_root = clone(concat(e.dir, "/work"), allocator)
+		r.cfg.work_root = fs.clean_path(concat(e.dir, "/work"), allocator)
 	}
 	if r.cfg.spawner.spawn == nil {
 		r.cfg.spawner = engine_spawner(e)
