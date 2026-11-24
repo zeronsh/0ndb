@@ -834,6 +834,10 @@ _redact_zeroed :: proc(data: rawptr) {
 
 _persist_fail :: proc(data: rawptr) -> bool {
 	n := (^Node)(data)
+	if outage_active(n) {
+		stat_add(n.w, STAT_PERSIST_FAULTS)
+		return true
+	}
 	if n.persist_fail <= 0 {
 		return false
 	}

@@ -109,7 +109,7 @@ _merge_crash :: proc(w: ^World, crash_at: u64, sync_fail: bool) -> (crashed: boo
 			world_fail(w, "merge: mount missing")
 			return
 		}
-		scope := fs.scope_open(n.reg, sm.m, prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng)), agent)
+		scope := sim_scope_open(w, n.reg, sm.m, prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng)), agent)
 		fs.scope_read_base(scope, "a.txt", transmute([]u8)base)
 		if !fs.scope_pinned(scope, "a.txt") {
 			world_fail(w, "merge: read base did not pin")

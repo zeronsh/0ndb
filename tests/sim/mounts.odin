@@ -448,7 +448,7 @@ _agent_start :: proc(w: ^World, n: ^Node) -> bool {
 	hold := rng_chance(&w.rng, 1, 2)
 	sid := prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng))
 	actor := prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng))
-	scope := fs.scope_open(n.reg, sm.m, sid, actor)
+	scope := sim_scope_open(w, n.reg, sm.m, sid, actor)
 	if hold {
 		fs.scope_write_begin(scope, name)
 		for other in paths {
@@ -508,8 +508,13 @@ _agent_scope_close :: proc(w: ^World, n: ^Node, s: ^fs.Scope) -> fs.Error {
 	if w.cfg.persist_fault && rng_chance(&w.fault_rng, 1, 3) {
 		n.persist_fail = 1
 	}
+	armed := n.persist_fail
 	err := fs.scope_close(n.reg, s)
+	fired := n.persist_fail < armed
 	n.persist_fail = 0
+	if err == .Reloading && !fired && !outage_active(n) && !n.disk.dead && w.cfg.io_rate == 0 {
+		world_fail(w, "%s scope_close deferred with no persist fault", n.name)
+	}
 	return err
 }
 
@@ -561,8 +566,17 @@ agent_finish :: proc(w: ^World, n: ^Node) {
 	}
 	_writer_set(w, n, abs, Writer_Info{scope = pa.scope, agent = true})
 	oerr := fs.mount_observe_begin(sm.m, pa.name, pa.scope)
-	if oerr != .None && !n.disk.dead && w.cfg.io_rate == 0 {
+	if oerr != .None && !(oerr == .Reloading && outage_active(n)) && !n.disk.dead && w.cfg.io_rate == 0 {
 		world_fail(w, "%s mount_observe_begin failed: %v", n.name, oerr)
+	}
+	if oerr == .Reloading {
+		stat_add(w, STAT_DEFERRED_CLOSES)
+		op.status = .Failed
+		if !n.disk.dead {
+			_agent_scope_close(w, n, pa.scope)
+			_forget_scope(w, n, pa.scope)
+		}
+		return
 	}
 	err := prim.Error.Io
 	if oerr == .None {
@@ -611,7 +625,9 @@ agent_finish :: proc(w: ^World, n: ^Node) {
 		return
 	}
 	op_done(op, eng.pending_seq(&n.e), .None)
-	if serr != .None && w.cfg.io_rate == 0 && !injected {
+	if serr == .Reloading {
+		stat_add(w, STAT_DEFERRED_CLOSES)
+	} else if serr != .None && w.cfg.io_rate == 0 && !injected {
 		world_fail(w, "%s scope_close failed: %v", n.name, serr)
 	}
 }
@@ -658,6 +674,7 @@ _rewrite_same_size :: proc(w: ^World, n: ^Node, sm: ^Sim_Mount, name: string, ag
 	copy(data[last.pos:], tok)
 	op := new_op(m, .Disk_Agent if agent else .Disk_Person, n, sm.oi)
 	op.path = strings.clone(name, w.allocator)
+	op.line = strings.clone(mount_model_line(sm.m, vfs, sm.root), w.allocator)
 	append(&op.deletes, strings.clone(last.text, w.allocator))
 	append(&op.tokens, tok)
 	unseen := false
@@ -680,11 +697,11 @@ _rewrite_same_size :: proc(w: ^World, n: ^Node, sm: ^Sim_Mount, name: string, ag
 	if agent {
 		sid := prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng))
 		op.actor = prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng))
-		scope = fs.scope_open(n.reg, sm.m, sid, op.actor)
+		scope = sim_scope_open(w, n.reg, sm.m, sid, op.actor)
 	}
 	_writer_set(w, n, abs, Writer_Info{scope = scope, agent = agent})
 	if agent {
-		if oerr := fs.mount_observe_begin(sm.m, name, scope); oerr != .None && !n.disk.dead && w.cfg.io_rate == 0 {
+		if oerr := fs.mount_observe_begin(sm.m, name, scope); oerr != .None && !(oerr == .Reloading && outage_active(n)) && !n.disk.dead && w.cfg.io_rate == 0 {
 			world_fail(w, "%s mount_observe_begin failed: %v", n.name, oerr)
 		}
 	}
@@ -716,7 +733,9 @@ _rewrite_same_size :: proc(w: ^World, n: ^Node, sm: ^Sim_Mount, name: string, ag
 		op_done(op, 0, .None)
 		op.status = .Acked
 	}
-	if serr != .None && w.cfg.io_rate == 0 {
+	if serr == .Reloading {
+		stat_add(w, STAT_DEFERRED_CLOSES)
+	} else if serr != .None && w.cfg.io_rate == 0 {
 		world_fail(w, "%s scope_close failed: %v", n.name, serr)
 	}
 }
@@ -788,14 +807,14 @@ _disk_edit_at :: proc(w: ^World, n: ^Node, sm: ^Sim_Mount, name: string, agent: 
 	if agent {
 		sid := prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng))
 		op.actor = prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng))
-		scope = fs.scope_open(n.reg, sm.m, sid, op.actor)
+		scope = sim_scope_open(w, n.reg, sm.m, sid, op.actor)
 	}
 	_writer_set(w, n, abs, Writer_Info{scope = scope, agent = agent})
 	oerr := fs.Error.None
 	if agent {
 		oerr = fs.mount_observe_begin(sm.m, name, scope)
 		if oerr != .None && !n.disk.dead {
-			if w.cfg.io_rate == 0 {
+			if w.cfg.io_rate == 0 && !(oerr == .Reloading && outage_active(n)) {
 				world_fail(w, "%s mount_observe_begin failed: %v", n.name, oerr)
 			}
 		} else if oerr == .None {
@@ -844,7 +863,10 @@ _disk_edit_at :: proc(w: ^World, n: ^Node, sm: ^Sim_Mount, name: string, agent: 
 	}
 	if err != .None {
 		op.status = .Uncertain if err == .Io else .Failed
-		if w.cfg.io_rate > 0 {
+		if oerr == .Reloading {
+			op.status = .Failed
+			stat_add(w, STAT_DEFERRED_CLOSES)
+		} else if w.cfg.io_rate > 0 {
 			op.status = .Uncertain
 			n.restart_pending = true
 		} else {
@@ -860,7 +882,9 @@ _disk_edit_at :: proc(w: ^World, n: ^Node, sm: ^Sim_Mount, name: string, agent: 
 			op_done(op, 0, .None)
 			op.status = .Acked
 		}
-		if serr != .None && w.cfg.io_rate == 0 {
+		if serr == .Reloading {
+			stat_add(w, STAT_DEFERRED_CLOSES)
+		} else if serr != .None && w.cfg.io_rate == 0 {
 			world_fail(w, "%s scope_close failed: %v", n.name, serr)
 		}
 		if serr == .None && !n.disk.dead && rng_chance(&w.rng, 1, 3) {
@@ -1253,7 +1277,7 @@ op_line_switch :: proc(w: ^World, n: ^Node) {
 		}
 		obj_add_line(&w.model, sm.oi, key)
 		stat_add(w, STAT_LINE_SWITCHES)
-	} else if !n.disk.dead && !(w.cfg.io_rate > 0 && (err == .Io || err == .No_Space)) && err != .Busy {
+	} else if !n.disk.dead && !(w.cfg.io_rate > 0 && (err == .Io || err == .No_Space)) && err != .Busy && !(err == .Reloading && outage_active(n)) {
 		world_fail(w, "%s 0ndb switch to %s failed: %v", n.name, branch, err)
 	} else if !n.disk.dead && w.cfg.io_rate > 0 {
 		n.restart_pending = true
@@ -1610,7 +1634,7 @@ op_agent_chain :: proc(w: ^World, n: ^Node) {
 	defer node_after(n)
 	sid := prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng))
 	actor := prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng))
-	scope := fs.scope_open(n.reg, sm.m, sid, actor)
+	scope := sim_scope_open(w, n.reg, sm.m, sid, actor)
 	if oerr := fs.mount_observe_begin(sm.m, name, scope); oerr != .None || n.disk.dead {
 		fs.scope_close(n.reg, scope)
 		return
