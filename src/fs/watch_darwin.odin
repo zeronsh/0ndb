@@ -173,10 +173,32 @@ fs_event_cb :: proc "c" (stream: rawptr, info: rawptr, n: c.size_t, paths: [^]cs
 
 @(private)
 _watch_mount :: proc(reg: ^Registry, m: ^Mount) -> Error {
+	return start_stream(reg, m.slot, m.root)
+}
+
+@(private)
+_os_watch_path :: proc(reg: ^Registry, id: int, path: string) -> Error {
+	return start_stream(reg, DIR_WATCH_SLOT + id, path)
+}
+
+@(private)
+_os_unwatch_path :: proc(reg: ^Registry, id: int) {
+	for s, i in reg.os.streams {
+		if s.slot == DIR_WATCH_SLOT + id {
+			stop_stream(s)
+			free(s, reg.allocator)
+			ordered_remove(&reg.os.streams, i)
+			return
+		}
+	}
+}
+
+@(private)
+start_stream :: proc(reg: ^Registry, slot: int, root: string) -> Error {
 	s := new(Darwin_Stream, reg.allocator)
 	s.reg = reg
-	s.slot = m.slot
-	str := CFStringCreateWithBytes(nil, raw_data(m.root), c.long(len(m.root)), CF_STRING_ENCODING_UTF8, false)
+	s.slot = slot
+	str := CFStringCreateWithBytes(nil, raw_data(root), c.long(len(root)), CF_STRING_ENCODING_UTF8, false)
 	if str == nil {
 		free(s, reg.allocator)
 		return .No_Memory
@@ -245,6 +267,10 @@ _registry_os_read :: proc(reg: ^Registry) -> Error {
 		}
 		p := string(events[pos:pos + l])
 		pos += l
+		if slot >= DIR_WATCH_SLOT {
+			registry_dir_event(reg, slot - DIR_WATCH_SLOT, "" if rescan else path_name(p))
+			continue
+		}
 		if slot >= len(reg.mounts) || reg.mounts[slot] == nil {
 			continue
 		}

@@ -280,6 +280,34 @@ resolve_wd :: proc(reg: ^Registry, wd: i32, buf: []u8) -> (slot: int, rel: strin
 }
 
 @(private)
+_os_watch_path :: proc(reg: ^Registry, id: int, path: string) -> Error {
+	if reg.os.ifd < 0 {
+		return .Unsupported
+	}
+	pbuf: prim.Path_Buf
+	cp, cerr := prim.cpath(path, &pbuf)
+	if cerr != .None {
+		return from_prim(cerr)
+	}
+	wd, errno := linux.inotify_add_watch(reg.os.ifd, cp, {.MODIFY, .ATTRIB, .CLOSE_WRITE, .MOVED_FROM, .MOVED_TO, .CREATE, .DELETE, .ONLYDIR})
+	if errno != .NONE {
+		return from_errno(errno)
+	}
+	reg.dirs[id].wd = i32(wd)
+	return put_watch(reg, wd, DIR_WATCH_SLOT + id, -1, "", false)
+}
+
+@(private)
+_os_unwatch_path :: proc(reg: ^Registry, id: int) {
+	wd := reg.dirs[id].wd
+	if wd < 0 || reg.os.ifd < 0 {
+		return
+	}
+	put_watch(reg, linux.Wd(wd), -1, -1, "", false)
+	linux.inotify_rm_watch(reg.os.ifd, linux.Wd(wd))
+}
+
+@(private)
 _registry_os_read :: proc(reg: ^Registry) -> Error {
 	if reg.os.ifd < 0 {
 		return .None
@@ -316,6 +344,9 @@ _registry_os_read :: proc(reg: ^Registry) -> Error {
 						mount_events_lost(m)
 					}
 				}
+				for _, i in reg.dirs {
+					registry_dir_event(reg, i, "")
+				}
 				continue
 			}
 			if .IGNORED in mask {
@@ -323,6 +354,10 @@ _registry_os_read :: proc(reg: ^Registry) -> Error {
 			}
 			pbuf: [prim.PATH_MAX]u8
 			slot, dir, git, ok := resolve_wd(reg, wd, pbuf[:])
+			if ok && slot >= DIR_WATCH_SLOT {
+				registry_dir_event(reg, slot - DIR_WATCH_SLOT, name)
+				continue
+			}
 			if !ok || slot >= len(reg.mounts) || reg.mounts[slot] == nil {
 				continue
 			}

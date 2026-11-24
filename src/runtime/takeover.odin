@@ -5,6 +5,7 @@ import "core:crypto/blake2b"
 import "core:strings"
 import "../convo"
 import eng "../engine"
+import "../fs"
 import "../obj"
 import "../prim"
 
@@ -381,6 +382,15 @@ _auth_identity :: proc(r: ^Runtime, d: agent.Provider_Descriptor) -> string {
 Auth_Mark :: struct {
 	sig:     string,
 	pending: bool,
+	watch:   ^Auth_Watch,
+}
+
+@(private)
+Auth_Watch :: struct {
+	r:     ^Runtime,
+	id:    string,
+	names: [dynamic]string,
+	dirs:  [dynamic]int,
 }
 
 @(private)
@@ -407,6 +417,100 @@ provider_auth_settled :: proc(r: ^Runtime, id: string) {
 	}
 	mk.sig = strings.clone(_auth_identity(r, d), r.allocator)
 	mk.pending = false
+	mk.watch = _auth_watch_arm(r, d)
+}
+
+@(private)
+_auth_watch_arm :: proc(r: ^Runtime, d: agent.Provider_Descriptor) -> ^Auth_Watch {
+	if len(d.auth_files) == 0 || len(r.cfg.home_dir) == 0 {
+		return nil
+	}
+	reg, rerr := eng.registry(r.e)
+	if rerr != .None {
+		return nil
+	}
+	aw := new(Auth_Watch, r.allocator)
+	aw.r = r
+	aw.id = strings.clone(d.id, r.allocator)
+	aw.names = make([dynamic]string, r.allocator)
+	aw.dirs = make([dynamic]int, r.allocator)
+	seen := make([dynamic]string, context.temp_allocator)
+	for f in d.auth_files {
+		path := concat(r.cfg.home_dir, "/", f.path)
+		cut := strings.last_index_byte(path, '/')
+		dir := path[:cut]
+		append(&aw.names, strings.clone(path[cut + 1:], r.allocator))
+		dup := false
+		for x in seen {
+			dup ||= x == dir
+		}
+		if dup {
+			continue
+		}
+		append(&seen, dir)
+		if wid, werr := fs.registry_watch_dir(reg, dir, _auth_watch_event, aw); werr == .None {
+			append(&aw.dirs, wid)
+		}
+	}
+	return aw
+}
+
+@(private)
+_auth_watch_event :: proc(data: rawptr, name: string) {
+	aw := (^Auth_Watch)(data)
+	r := aw.r
+	context = eng.context_for(r.e)
+	hit := len(name) == 0
+	for n in aw.names {
+		hit ||= n == name
+	}
+	if !hit {
+		return
+	}
+	if d, ok := _descriptor(r, aw.id); ok {
+		_auth_marked(r, d)
+	}
+}
+
+@(private)
+_auth_watch_free :: proc(r: ^Runtime, aw: ^Auth_Watch) {
+	if reg, rerr := eng.registry(r.e); rerr == .None {
+		for wid in aw.dirs {
+			fs.registry_unwatch_dir(reg, wid)
+		}
+	}
+	for n in aw.names {
+		delete(n, r.allocator)
+	}
+	delete(aw.names)
+	delete(aw.dirs)
+	delete(aw.id, r.allocator)
+	free(aw, r.allocator)
+}
+
+@(private)
+_auth_marks_free :: proc(r: ^Runtime) {
+	for k, v in prim.unordered(r.auth_marks) {
+		delete(k, r.allocator)
+		delete(v.sig, r.allocator)
+		if v.watch != nil {
+			_auth_watch_free(r, v.watch)
+		}
+	}
+	delete(r.auth_marks)
+	r.auth_marks = nil
+}
+
+@(private)
+_auth_watch_disarm :: proc(r: ^Runtime, aw: ^Auth_Watch) {
+	if aw == nil {
+		return
+	}
+	prim.timer(eng.loop(r.e), 0, aw, proc(l: ^prim.Loop, data: rawptr) {
+		aw := (^Auth_Watch)(data)
+		context = eng.context_for(aw.r.e)
+		_auth_watch_free(aw.r, aw)
+	})
 }
 
 provider_auth_failed :: proc(r: ^Runtime, id: string) {
@@ -420,6 +524,7 @@ provider_auth_failed :: proc(r: ^Runtime, id: string) {
 	mk := Auth_Mark{pending = true}
 	if old, had := &r.auth_marks[id]; had {
 		delete(old.sig, r.allocator)
+		_auth_watch_disarm(r, old.watch)
 		old^ = mk
 	} else {
 		r.auth_marks[strings.clone(id, r.allocator)] = mk
@@ -434,6 +539,7 @@ provider_auth_ok :: proc(r: ^Runtime, id: string) {
 	k, v := delete_key(&r.auth_marks, id)
 	delete(k, r.allocator)
 	delete(v.sig, r.allocator)
+	_auth_watch_disarm(r, v.watch)
 	readvertise_all(r)
 }
 

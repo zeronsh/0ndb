@@ -2189,8 +2189,15 @@ live runner by default:
   runs fail at once without spawning it. The mark records the auth files'
   identity (size, mtime and a content hash) once the failed run's process
   has exited, after the CLI's own rewrite of them; any later change to that
-  identity is a new sign-in and clears the mark at the next check, and so
-  does a run that succeeds.
+  identity is a new sign-in and clears the mark, and so does a run that
+  succeeds. While a provider is marked, the runner watches just the
+  directories of its auth files through the mount watcher's backends
+  (`registry_watch_dir`: inotify, FSEvents, ReadDirectoryChangesW, not
+  recursive where the platform allows); an event on one of those files
+  rechecks the identity, so a sign-in clears the mark and re-advertises the
+  runner directory without anyone querying, and the watch is disarmed when
+  the mark clears. A daemon with every provider signed in holds no such
+  watch.
 - **Sleep and wake.** A sleeping pool runner's lease lapses. On wake its
   pool readmits it with an ephemeral lease token on its existing `Add` (see
   Runner pools), without enrolling again and without a membership record;
