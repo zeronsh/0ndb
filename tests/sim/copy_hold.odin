@@ -278,6 +278,45 @@ _copy_hold :: proc(w: ^World) {
 		world_fail(w, "copy hold: the third device's feature write never reached the mount's disk")
 		return
 	}
+	if env_u64("SIM_HOLD_NOCOPY", 0) != 0 {
+		_hold.on = false
+		for cn in b.conns {
+			conn_reset(cn, true)
+		}
+		run_until(w, w.now + 30_000_000_000, true)
+		{
+			context = instance_context(&a.inst)
+			defer node_after(a)
+			sm := _hold_mount(a)
+			v, _, _ := fs.history_line(sm.m.history, HOLD_FEATURE, context.temp_allocator)
+			from := len("shared a\n")
+			if _, rerr := fs.mount_redact_range(sm.m, "a.txt", v, from, from + len(HOLD_TEXT), context.temp_allocator); rerr != .None {
+				world_fail(w, "nocopy redact: %v", rerr)
+				return
+			}
+			eng.tree_unmount(&a.e, sm.m)
+			for x, i in a.mounts {
+				if x.root == HOLD_ROOT {
+					ordered_remove(&a.mounts, i)
+					break
+				}
+			}
+			for x, i in m.mounts {
+				if x.node == a.idx && x.root == HOLD_ROOT {
+					ordered_remove(&m.mounts, i)
+					break
+				}
+			}
+		}
+		run_until(w, w.now + 30_000_000_000, true)
+		for n in ([]^Node{a, b, c}) {
+			for line in ([]string{"main", HOLD_FEATURE}) {
+				d, rok := _hold_read(n, tree, line)
+				fmt.eprintfln("NOCOPY %s %s %q %v", n.name, line, d, rok)
+			}
+		}
+		return
+	}
 	back := make([dynamic]Git_Change, context.temp_allocator)
 	if res, err := git_checkout(vfs, HOLD_ROOT, "main", false, when_s, node_clock(&a.clock), rng_random(&w.rng), &back); res != .Done || err != .None {
 		world_fail(w, "copy hold: checkout main: %v %v", res, err)
