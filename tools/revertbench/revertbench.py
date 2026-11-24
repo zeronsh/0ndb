@@ -15,7 +15,7 @@ BROKEN = os.environ.get("RB_BROKEN", "")
 PERSON = os.environ.get("RB_PERSON", "api")
 PERSON_SETTLE = float(os.environ.get("RB_PERSON_SETTLE", "1.5"))
 HOLD = float(os.environ.get("RB_HOLD", "4"))
-CRASH_DELAYS = [float(x) for x in os.environ.get("RB_CRASH_DELAYS", "0.05,0.2,0.6").split(",") if x]
+CRASH_DELAYS = [float(x) for x in os.environ.get("RB_CRASH_DELAYS", "0,0.001,0.002,0.003,0.004,0.005,0.006,0.007,0.008,0.01,0.013").split(",") if x]
 
 
 def parse_value(v):
@@ -158,7 +158,9 @@ class Turns:
 def shell_command(ops):
     blob = base64.b64encode(json.dumps(ops).encode()).decode()
     cmd = '"%s" "%s" "%s" "%s"' % (PY, OP, blob, Turns.workdir)
-    return "& " + cmd if WIN else cmd
+    cmd = "& " + cmd if WIN else cmd
+    linger = os.environ.get("RB_LINGER", "0")
+    return cmd + ("; Start-Sleep " if WIN else " ; sleep ") + linger if linger != "0" else cmd
 
 
 class FakeProvider(BaseHTTPRequestHandler):
@@ -428,7 +430,7 @@ def run_case(case, out_root, url, crash, run="undo"):
     if WIN and case.uses_links:
         res["skipped"] = "symlinks need admin or Developer Mode on Windows"
         return res
-    d = os.path.join(out_root, case.name + ("_crash%g" % crash if crash else "_" + run))
+    d = os.path.join(out_root, case.name + ("_crash%g" % crash if crash is not None else "_" + run))
     import shutil
     shutil.rmtree(d, ignore_errors=True)
     os.makedirs(d)
@@ -469,11 +471,18 @@ def run_case(case, out_root, url, crash, run="undo"):
             raise RuntimeError("no message id for the turn")
         if not BROKEN and not NOOP and not res["ok"]:
             raise RuntimeError("setup or turn not as modelled; the operations were not run")
-        if crash:
+        if crash is not None:
             p = subprocess.Popen(H.LIMIT + [H.BIN, "undo", msg, "--home", dev.home], cwd=dev.dir, env=dev.env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             time.sleep(crash)
             inside = p.poll() is None
             kill9(dev)
+            try:
+                p.kill()
+            except OSError:
+                pass
+            at_kill = snapshot(work)
+            same = not diff(case.undone, case.post)
+            phase = "same-tree" if same else ("before" if not diff(case.post, at_kill) else ("after" if not diff(case.undone, at_kill) else "during"))
             try:
                 p.wait(timeout=10)
             except Exception:
@@ -483,9 +492,13 @@ def run_case(case, out_root, url, crash, run="undo"):
             time.sleep(4)
             got = snapshot(work)
             a, b = diff(case.undone, got), diff(case.post, got)
-            res["kill_inside_undo"] = inside
-            record("crash undo", [], [] if (not a or not b) else ["mix: vs pre-turn " + "; ".join(a[:4]) + " || vs post-turn " + "; ".join(b[:4])], "kill inside the undo: %s; state %s" % (inside, "pre" if not a else ("post" if not b else "mix")))
-            if status(dev, obj)["position"] is not None:
+            st0 = status(dev, obj)
+            res["phase"] = phase
+            res["undo_recorded"] = st0["position"] is None
+            res["after_restart"] = "same-tree" if same else ("pre" if not a else ("post" if not b else "mix"))
+            res["cli_still_running"] = inside
+            record("crash undo", [], [] if (not a or not b) else ["mix: vs pre-turn " + "; ".join(a[:4]) + " || vs post-turn " + "; ".join(b[:4])], "killed %s the tree changed; undo recorded after restart: %s; state after restart %s" % (phase, res["undo_recorded"], res["after_restart"]))
+            if not res["undo_recorded"]:
                 cli_raw(dev, "continue")
                 cli_raw(dev, "undo", msg)
             t0 = time.time()
@@ -573,16 +586,24 @@ def main():
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     url = "http://127.0.0.1:%d" % srv.server_address[1]
     results = []
-    runs = [("undo", 0.0), ("switch", 0.0), ("redo-regenerate", 0.0)] + ([("undo", x) for x in CRASH_DELAYS] if os.environ.get("RB_CRASH", "1") != "0" else [])
+    runs = [] if os.environ.get("RB_CRASH_ONLY", "0") != "0" else [("undo", None), ("switch", None), ("redo-regenerate", None)]
+    runs += ([("undo", x) for x in CRASH_DELAYS] if os.environ.get("RB_CRASH", "1") != "0" else [])
     for c in cases:
         for run, crash in runs:
             r = run_case(c, out_root, url, crash, run)
             results.append(r)
             bad = ["%s: %s" % (x["step"], "; ".join(x["errs"] + ([] if x["na"] else x["diff"][:3]))) for x in r["steps"] if x["errs"] or (x["diff"] and not x["na"])]
-            inside = " kill_inside=%s" % r["kill_inside_undo"] if "kill_inside_undo" in r else ""
-            print("%-18s %-16s %s%s %s" % (c.name, "crash%g" % crash if crash else run, "SKIP " + r["skipped"] if r.get("skipped") else ("ok" if r["ok"] else "FAIL"), inside, (r.get("error", "") + " " + " | ".join(bad))[:700]), flush=True)
+            inside = " kill=%s recorded=%s restart=%s" % (r["phase"], r["undo_recorded"], r["after_restart"]) if "phase" in r else ""
+            print("%-18s %-16s %s%s %s" % (c.name, "crash%g" % crash if crash is not None else run, "SKIP " + r["skipped"] if r.get("skipped") else ("ok" if r["ok"] else "FAIL"), inside, (r.get("error", "") + " " + " | ".join(bad))[:700]), flush=True)
             if r.get("skipped"):
                 break
+    phases = {}
+    for r in results:
+        if "phase" in r:
+            k = (r["phase"], r["undo_recorded"], r["after_restart"])
+            phases[k] = phases.get(k, 0) + 1
+    for k, n in sorted(phases.items()):
+        print("KILL %d runs: killed %s the tree changed, undo recorded=%s, after restart=%s" % ((n,) + k), flush=True)
     if NOOP or BROKEN:
         names = {"undo", "redo", "undo again", "regenerate", "regenerate after redo", "switch back", "switch forward"}
         checked = [(r["case"], r["run"], x) for r in results for x in r["steps"] if not x["na"] and (BROKEN or x["step"] in names)]
