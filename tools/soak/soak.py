@@ -174,6 +174,7 @@ class Daemon:
             if os.path.exists(self.sock):
                 try:
                     Client(self.sock).close()
+                    self.guard()
                     return
                 except OSError:
                     pass
@@ -181,6 +182,15 @@ class Daemon:
                 raise RuntimeError("the daemon exited at start with %s" % self.proc.returncode)
             time.sleep(0.025)
         raise RuntimeError("the daemon socket never appeared")
+
+    def guard(self):
+        if not sys.platform.startswith("linux"):
+            return
+        have = open("/proc/%d/environ" % self.proc.pid, "rb").read().split(b"\0")
+        want = ("ANTHROPIC_BASE_URL=" + self.env["ANTHROPIC_BASE_URL"]).encode()
+        if want not in have:
+            self.stop()
+            raise RuntimeError("the daemon runs without ANTHROPIC_BASE_URL, so its provider would call the real API")
 
     def stop(self):
         if self.proc and self.proc.poll() is None:
@@ -206,6 +216,26 @@ class Daemon:
         if p.returncode != 0:
             raise RuntimeError("0ndb %s -> %d %s%s" % (" ".join(args), p.returncode, p.stdout, p.stderr))
         return json.loads(p.stdout or "{}")
+
+
+def isolated():
+    if not sys.platform.startswith("linux"):
+        return False
+    try:
+        return all(l.split(":")[0].strip() == "lo" for l in open("/proc/net/dev").read().splitlines()[2:])
+    except OSError:
+        return False
+
+
+def isolate():
+    if isolated():
+        return
+    if sys.platform.startswith("linux"):
+        if not shutil.which("unshare"):
+            sys.exit("soak: unshare is needed to keep the daemon off the network")
+        os.execvp("unshare", ["unshare", "-rn", "sh", "-c", 'ip link set lo up; exec "$@"', "x", sys.executable, os.path.abspath(__file__)] + sys.argv[1:])
+    if os.environ.get("SOAK_ALLOW_NETWORK") != "1":
+        sys.exit("soak: this platform cannot cut the daemon off the network, and a daemon that loses ANTHROPIC_BASE_URL would call the real API; set SOAK_ALLOW_NETWORK=1 only with that host's egress blocked another way")
 
 
 def sample_proc(pid):
@@ -760,6 +790,7 @@ def main():
     ap.add_argument("--stop", action="store_true", help="stop at the first finding")
     ap.add_argument("--keep", action="store_true")
     args = ap.parse_args()
+    isolate()
     s = Soak(args)
     try:
         s.run()
