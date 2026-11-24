@@ -79,7 +79,7 @@ _closes_destroy :: proc(w: ^World) {
 deferred_close_note :: proc(w: ^World, n: ^Node, sm: Sim_Mount, op: ^M_Op, before: []crdt.Op_Id) {
 	stat_add(w, STAT_CLOSE_DEFERRED)
 	world_note(w, "%s a scope close on %s/%s is deferred; its base outcome is owed", n.name, sm.root, op.path)
-	append(&_closes, Deferred_Close{n.idx, int(n.incarnation), strings.clone(sm.root, w.allocator), strings.clone(op.path, w.allocator), op.actor, op.idx, strings.clone(fs.mount_line(sm.m), w.allocator), slice.clone(before, w.allocator)})
+	append(&_closes, Deferred_Close{n.idx, int(n.incarnation), strings.clone(sm.root, w.allocator), strings.clone(op.path, w.allocator), op.actor, op.idx, strings.clone(sm.m.line, w.allocator), slice.clone(before, w.allocator)})
 }
 
 deferred_close_outcome :: proc(w: ^World, n: ^Node, root: string, path: string, note: fs.Base_Note, actor: prim.Id) {
