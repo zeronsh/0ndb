@@ -1277,8 +1277,7 @@ int ondb_tool_result(ondb *h, const uint8_t space[16], const uint8_t object[16],
 #define ONDB_OP_AWAIT 72u
 /* assign(object: object, msg: rid, runner: id) -> Result */
 #define ONDB_OP_ASSIGN 73u
-/* redact(object: object, msg: rid) -> Result */
-#define ONDB_OP_REDACT 74u
+/* 74: removed, returns ONDB_UNSUPPORTED */
 /* map.create(space: id, title: str, settings: bytes) -> object:object */
 #define ONDB_OP_MAP_CREATE 75u
 /* map.get(object: object, key: bytes) -> found:bool entry:Entry */
@@ -1293,8 +1292,7 @@ int ondb_tool_result(ondb *h, const uint8_t space[16], const uint8_t object[16],
 #define ONDB_OP_MAP_ADD 80u
 /* map.remove(object: object, key: bytes, tag: uvarint, element: bytes) -> Result */
 #define ONDB_OP_MAP_REMOVE 81u
-/* map.redact(object: object, key: bytes) -> {} */
-#define ONDB_OP_MAP_REDACT 82u
+/* 82: removed, returns ONDB_UNSUPPORTED */
 /* text.create(space: id, title: str, initial: str) -> object:object */
 #define ONDB_OP_TEXT_CREATE 83u
 /* text.read(object: object) -> text:str */
@@ -1303,8 +1301,7 @@ int ondb_tool_result(ondb *h, const uint8_t space[16], const uint8_t object[16],
 #define ONDB_OP_TEXT_SPANS 85u
 /* text.edit(object: object, pos: uvarint, remove: uvarint, insert: str) -> Result */
 #define ONDB_OP_TEXT_EDIT 86u
-/* text.redact(object: object, pos: uvarint, len: uvarint) -> {} */
-#define ONDB_OP_TEXT_REDACT 87u
+/* 87: removed, returns ONDB_UNSUPPORTED */
 /* tree.create(space: id, title: str) -> object:object */
 #define ONDB_OP_TREE_CREATE 88u
 /* tree.read(object: object, path: str, line: str, version: bytes) -> text:str line:str base:bytes */
