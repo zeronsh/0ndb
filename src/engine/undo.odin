@@ -721,6 +721,26 @@ _cu_drive :: proc(e: ^Engine, o: Object, undo: prim.Id, fresh: bool) -> Error {
 }
 
 @(private)
+_cu_wait_object :: proc(e: ^Engine, on: Object, o: Object, move: prim.Id) {
+	r := new(Cu_Redrive, e.allocator)
+	r^ = Cu_Redrive{e = e, o = o, move = move}
+	w := new(Waiter, e.allocator)
+	w.space = on.space
+	w.object = on.id
+	w.tick = e.tick
+	w.ready = Ready{data = r, call = proc(data: rawptr, e: ^Engine, err: Error) {
+		r := (^Cu_Redrive)(data)
+		ee, oo, mm := r.e, r.o, r.move
+		free(r, ee.allocator)
+		context = context_for(ee)
+		if err == .None && _cu_drive(ee, oo, mm, false) == .Pending && ee.undo_hooks.pending != nil {
+			ee.undo_hooks.pending(ee.undo_hooks.data, ee, oo, mm)
+		}
+	}}
+	append(&e.waiters, w)
+}
+
+@(private)
 Cu_Redrive :: struct {
 	e:    ^Engine,
 	o:    Object,
@@ -1108,7 +1128,12 @@ _cu_cancel_set :: proc(e: ^Engine, o: Object, st: ^convo.Undo_State, list: []con
 		for r in un.reverts {
 			th := _handle_get(e, Object{o.space, r.tree}, .File_Tree) or_return
 			_hist_ready(e, th) or_return
+			tree_version(e, Object{o.space, r.tree}, r.line, context.temp_allocator) or_return
 			before, ferr := fs.revert_parents(th.hist, r.revert, context.temp_allocator)
+			if ferr == .Not_Found {
+				_cu_wait_object(e, Object{o.space, r.tree}, o, st.id)
+				return nil, .Pending
+			}
 			if ferr != .None {
 				return nil, _ferr(ferr)
 			}
