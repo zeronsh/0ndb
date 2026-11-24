@@ -502,7 +502,7 @@ revert_text :: proc(h: ^History, b: ^Builder, ino: fstree.Inode_Id, bl, cl: []cr
 		if e.visible {
 			builder_delete(b, ino, e.pos, e.len)
 		} else {
-			builder_copy(b, ino, e.pos, e.src, e.len)
+			builder_copy_root(b, ino, e.pos, e.src, e.len)
 		}
 	}
 	return .None
@@ -765,10 +765,10 @@ revert_accept_ops :: proc(h: ^History, c: Text_Conflict, version: []crdt.Op_Id, 
 			if s.len <= 0 {
 				continue
 			}
-			r := crdt.Op_Run{target = target, kind = .Insert_Copy, pos = pos, len = s.len}
-			r.src = s.id
-			append(ops, r)
-			pos += s.len
+			for a in copy_roots(h, s.id, s.len) {
+				append(ops, crdt.Op_Run{target = target, kind = .Insert_Copy, pos = pos, len = a.len, src = a.op})
+				pos += a.len
+			}
 		}
 	}
 	buf := make([dynamic]u8, context.temp_allocator)
