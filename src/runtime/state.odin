@@ -372,7 +372,7 @@ runner_live :: proc(r: ^Runtime, space: prim.Id, device: prim.Id, provider: stri
 		return false
 	}
 	if device == r.self {
-		return r.cfg.runner && !r.closing && (len(provider) == 0 || _provider_installed(r, provider))
+		return r.cfg.runner && !r.closing && (len(provider) == 0 || _provider_installed(r, provider, true))
 	}
 	if !runner_present(r, space, device) {
 		return false
@@ -494,12 +494,12 @@ Installed_Probe :: struct {
 }
 
 @(private)
-_provider_installed :: proc(r: ^Runtime, id: string) -> bool {
+_provider_installed :: proc(r: ^Runtime, id: string, asked := false) -> bool {
 	if id == PROVIDER_NATIVE {
 		return true
 	}
 	now := mono_ns(r)
-	if p, ok := r.installed[id]; ok && now - p.at < INSTALLED_TTL_NS {
+	if p, ok := r.installed[id]; ok && now - p.at < INSTALLED_TTL_NS && (p.found || !asked) {
 		return p.found
 	}
 	desc, dok := _descriptor(r, id)
@@ -513,6 +513,15 @@ _provider_installed :: proc(r: ^Runtime, id: string) -> bool {
 		r.installed[strings.clone(id, r.allocator)] = {found, now}
 	}
 	return found
+}
+
+@(private)
+_provider_forget :: proc(r: ^Runtime, id: string) {
+	if id not_in r.installed {
+		return
+	}
+	k, _ := delete_key(&r.installed, id)
+	delete(k, r.allocator)
 }
 
 @(private)

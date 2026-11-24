@@ -2180,7 +2180,10 @@ live runner by default:
   resolving its executable on the device's PATH; the answer is kept per
   provider for 30 s on the engine clock and reused by placement, the runner
   check and the advert, so a send does not search PATH for every provider
-  (PATH and PATHEXT made that tens of milliseconds per send on Windows).
+  (PATH and PATHEXT made that tens of milliseconds per send on Windows). A
+  send that asks for a provider kept as not installed resolves it again at
+  once, and a spawn that fails drops the kept answer, so a stale answer never
+  costs a failed run or a wait.
 - **Not signed in.** A runner checks a harness provider's sign-in (its auth
   env or auth files) when a run begins: a provider that is not signed in on
   this device fails the run at once with an error block named
