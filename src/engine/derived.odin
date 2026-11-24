@@ -733,7 +733,7 @@ _hist_rebuild :: proc(e: ^Engine, h: ^Handle, hist: ^fs.History, shuffled: bool)
 				if !journal.is_sig(body) {
 					owned := make([]u8, len(body), context.temp_allocator)
 					copy(owned, body)
-					if _, aerr := fs.history_admit(re, s.device, pos, owned); aerr == .Not_Found {
+					if _, aerr := fs.history_admit(re, s.device, pos, owned); aerr == .Not_Found || aerr == .Need_Source {
 						break
 					} else if aerr != .None {
 						return "", false, .None
