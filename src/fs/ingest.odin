@@ -1799,32 +1799,31 @@ fork_version :: proc(m: ^Mount) -> (v: Version, err: Error) {
 		if len(only_b) == 0 {
 			continue
 		}
-		touched := make(map[fstree.Inode_Id]bool, context.temp_allocator)
-		spans_touched(h, only_b[:], &touched) or_return
 		held := true
-		for ino in prim.sorted_keys(touched) {
-			covered := false
-			for y in named {
-				if y.inode != ino {
-					continue
+		scan: for sp in only_b {
+			whole := [1]crdt.Lv_Span{sp}
+			all := make(map[fstree.Inode_Id]bool, context.temp_allocator)
+			spans_touched(h, whole[:], &all) or_return
+			for lv in sp.lv ..< sp.lv + crdt.Lv(sp.len) {
+				on := all
+				if len(all) > 1 {
+					one := [1]crdt.Lv_Span{{lv, 1}}
+					on = make(map[fstree.Inode_Id]bool, context.temp_allocator)
+					spans_touched(h, one[:], &on) or_return
 				}
-				all := true
-				for sp in only_b {
-					for lv in sp.lv ..< sp.lv + crdt.Lv(sp.len) {
-						if !crdt.graph_contains(&h.g, y.lvs, lv) {
-							all = false
+				for ino in prim.sorted_keys(on) {
+					covered := false
+					for y in named {
+						if y.inode == ino && crdt.graph_contains(&h.g, y.lvs, lv) {
+							covered = true
 							break
 						}
 					}
-					if !all {
-						break
+					if !covered {
+						held = false
+						break scan
 					}
 				}
-				covered ||= all
-			}
-			if !covered {
-				held = false
-				break
 			}
 		}
 		if !held {

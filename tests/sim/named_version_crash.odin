@@ -38,7 +38,17 @@ Named_Arm :: struct {
 	clean:   bool,
 	edit:    bool,
 	fork_check: bool,
+	two: bool,
 }
+
+@(private = "file")
+NV_D_BASE :: "d base\n"
+
+@(private = "file")
+NV_D_TOOL :: "d tool line\n"
+
+@(private = "file")
+NV_D_KEPT :: "d kept line\n"
 
 @(private = "file")
 NV_EDIT :: "edit line\n"
@@ -145,7 +155,8 @@ _named_crash :: proc(w: ^World, arm: Named_Arm, crash_at: u64) -> (res: Named_Re
 	oi := len(m.objs) - 1
 	when_s := clock_wall(&n.clock) / 1_000_000_000
 	files := [?]Git_File{{name = "a.txt", data = transmute([]u8)string(NV_BASE)}, {name = "b.txt", data = transmute([]u8)string("main b\n")}}
-	if err := git_checkout_create(vfs, NV_ROOT, files[:], when_s, node_clock(&n.clock), rng_random(&w.rng)); err != .None {
+	two_files := [?]Git_File{files[0], files[1], {name = "d.txt", data = transmute([]u8)string(NV_D_BASE)}}
+	if err := git_checkout_create(vfs, NV_ROOT, two_files[:] if arm.two else files[:], when_s, node_clock(&n.clock), rng_random(&w.rng)); err != .None {
 		world_fail(w, "named: git checkout: %v", err)
 		return
 	}
@@ -197,12 +208,41 @@ _named_crash :: proc(w: ^World, arm: Named_Arm, crash_at: u64) -> (res: Named_Re
 		if !arm.control {
 			hold := fs.scope_open(n.reg, sm.m, prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng)), holder)
 			fs.scope_write_begin(hold, "a.txt")
+			if arm.two {
+				fs.scope_write_begin(hold, "d.txt")
+			}
 		}
 		reader := fs.scope_open(n.reg, sm.m, prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng)), agent)
 		fs.scope_read_base(reader, "a.txt", transmute([]u8)string(NV_BASE))
 		if !fs.scope_pinned(reader, "a.txt") {
 			world_fail(w, "named: the reader did not pin a.txt")
 			return
+		}
+		if arm.two {
+			first := fs.scope_open(n.reg, sm.m, prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng)), agent)
+			fs.scope_read_base(first, "d.txt", transmute([]u8)string(NV_D_BASE))
+			second := fs.scope_open(n.reg, sm.m, prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng)), keeper)
+			fs.mount_observe_begin(sm.m, "d.txt", second)
+			_writer_set(w, n, NV_ROOT + "/d.txt", Writer_Info{scope = second, agent = true})
+			if err := _nv_write(vfs, NV_ROOT + "/d.txt", NV_D_BASE + NV_D_KEPT); err != .None {
+				world_fail(w, "named: keeper write to d.txt: %v", err)
+				return
+			}
+			fs.scope_close(n.reg, second)
+			_forget_scope(w, n, second)
+			fs.mount_observe_begin(sm.m, "d.txt", first)
+			_writer_set(w, n, NV_ROOT + "/d.txt", Writer_Info{scope = first, agent = true})
+			if err := _nv_write(vfs, NV_ROOT + "/d.txt", NV_D_BASE + NV_D_TOOL); err != .None {
+				world_fail(w, "named: agent write to d.txt: %v", err)
+				return
+			}
+			fs.scope_close(n.reg, first)
+			_forget_scope(w, n, first)
+			de, dfound, _ := fs.shadow_get(&sm.m.shadow, "d.txt")
+			if !dfound || de.ver == 0 {
+				world_fail(w, "named: d.txt's entry names no version, so the two-file arm proves nothing")
+				return
+			}
 		}
 		if !arm.control {
 			other := fs.scope_open(n.reg, sm.m, prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng)), keeper)
@@ -327,6 +367,17 @@ _named_crash :: proc(w: ^World, arm: Named_Arm, crash_at: u64) -> (res: Named_Re
 					}
 				}
 				_nv_authors(w, n, tree, arm, crash_at, NV_FEATURE, agent, keeper)
+				if sm := _nv_mount(n); sm != nil && sm.m.fork_rejected > 0 {
+					world_fail(w, "named fork: %v: the fork left out %d named versions the disk holds, at disk op %d", arm, sm.m.fork_rejected, crash_at)
+				}
+				if arm.two {
+					ddata, derr := eng.tree_read(&n.e, tree, "d.txt", context.temp_allocator, {}, NV_FEATURE)
+					for line in ([]string{NV_D_BASE, NV_D_KEPT, NV_D_TOOL}) {
+						if c := strings.count(string(ddata), line); derr != .None || c != 1 {
+							world_fail(w, "named fork: %v: %q appears %d times in d.txt on the new line (%v %q), at disk op %d", arm, strings.trim_space(line), c, derr, string(ddata), crash_at)
+						}
+					}
+				}
 			}
 		}
 	}
@@ -415,6 +466,9 @@ named_version_crash :: proc(t: ^testing.T) {
 	test_begin(t)
 	defer test_end(t)
 	for kind in Named_Kind {
+		if env_u64("NV_FORK", 0) != 0 {
+			break
+		}
 		for bits in 0 ..< 10 {
 			arm := Named_Arm{kind = kind, process = bits & 1 != 0, early = bits & 2 != 0, control = bits >= 4, clean = bits >= 8}
 			points, named, ahead, settled, bad := 0, 0, 0, 0, 0
@@ -441,8 +495,11 @@ named_version_crash :: proc(t: ^testing.T) {
 			testing.expect(t, arm.control || named > 0, fmt.tprintf("named_version_crash %v: no run had a named version in flight", arm))
 		}
 	}
-	for bits in ([]int{0, 1, 4, 5, 8, 9}) {
-		arm := Named_Arm{kind = .Checkout_New, process = bits & 1 != 0, control = bits >= 4, clean = bits >= 8, fork_check = true}
+	for bits in ([]int{0, 1, 4, 5, 8, 9, 16, 17}) {
+		arm := Named_Arm{kind = .Checkout_New, process = bits & 1 != 0, control = bits >= 4 && bits < 16, clean = bits >= 8 && bits < 16, two = bits >= 16, fork_check = true}
+		if env_u64("NV_FORK", 0) == 2 && !arm.two {
+			continue
+		}
 		points, named, forked, bad := 0, 0, 0, 0
 		for k in u64(1) ..= 4000 {
 			failures, res := named_version_run(1, arm, k)
@@ -462,10 +519,13 @@ named_version_crash :: proc(t: ^testing.T) {
 			}
 			points += 1
 		}
-		fmt.eprintf("named_version_crash: fork process=%v control=%v clean=%v: points=%d named=%d forked=%d failed=%d\n", arm.process, arm.control, arm.clean, points, named, forked, bad)
+		fmt.eprintf("named_version_crash: fork process=%v control=%v clean=%v two=%v: points=%d named=%d forked=%d failed=%d\n", arm.process, arm.control, arm.clean, arm.two, points, named, forked, bad)
 		testing.expect(t, forked > 0, fmt.tprintf("named_version_crash fork %v: no run ended on the new line", arm))
 	}
 	for kind in Named_Kind {
+		if env_u64("NV_FORK", 0) != 0 {
+			break
+		}
 		for process in ([]bool{false, true}) {
 			arm := Named_Arm{kind = kind, process = process, edit = true}
 			points, named, edited, wrong, awake, bad := 0, 0, 0, 0, 0, 0
