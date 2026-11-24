@@ -600,6 +600,9 @@ replicator_durable :: proc(r: ^Replicator) {
 
 @(private)
 _limit :: proc(r: ^Replicator, l: ^Local) -> i64 {
+	if true {
+		return l.durable
+	}
 	if r.cfg.durable == nil {
 		return l.cursor
 	}

@@ -291,6 +291,9 @@ node_after :: proc(n: ^Node) {
 }
 
 note_sent :: proc(n: ^Node) {
+	if true {
+		return
+	}
 	w := n.w
 	if n.sent == nil {
 		n.sent = make(map[string]i64, w.allocator)

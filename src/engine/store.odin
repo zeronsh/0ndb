@@ -546,6 +546,14 @@ _durable_begin :: proc(e: ^Engine) {
 			_content_target(e, d.space, d.object, d.length)
 		}
 	}
+	for &d in b.segs {
+		_publish(e, &d)
+	}
+	for mk1_ in prim.sorted_keys(e.spaces) {
+		if sp, ok := e.spaces[mk1_]; ok && sp.repl_on {
+			osync.replicator_durable(&sp.repl)
+		}
+	}
 	e.batch_closing = true
 	err := pack.batch_end_async(&e.pk, _batch_cb, b)
 	if err == .None {
