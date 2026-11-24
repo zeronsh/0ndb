@@ -1,7 +1,6 @@
 package sim
 
 import eng "../../src/engine"
-import "../../src/obj"
 import "../../src/prim"
 
 STAT_BITROT_FLIPS: Stat
@@ -68,77 +67,6 @@ _bitrot_write :: proc(w: ^World, n: ^Node, o: eng.Own_Length, at: i64, bit: u8) 
 	}
 	stat_add(w, STAT_BITROT_FLIPS)
 	return true
-}
-
-bitrot_redact_weight :: proc(w: ^World) -> int {
-	return 1 if bitrot_on(w) else 0
-}
-
-bitrot_redact :: proc(w: ^World, n: ^Node) {
-	if !n.alive || !n.e_open {
-		return
-	}
-	m := &w.model
-	cands := make([dynamic]^M_Op, context.temp_allocator)
-	for op in m.ops {
-		if op.kind != .Send || op.node != n.idx || op.status != .Acked || obj.rid_none(op.rid) || op.rid.seg != n.identity.id {
-			continue
-		}
-		taken := false
-		for x in m.ops {
-			if x.kind == .Redact_Msg && x.target == op.idx {
-				taken = true
-				break
-			}
-		}
-		if !taken {
-			append(&cands, op)
-		}
-	}
-	if len(cands) == 0 {
-		return
-	}
-	t := cands[rng_int(&w.rng, len(cands))]
-	at := t.rid.off + 4 + i64(rng_int(&w.rng, 16))
-	bit := u8(1) << u8(rng_int(&w.rng, 8))
-	first := rng_chance(&w.rng, 1, 2)
-	oi := t.obj
-	o := m.objs[oi].o
-	context = instance_context(&n.inst)
-	own, err := eng.own_lengths(&n.e, context.temp_allocator)
-	if err != .None {
-		return
-	}
-	found := false
-	ol: eng.Own_Length
-	for x in own {
-		if x.object == o.id && x.kind == .Conversation && !x.device {
-			ol = x
-			found = true
-		}
-	}
-	if !found || at >= ol.uploaded {
-		return
-	}
-	node_after(n)
-	length, base, exists := relay_probe(w, ol.space, ol.stream)
-	context = instance_context(&n.inst)
-	if !exists || at < base || at >= length {
-		return
-	}
-	if first && !_bitrot_write(w, n, ol, at, bit) {
-		return
-	}
-	op := new_op(m, .Redact_Msg, n, oi)
-	op.target = t.idx
-	snapshot_search_models(w, n, op)
-	context = instance_context(&n.inst)
-	rerr := eng.convo_redact(&n.e, o, t.rid, op_done_handle(op))
-	op_result(op, n, rerr)
-	if !first {
-		_bitrot_write(w, n, ol, at, bit)
-	}
-	world_note(w, "%s bit rot and redaction (%s first) of its own message %s at %d of %s -> %v", n.name, "flip" if first else "redaction", t.token, at, id_short(o.id), rerr)
 }
 
 bitrot_settle :: proc(w: ^World) {
@@ -209,7 +137,6 @@ check_bitrot :: proc(w: ^World) {
 @(init)
 _bitrot_hooks :: proc "contextless" () {
 	register_op(90, "bitrot", bitrot_weight, bitrot_flip)
-	register_op(91, "bitrot_redact", bitrot_redact_weight, bitrot_redact)
 	register_final_check(2, bitrot_settle)
 	register_final_check(115, check_bitrot)
 	register_stat_line(47, "bitrot")
