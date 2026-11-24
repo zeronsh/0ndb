@@ -530,6 +530,7 @@ Mount :: struct {
 	holds:       [dynamic]Path_Hold,
 	reload_ms:   i64,
 	reload_owed: bool,
+	stuck:       [dynamic]string,
 	reshow:      [dynamic]string,
 	branch:      string,
 	home:        string,
@@ -673,6 +674,7 @@ mount_open :: proc(m: ^Mount, reg: ^Registry, h: ^History, db: ^odb.Odb, id: pri
 	m.stale_temps = make([dynamic]string, allocator)
 	m.holds = make([dynamic]Path_Hold, allocator)
 	m.reshow = make([dynamic]string, allocator)
+	m.stuck = make([dynamic]string, allocator)
 	ok := false
 	defer if !ok {
 		mount_close(m)
@@ -749,6 +751,10 @@ mount_open :: proc(m: ^Mount, reg: ^Registry, h: ^History, db: ^odb.Odb, id: pri
 	before := mount_jlen(m)
 	m.sweep_temps = true
 	rerr := mount_open_rest(m, fresh)
+	if rerr == .Corrupt && m.shadow.damaged {
+		mount_heal(m) or_return
+		rerr = mount_open_rest(m, fresh)
+	}
 	if err := rerr; err != .None {
 		if mount_jlen(m) == before {
 			return err
@@ -955,6 +961,10 @@ mount_close :: proc(m: ^Mount) {
 		delete(c, m.allocator)
 	}
 	delete(m.reshow)
+	for c in m.stuck {
+		delete(c, m.allocator)
+	}
+	delete(m.stuck)
 	for k in m.dirty {
 		delete(k, m.allocator)
 	}
@@ -1007,6 +1017,7 @@ mount_wake :: proc(m: ^Mount) -> Error {
 		} else if err == .None {
 			m.reload_ms = 0
 			m.reload_owed = false
+			err = mount_heal(m)
 		}
 		return err
 	}
@@ -1014,7 +1025,7 @@ mount_wake :: proc(m: ^Mount) -> Error {
 	format := m.db.format if m.db != nil else odb.Hash_Format.Sha1
 	if !shadow_attached(&m.shadow) {
 		if m.shadow.dir == "" {
-			shadow_open(&m.shadow, m.vfs, sp, format, m.allocator) or_return
+			shadow_open(&m.shadow, m.vfs, sp, format, m.allocator, m.shadow_mark) or_return
 			if m.history != nil {
 				m.shadow.clock = m.history.opts.clock
 			}
@@ -1048,7 +1059,7 @@ mount_wake :: proc(m: ^Mount) -> Error {
 		}
 		m.watched = true
 	}
-	return .None
+	return mount_heal(m)
 }
 
 mount_hibernate :: proc(m: ^Mount) -> Error {
@@ -1670,7 +1681,10 @@ mount_closed :: proc(m: ^Mount, rel: string) {
 	if rerr != .None {
 		return
 	}
-	prev, has_prev, _ := shadow_get(&m.shadow, rel)
+	prev, has_prev, perr := shadow_get(&m.shadow, rel)
+	if perr != .None {
+		return
+	}
 	cleaned, cok := eol_clean(m, rel, data, prev.inode, has_prev && prev.kind == .File)
 	if !cok {
 		return
@@ -1802,6 +1816,10 @@ mount_step :: proc(m: ^Mount) -> Error {
 	}
 	if err == .Reloading {
 		mount_reload_retry(m)
+	}
+	if err == .Corrupt && m.shadow.damaged {
+		m.rescan = true
+		mount_schedule(m, 0)
 	}
 	if fence {
 		i := 0
@@ -2219,6 +2237,18 @@ load_mount_state :: proc(m: ^Mount) -> (fresh: bool, err: Error) {
 		rec_head.commit = prim.read_str(&rd)
 		rec_reflog = prim.read_ivarint(&rd)
 	}
+	if prim.reader_remaining(&rd) > 0 {
+		nh := prim.read_uvarint(&rd)
+		if nh > u64(prim.reader_remaining(&rd)) {
+			return false, .Corrupt
+		}
+		for _ in 0 ..< nh {
+			p := prim.read_str(&rd)
+			if prim.reader_ok(&rd) {
+				mount_stuck_add(m, p)
+			}
+		}
+	}
 	m.jpend = m.jpos
 	if !prim.reader_ok(&rd) {
 		return false, .Corrupt
@@ -2569,6 +2599,10 @@ save_mount_state :: proc(m: ^Mount) -> Error {
 	prim.write_str(&w, rec.head.branch)
 	prim.write_str(&w, rec.head.commit)
 	prim.write_ivarint(&w, rec.reflog_pos)
+	prim.write_uvarint(&w, u64(len(m.stuck)))
+	for p in m.stuck {
+		prim.write_str(&w, p)
+	}
 	sum := xxhash.XXH3_64_with_seed(buf[:], 0) | 1
 	if sum == m.saved {
 		return .None

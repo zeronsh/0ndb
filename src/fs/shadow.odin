@@ -114,6 +114,8 @@ Shadow :: struct {
 	ver_index:  map[u64]u32,
 	ver_gen:    u32,
 	ver_ids:    [dynamic]fstree.Op_Id,
+	mark:       Shadow_Mark,
+	damaged:    bool,
 }
 
 SHADOW_VERSION_MAX :: 1024
@@ -190,13 +192,14 @@ versions_clear :: proc(s: ^Shadow) {
 	s.ver_gen = (s.ver_gen + 1) & 0xff
 }
 
-shadow_open :: proc(s: ^Shadow, vfs: prim.Vfs, dir: string, format: odb.Hash_Format, allocator := context.allocator) -> Error {
+shadow_open :: proc(s: ^Shadow, vfs: prim.Vfs, dir: string, format: odb.Hash_Format, allocator := context.allocator, mark := Shadow_Mark{}) -> Error {
 	s^ = {
 		vfs       = vfs,
 		allocator = allocator,
 		oid_size  = odb.oid_size(format),
 		log_fd    = prim.INVALID_FD,
 		idx_fd    = prim.INVALID_FD,
+		mark      = mark,
 	}
 	d, aerr := clone_string(dir, allocator)
 	if aerr != nil {
@@ -207,7 +210,16 @@ shadow_open :: proc(s: ^Shadow, vfs: prim.Vfs, dir: string, format: odb.Hash_For
 		shadow_close(s)
 		return err
 	}
-	s.gen = read_gen(s, dir)
+	gen, have, gerr := read_gen(s, dir)
+	if gerr == .Corrupt && mark.end != 0 {
+		have, gerr = false, .None
+	}
+	if gerr != .None {
+		shadow_close(s)
+		return gerr
+	}
+	s.gen = gen if have else mark.gen
+	s.damaged = mark.end != 0 && (!have || gen != mark.gen)
 	if err := shadow_attach(s); err != .None {
 		shadow_close(s)
 		return err
@@ -234,12 +246,14 @@ shadow_attach :: proc(s: ^Shadow) -> Error {
 	err := open_gen(s)
 	if err != .None {
 		shadow_detach(s)
+	} else if !s.damaged {
+		s.mark = {s.gen, s.log_end}
 	}
 	return err
 }
 
 shadow_detach :: proc(s: ^Shadow) {
-	if s.idx_fd >= 0 && !s.idx_lost && len(s.pending) == 0 && s.log_fd >= 0 {
+	if s.idx_fd >= 0 && !s.idx_lost && !s.damaged && len(s.pending) == 0 && s.log_fd >= 0 {
 		if s.covered == s.log_end || checkpoint(s) == .None {
 			write_header(s, true)
 		}
@@ -337,7 +351,7 @@ shadow_get :: proc(s: ^Shadow, path: string) -> (e: Entry, found: bool, err: Err
 	if !ok {
 		return {}, false, .None
 	}
-	r := read_rec(s, slot.off, &s.scratch) or_return
+	r := read_live(s, slot.off, &s.scratch) or_return
 	if r.del {
 		return {}, false, .None
 	}
@@ -371,7 +385,7 @@ shadow_by_inode :: proc(s: ^Shadow, inode: fstree.Inode_Id, allocator := context
 			return
 		}
 		if slot.hash == h && slot.off != 0 {
-			r := read_rec(s, slot.off, &s.scratch) or_return
+			r := read_live(s, slot.off, &s.scratch) or_return
 			cur: Path_Slot
 			live := false
 			if !r.del && r.entry.inode == inode {
@@ -476,12 +490,14 @@ shadow_children :: proc(s: ^Shadow, dir: string, out: ^[dynamic]Shadow_Child, al
 		if steps > s.log_end {
 			return .Corrupt
 		}
-		r := read_rec(s, off, &s.scratch) or_return
+		r := read_live(s, off, &s.scratch) or_return
 		if !r.linked || len(r.path) == 0 || path_parent(r.path) != dir {
+			s.damaged = true
 			return .Corrupt
 		}
 		next := r.sibling
 		if next >= off {
+			s.damaged = true
 			return .Corrupt
 		}
 		if _, pending := s.index[r.path]; !pending {
@@ -495,7 +511,7 @@ shadow_children :: proc(s: ^Shadow, dir: string, out: ^[dynamic]Shadow_Child, al
 			if !found || cur.link != off {
 				present = false
 			} else if cur.off != off {
-				c := read_rec(s, cur.off, &s.scratch) or_return
+				c := read_live(s, cur.off, &s.scratch) or_return
 				e = c.entry
 				present = !c.del
 			}
@@ -622,6 +638,7 @@ shadow_persist :: proc(s: ^Shadow) -> Error {
 		return from_prim(err)
 	}
 	s.log_end = start + u64(len(s.out))
+	s.mark = {s.gen, s.log_end}
 	ierr: Error
 	index: {
 		pos := 0
@@ -769,6 +786,7 @@ shadow_compact :: proc(s: ^Shadow) -> Error {
 		}
 		return werr
 	}
+	s.mark = {ng, n.log_end}
 	shadow_detach(&n)
 	old_log := gen_path(s.dir, s.gen, "log", context.temp_allocator)
 	old_idx := gen_path(s.dir, s.gen, "idx", context.temp_allocator)
@@ -777,6 +795,182 @@ shadow_compact :: proc(s: ^Shadow) -> Error {
 	prim.remove(s.vfs, old_idx)
 	s.gen = ng
 	return shadow_attach(s)
+}
+
+Shadow_Row :: struct {
+	path:  string,
+	entry: Entry,
+}
+
+@(private)
+shadow_salvage :: proc(s: ^Shadow, rows: ^map[string]Entry, allocator := context.temp_allocator) -> Error {
+	if s.log_fd < 0 {
+		return .None
+	}
+	end := s.log_end
+	if s.gen == s.mark.gen && s.mark.end != 0 {
+		end = min(end, s.mark.end)
+	}
+	off := u64(SHADOW_LOG_HEADER)
+	for off < end {
+		r, err := read_rec(s, off, &s.scratch)
+		if err == .Corrupt || err == .None && off + r.size > end {
+			off = next_rec(s, off, end) or_return
+			if off == 0 {
+				return .None
+			}
+			continue
+		}
+		if err != .None {
+			return err
+		}
+		off += r.size
+		if r.del {
+			delete_key(rows, r.path)
+			continue
+		}
+		if r.path in rows {
+			rows[r.path] = r.entry
+			continue
+		}
+		p, aerr := clone_string(r.path, allocator)
+		if aerr != nil {
+			return .No_Memory
+		}
+		rows[p] = r.entry
+	}
+	return .None
+}
+
+@(private = "file")
+next_rec :: proc(s: ^Shadow, bad, end: u64) -> (off: u64, err: Error) {
+	head: [4]u8
+	got, rerr := prim.read_at(s.vfs, s.log_fd, head[:], i64(bad))
+	if rerr != .None {
+		return 0, from_prim(rerr)
+	}
+	n := u64(prim.get_u32le(head[:]))
+	if got == 4 && n <= SHADOW_MAX_RECORD && bad + 8 + n < end {
+		_, verr := read_rec(s, bad + 8 + n, &s.scratch)
+		if verr == .None {
+			return bad + 8 + n, .None
+		}
+		if verr != .Corrupt {
+			return 0, verr
+		}
+	}
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+	buf := make([]u8, 1 << 16, context.temp_allocator)
+	pos := bad + 1
+	for pos + 10 <= end {
+		got, rerr = prim.read_at(s.vfs, s.log_fd, buf[:min(u64(len(buf)), end - pos)], i64(pos))
+		if rerr != .None {
+			return 0, from_prim(rerr)
+		}
+		if got < 10 {
+			break
+		}
+		for k in 0 ..= got - 10 {
+			size := u64(prim.get_u32le(buf[k:k + 4]))
+			if size < 3 || size > 1 << 16 || buf[k + 8] != 1 && buf[k + 8] != 2 || buf[k + 9] > 3 || pos + u64(k) + 8 + size > end {
+				continue
+			}
+			_, verr := read_rec(s, pos + u64(k), &s.scratch)
+			if verr == .None {
+				return pos + u64(k), .None
+			}
+			if verr != .Corrupt {
+				return 0, verr
+			}
+		}
+		pos += u64(got - 9)
+	}
+	return 0, .None
+}
+
+@(private)
+shadow_rewrite :: proc(s: ^Shadow, rows: []Shadow_Row) -> Error {
+	held := s.lock
+	s.lock = nil
+	defer s.lock = held
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+	ng := max(s.gen, s.mark.gen, s.burned) + 1
+	for prim.exists(s.vfs, gen_path(s.dir, ng, "log", context.temp_allocator)) {
+		ng += 1
+	}
+	log_path := gen_path(s.dir, ng, "log", context.temp_allocator)
+	idx_path := gen_path(s.dir, ng, "idx", context.temp_allocator)
+	prim.remove(s.vfs, idx_path)
+	n := Shadow {
+		vfs       = s.vfs,
+		dir       = s.dir,
+		allocator = s.allocator,
+		oid_size  = s.oid_size,
+		gen       = ng,
+		log_fd    = prim.INVALID_FD,
+		idx_fd    = prim.INVALID_FD,
+	}
+	n.pending = make([dynamic]Pending_Rec, s.allocator)
+	n.index = make(map[string]int, s.allocator)
+	n.by_inode = make(map[fstree.Inode_Id]int, s.allocator)
+	n.scratch = make([dynamic]u8, s.allocator)
+	n.probe = make([dynamic]u8, s.allocator)
+	n.out = make([dynamic]u8, s.allocator)
+	n.versions = make([dynamic][]fstree.Op_Id, s.allocator)
+	ok := false
+	defer if !ok {
+		shadow_detach(&n)
+		prim.remove(s.vfs, log_path)
+		prim.remove(s.vfs, idx_path)
+	}
+	slice.sort_by(rows, proc(a, b: Shadow_Row) -> bool {
+		x, y := path_depth(a.path), path_depth(b.path)
+		return x < y || x == y && a.path < b.path
+	})
+	root := Entry{inode = fstree.ROOT, kind = .Dir}
+	body := rows
+	if len(rows) > 0 && len(rows[0].path) == 0 {
+		root = compact_entry(s, &n, rows[0].entry) or_return
+		body = rows[1:]
+	}
+	create_files(&n, cap_for(u64(len(body)) + 1), root) or_return
+	for r in body {
+		shadow_append(&n, r.path, compact_entry(s, &n, r.entry) or_return) or_return
+		if len(n.pending) >= 65536 {
+			shadow_persist(&n) or_return
+		}
+	}
+	shadow_persist(&n) or_return
+	checkpoint(&n) or_return
+	write_header(&n, true)
+	from_prim(prim.datasync(s.vfs, n.idx_fd)) or_return
+	ok = true
+	if werr := write_gen(s, s.dir, ng); werr != .None {
+		s.burned = max(s.burned, ng)
+		shadow_detach(&n)
+		return werr
+	}
+	old_gen := s.gen
+	idx_unmap(s)
+	prim.close_file(s.vfs, s.log_fd)
+	prim.close_file(s.vfs, s.idx_fd)
+	s.log_fd, s.idx_fd = n.log_fd, n.idx_fd
+	s.cap, s.used, s.inode_used = n.cap, n.used, n.inode_used
+	s.covered, s.log_end = n.covered, n.log_end
+	s.live, s.garbage = n.live, n.garbage
+	s.gen = ng
+	s.mark = {ng, n.log_end}
+	s.idx_lost = false
+	s.damaged = false
+	write_header(s, false)
+	n.log_fd, n.idx_fd = prim.INVALID_FD, prim.INVALID_FD
+	idx_unmap(&n)
+	shadow_detach(&n)
+	if old_gen != ng {
+		prim.remove(s.vfs, gen_path(s.dir, old_gen, "log", context.temp_allocator))
+		prim.remove(s.vfs, gen_path(s.dir, old_gen, "idx", context.temp_allocator))
+	}
+	return .None
 }
 
 @(private = "file")
@@ -915,7 +1109,7 @@ apply_rec :: proc(s: ^Shadow, rec: Rec, link := true) -> Error {
 	prev_inode: Maybe(fstree.Inode_Id)
 	prev_off := slot.off
 	if found {
-		old := read_rec(s, slot.off, &s.scratch) or_return
+		old := read_live(s, slot.off, &s.scratch) or_return
 		s.garbage += old.size
 		if !old.del {
 			s.live -= 1
@@ -981,6 +1175,9 @@ inode_set :: proc(s: ^Shadow, inode: fstree.Inode_Id, off: u64) -> Error {
 				}
 			} else {
 				r, rerr := read_rec(s, slot.off, &s.probe)
+				if rerr != .None && rerr != .Corrupt {
+					return rerr
+				}
 				if rerr != .None || r.del || r.entry.inode == inode {
 					return write_inode_slot(s, i, Inode_Slot{h, off})
 				}
@@ -1010,6 +1207,9 @@ inode_unset :: proc(s: ^Shadow, inode: fstree.Inode_Id, prev_off: u64) -> Error 
 				return write_inode_slot(s, i, Inode_Slot{h, 0})
 			}
 			r, rerr := read_rec(s, slot.off, &s.probe)
+			if rerr != .None && rerr != .Corrupt {
+				return rerr
+			}
 			if rerr == .None && r.entry.inode == inode {
 				return .None
 			}
@@ -1028,6 +1228,7 @@ find_path :: proc(s: ^Shadow, path: string, h: u64) -> (index: u64, slot: Path_S
 	i := h & mask
 	block: [SHADOW_BLOCK]u8
 	scanned: u64
+	bad := false
 	step := u64(8)
 	for scanned < s.cap {
 		n := min(step, s.cap - i)
@@ -1038,12 +1239,17 @@ find_path :: proc(s: ^Shadow, path: string, h: u64) -> (index: u64, slot: Path_S
 			b := buf[k * SHADOW_PATH_SLOT:]
 			sh := prim.get_u64le(b[0:8])
 			if sh == 0 {
-				return i + k, {}, false, .None
+				s.damaged ||= bad
+				return i + k, {}, false, .Corrupt if bad else .None
 			}
 			if sh == h {
 				off := prim.get_u64le(b[8:16])
-				r, rerr2 := read_rec(s, off, &s.probe)
-				if rerr2 == .None && r.path == path {
+				r, rerr := read_rec(s, off, &s.probe)
+				if rerr != .None && rerr != .Corrupt {
+					return 0, {}, false, rerr
+				}
+				bad ||= rerr == .Corrupt
+				if rerr == .None && r.path == path {
 					s.probe_del = r.del
 					sl := Path_Slot{sh, off, prim.get_u64le(b[16:24]), prim.get_u64le(b[24:32])}
 					return i + k, sl, true, .None
@@ -1202,6 +1408,13 @@ read_rec :: proc(s: ^Shadow, off: u64, buf: ^[dynamic]u8) -> (r: Rec, err: Error
 }
 
 @(private = "file")
+read_live :: proc(s: ^Shadow, off: u64, buf: ^[dynamic]u8) -> (r: Rec, err: Error) {
+	r, err = read_rec(s, off, buf)
+	s.damaged ||= err == .Corrupt
+	return
+}
+
+@(private = "file")
 decode_rec :: proc(body: []u8, oid_size: int, ids: ^[dynamic]fstree.Op_Id) -> (r: Rec, err: Error) {
 	rd := prim.reader(body)
 	kind := prim.read_u8(&rd)
@@ -1277,23 +1490,29 @@ gen_path :: proc(dir: string, gen: u64, ext: string, allocator: runtime.Allocato
 }
 
 @(private = "file")
-read_gen :: proc(s: ^Shadow, dir: string) -> u64 {
+read_gen :: proc(s: ^Shadow, dir: string) -> (gen: u64, have: bool, err: Error) {
 	buf: prim.Path_Buf
 	p, ok := path_join_buf(buf[:], dir, "shadow.gen")
 	if !ok {
-		return 0
+		return 0, false, .Name_Too_Long
 	}
-	fd, err := prim.open_file(s.vfs, p)
-	if err != .None {
-		return 0
+	fd, oerr := prim.open_file(s.vfs, p)
+	if oerr == .Not_Found {
+		return 0, false, .None
+	}
+	if oerr != .None {
+		return 0, false, from_prim(oerr)
 	}
 	defer prim.close_file(s.vfs, fd)
 	b: [16]u8
-	n, _ := prim.read_at(s.vfs, fd, b[:], 0)
-	if n != 16 || u32(xxhash.XXH3_64_default(b[0:8])) != prim.get_u32le(b[8:12]) {
-		return 0
+	n, rerr := prim.read_at(s.vfs, fd, b[:], 0)
+	if rerr != .None {
+		return 0, false, from_prim(rerr)
 	}
-	return prim.get_u64le(b[0:8])
+	if n != 16 || u32(xxhash.XXH3_64_default(b[0:8])) != prim.get_u32le(b[8:12]) {
+		return 0, false, .Corrupt
+	}
+	return prim.get_u64le(b[0:8]), true, .None
 }
 
 @(private = "file")
@@ -1316,6 +1535,10 @@ open_gen :: proc(s: ^Shadow) -> Error {
 	idx_path := gen_path(s.dir, s.gen, "idx", context.temp_allocator)
 	fd, err := prim.open_file(s.vfs, log_path, {.Write}, 0o600)
 	if err == .Not_Found {
+		if s.mark.end != 0 {
+			s.damaged = true
+			return .None
+		}
 		prim.remove(s.vfs, idx_path)
 		return create_files(s, SHADOW_MIN_CAP, Entry{inode = fstree.ROOT, kind = .Dir})
 	}
@@ -1329,6 +1552,10 @@ open_gen :: proc(s: ^Shadow) -> Error {
 	}
 	if size < SHADOW_LOG_HEADER {
 		prim.close_file(s.vfs, fd)
+		if s.mark.end != 0 {
+			s.damaged = true
+			return .None
+		}
 		prim.remove(s.vfs, idx_path)
 		return create_files(s, SHADOW_MIN_CAP, Entry{inode = fstree.ROOT, kind = .Dir})
 	}
@@ -1342,12 +1569,19 @@ open_gen :: proc(s: ^Shadow) -> Error {
 		return .Corrupt
 	}
 	s.log_end = u64(size)
+	if s.damaged || s.mark.end != 0 && s.gen == s.mark.gen && s.log_end < s.mark.end {
+		s.damaged = true
+		return .None
+	}
 	ifd, ierr := prim.open_file(s.vfs, idx_path, {.Write}, 0o600)
 	if ierr == .None {
 		s.idx_fd = ifd
 		clean, valid := load_header(s)
 		if valid {
 			if rerr := recover_tail(s, clean); rerr != .None {
+				if s.damaged {
+					return .None
+				}
 				s.idx_lost = true
 				return rerr
 			}
@@ -1358,7 +1592,10 @@ open_gen :: proc(s: ^Shadow) -> Error {
 	} else if ierr != .Not_Found {
 		return from_prim(ierr)
 	}
-	return rebuild_index(s, SHADOW_MIN_CAP)
+	if rerr := rebuild_index(s, SHADOW_MIN_CAP); rerr != .None {
+		return .None if s.damaged else rerr
+	}
+	return from_prim(prim.datasync(s.vfs, s.log_fd))
 }
 
 @(private = "file")
@@ -1466,6 +1703,10 @@ recover_tail :: proc(s: ^Shadow, clean: bool) -> Error {
 	for off < end {
 		r, err := read_rec(s, off, &s.scratch)
 		if err == .Corrupt {
+			if off < s.mark.end {
+				s.damaged = true
+				return .Corrupt
+			}
 			break
 		}
 		if err != .None {
@@ -1473,6 +1714,9 @@ recover_tail :: proc(s: ^Shadow, clean: bool) -> Error {
 		}
 		apply_rec(s, r) or_return
 		off += r.size
+	}
+	if off > s.covered {
+		from_prim(prim.datasync(s.vfs, s.log_fd)) or_return
 	}
 	if off < end {
 		from_prim(prim.truncate(s.vfs, s.log_fd, i64(off))) or_return
@@ -1538,6 +1782,9 @@ recount :: proc(s: ^Shadow) -> Error {
 				continue
 			}
 			r, err := read_rec(s, prim.get_u64le(block[k + 8:k + 16]), &s.scratch)
+			if err != .None && err != .Corrupt {
+				return err
+			}
 			if err == .None && !r.del {
 				live += 1
 			}
@@ -1599,6 +1846,10 @@ rebuild_into :: proc(s: ^Shadow, capacity: u64) -> (full: bool, err: Error) {
 	for off < end {
 		r, rerr := read_rec(s, off, &s.scratch)
 		if rerr == .Corrupt {
+			if off < s.mark.end {
+				s.damaged = true
+				return false, .Corrupt
+			}
 			break
 		}
 		if rerr != .None {
