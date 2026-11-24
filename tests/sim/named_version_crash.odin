@@ -191,7 +191,7 @@ _named_crash :: proc(w: ^World, arm: Named_Arm, crash_at: u64) -> (res: Named_Re
 	agent: prim.Id
 	before, before_feature: []u8
 	holder := prim.id_new_with(node_clock(&n.clock), rng_random(&w.rng))
-	pin: {
+	register: {
 		context = instance_context(&n.inst)
 		sm := _nv_mount(n)
 		if sm == nil {
@@ -201,6 +201,16 @@ _named_crash :: proc(w: ^World, arm: Named_Arm, crash_at: u64) -> (res: Named_Re
 		agent = fshist.ingestion_actor(sm.m.history.self, pseudo)
 		if err := fs.history_register_owned_actor(sm.m.history, agent, pseudo, owner); err != .None {
 			world_fail(w, "named: register the agent: %v", err)
+			return
+		}
+		node_after(n)
+	}
+	run_until(w, w.now + 2_000_000_000, true)
+	pin: {
+		context = instance_context(&n.inst)
+		sm := _nv_mount(n)
+		if sm == nil {
+			world_fail(w, "named: mount missing")
 			return
 		}
 		before = _nv_version(w, n, tree, "main")
