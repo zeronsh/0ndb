@@ -8,6 +8,11 @@
 # Every case runs: turn; undo (pre-turn tree); redo (post-turn tree); switch away and back (post-turn
 # tree); then, separately, the undo with a crash at every disk op, and after recovery the tree is
 # either the pre-turn tree or the post-turn tree (never a mix), and a retried undo reaches pre-turn.
+# Text values: \n inside a value is a newline, and one is appended. Trailing person ops run after the turn ends.
+# The note may hold undo:P=TEXT (the file's text after the undo, - for absent) and offer:P (the undo offers base back).
+# Person rule: a line the turn changed that someone else has edited or deleted since stays as it is, with base
+# offered; every other line goes back; a file the turn created keeps only the lines someone else touched, and is
+# removed if they only deleted.
 # Empty-directory cases first (coordinator ruling: directories that exist only because of a turn
 # go with its undo; pre-existing empty ones stay).
 mkdir_empty     | a.txt=x                 | mkdir e
@@ -40,4 +45,11 @@ symlink_retarget| a.txt=x b.txt=y l->a.txt| rm l; ln_s b.txt l
 symlink_delete  | a.txt=x l->a.txt        | rm l
 symlink_dangling| a.txt=x                 | ln_s missing.txt l
 person_between  | a.txt=x                 | write b.txt agent; person c.txt person; write b.txt agent2 | undo keeps c.txt
-person_same     | a.txt=x                 | write a.txt agent; person a.txt person-after      | person edit after the turn on the turn's file: undo keeps the person's text
+person_same     | a.txt=x                 | write a.txt agent; person a.txt person-after      | undo:a.txt=person-after offer:a.txt
+person_changed  | a.txt=1\n2\n3       | write a.txt A\n2\n3; person a.txt B\n2\n3               | undo:a.txt=B\n2\n3 offer:a.txt
+person_adjacent | a.txt=1\n2\n3       | write a.txt A\n2\n3; person a.txt A\nP\n3               | undo:a.txt=1\nP\n3
+person_far      | a.txt=1\n2\n3\n4\n5 | write a.txt A\n2\n3\n4\n5; person a.txt A\n2\n3\n4\nP   | undo:a.txt=1\n2\n3\n4\nP
+person_deleted  | a.txt=1\n2\n3       | write a.txt A\n2\n3; person a.txt 2\n3                  | undo:a.txt=2\n3 offer:a.txt
+person_new_edit | k.txt=x               | write n.txt A\nB\nC; person n.txt A\nP\nC               | undo:n.txt=P
+person_new_add  | k.txt=x               | write n.txt A\nB; person n.txt A\nP\nB                  | undo:n.txt=P
+person_new_del  | k.txt=x               | write n.txt A\nB\nC; person n.txt A\nC                  | undo:n.txt=-

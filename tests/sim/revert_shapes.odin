@@ -48,6 +48,8 @@ Rs_Case :: struct {
 	name:  string,
 	setup: []string,
 	ops:   []Rs_Op,
+	undo:  [][2]string,
+	offer: []string,
 }
 
 @(private = "file")
@@ -89,7 +91,8 @@ _rs_text :: proc(v: string, alloc: runtime.Allocator) -> string {
 			return _rs_big(n, alloc)
 		}
 	}
-	return strings.concatenate({v, "\n"}, alloc)
+	u, _ := strings.replace_all(v, "\\n", "\n", alloc)
+	return strings.concatenate({u, "\n"}, alloc)
 }
 
 @(private = "file")
@@ -115,6 +118,18 @@ _rs_cases :: proc(alloc: runtime.Allocator) -> []Rs_Case {
 			append(&ops, Rs_Op{verb = w[0], args = w[1:]})
 		}
 		c.ops = ops[:]
+		undo := make([dynamic][2]string, alloc)
+		offer := make([dynamic]string, alloc)
+		for w in strings.fields(f[3] if len(f) > 3 else "", alloc) {
+			if strings.has_prefix(w, "undo:") {
+				eq := strings.index_byte(w, '=')
+				append(&undo, [2]string{w[len("undo:"):eq], w[eq + 1:]})
+			} else if strings.has_prefix(w, "offer:") {
+				append(&offer, w[len("offer:"):])
+			}
+		}
+		c.undo = undo[:]
+		c.offer = offer[:]
 		append(&out, c)
 	}
 	return out[:]
@@ -606,7 +621,11 @@ _rs_turn :: proc(c: ^Rs_Ctx, cs: Rs_Case) -> (r: Rs_Run, ok: bool) {
 	r.base = r0r
 	r.user = _rs_msg(c, .User, r0r, nil) or_return
 	reply := _rs_msg(c, .Assistant, r.user, files) or_return
-	for op in cs.ops {
+	last := len(cs.ops)
+	for last > 0 && cs.ops[last - 1].verb == "person" {
+		last -= 1
+	}
+	for op in cs.ops[:last] {
 		before := make(Rs_Tree, context.temp_allocator)
 		for k in prim.sorted_keys(model) {
 			before[k] = model[k]
@@ -635,6 +654,19 @@ _rs_turn :: proc(c: ^Rs_Ctx, cs: Rs_Case) -> (r: Rs_Run, ok: bool) {
 		node_after(n)
 	}
 	run_until(w, w.now + 1_000_000_000, true)
+	for op in cs.ops[last:] {
+		_rs_apply(&model, op, c.alloc)
+		_rs_apply(&r.undoneq, op, c.alloc)
+		_rs_person(c, op, &model) or_return
+		run_until(w, w.now + 1_000_000_000, true)
+	}
+	for x in cs.undo {
+		if x[1] == "-" {
+			delete_key(&r.undoneq, x[0])
+		} else {
+			r.undoneq[x[0]] = Rs_Entry{kind = .File, data = _rs_text(x[1], c.alloc)}
+		}
+	}
 	r.post = model
 	got := _rs_read(c, c.alloc)
 	if d := _rs_diff(model, got); len(d) > 0 {
@@ -717,6 +749,18 @@ _rs_case :: proc(w: ^World, cs: Rs_Case, alloc: runtime.Allocator) {
 	run_until(w, w.now + 5_000_000_000, true)
 	_rs_released(c, cs, undo)
 	_rs_expect(c, cs, "undo", r.undoneq)
+	for path in cs.offer {
+		context = instance_context(&n.inst)
+		list, err := eng.tree_conflicts(&n.e, c.tree, context.temp_allocator)
+		found := false
+		for x in list {
+			found ||= x.path == path
+		}
+		if err != .None || !found {
+			world_fail(w, "shapes %s: after undo: %s offers nothing back (%v, %d conflicts in the tree)", cs.name, path, err, len(list))
+		}
+		node_after(n)
+	}
 	if env_u64("SHAPES_TREE", 0) != 0 {
 		context = instance_context(&n.inst)
 		names, _ := tree_walk(n, c.tree, {}, "main")
