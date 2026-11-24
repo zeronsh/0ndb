@@ -168,13 +168,6 @@ The idle and streaming figures come from `bindings/rust/ondb/examples/bench.rs`
 - Search: `search(query, space, scope)` across this device's index and, when
   another device keeps a full index of the space, that index too; remote hits
   are fetched and verified locally.
-- Redaction: `redact(object, msg)` zero-fills a message's content everywhere
-  it replicates. A `redact_unreached` event names each copy it could not
-  remove (`Event::redact_unreached()` in Rust): a blob the user's own git
-  history still holds, with the ref and commit, which 0ndb never rewrites;
-  bytes other live content shares; a pinned pack; or a removal that failed
-  and stays pending until it succeeds. An app shows these to the user, for
-  example "this text is also in your git history (commit X)".
 
 ## 5. Sign-in through host plugs
 
