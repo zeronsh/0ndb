@@ -1509,6 +1509,14 @@ concurrent typing is never lost or reverted.
   commit job that runs at a scheduled later time. Compaction rewrites cold
   containers so each stream's extents stay contiguous, keeping page reads to
   one or two preads.
+- Compaction cannot be starved by writers. Once the garbage in checkpointed
+  containers reaches two log windows, the completion of each job runs one
+  slice of compaction (256 KiB) and submits its commit before any flush the
+  writers want, so dead containers are deleted at the rate they are made.
+  With no writer it is driven by the same completions: each finished job
+  starts the next slice until no container is past `compact_ratio`, with no
+  timer. Disk use stays within live bytes plus two log windows plus the
+  containers of one flush.
 - A staged handle (`pack.stage`) gives one writer commit scoping: its writes
   stay out of the log until that handle's own sync, which applies them inside
   the current batch, so no other commit can make them durable; closing it

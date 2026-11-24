@@ -183,6 +183,8 @@ Pack :: struct {
 	pressure:      bool,
 	want_flush:    bool,
 	closing:       bool,
+	reclaiming:    bool,
+	reclaimed:     bool,
 	cscan:         [dynamic]Scan,
 	bcache:        []Bc_Entry,
 	tick:          u64,
