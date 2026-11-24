@@ -205,7 +205,7 @@ _ril_run :: proc(w: ^World, k: u64, peer: Ril_Peer) -> (res: Ril_Result) {
 	head := "warm "
 	if peer == .First {
 		context = instance_context(&b.inst)
-		if err := eng.text_insert(&b.e, text, 0, head); err != .None {
+		if err := eng.text_edit(&b.e, text, 0, 0, head); err != .None {
 			world_fail(w, "reissue live: n1 first insert: %v", err)
 			return
 		}
