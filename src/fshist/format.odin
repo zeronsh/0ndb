@@ -71,6 +71,7 @@ Revert_Op :: struct {
 Observe_Kind :: enum u8 {
 	Read        = 0,
 	Write_Begin = 1,
+	Step        = 2,
 }
 
 Observe_Op :: struct {
